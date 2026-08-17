@@ -5344,6 +5344,7 @@ impl ClusterCoordinator {
                                 &inbound_state_path_event,
                                 &reheal_backoff_event,
                                 &partition_view,
+                                Some(&engine),
                             );
                         if queued > 0 {
                             tracing::warn!(
@@ -9448,7 +9449,7 @@ pub fn is_self_behind_any_replica_coarse(
 
 /// A stale-mastered-shard classification produced by
 /// [`classify_stale_mastered_shards`] for the Phase-3b online re-heal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RehealCandidate {
     /// The mastered shard that diverges (digest mismatch) from a live replica.
     pub shard: u16,
@@ -9459,7 +9460,16 @@ pub(crate) struct RehealCandidate {
     /// DIRECTION: coarsely BEHIND a live replica
     /// ([`is_self_behind_any_replica_coarse`]) — the fence + pull gate. `false`
     /// for an ahead/equal master (never fenced).
+    ///
+    /// W10 composition review P1-3a — this verdict is computed from the
+    /// CACHED self recency the partition view carries; it is a PRE-FILTER.
+    /// Before fencing, [`trigger_online_reheal`] re-checks it against self's
+    /// LIVE recency ([`confirm_self_behind_with_live_recency`]).
     pub self_behind: bool,
+    /// The live replicas' reported recencies for the shard — carried so the
+    /// live-recency confirm can re-run the direction gate without re-deriving
+    /// them from a shard table that may have moved on.
+    pub replica_recencies: Vec<ShardRecency>,
 }
 
 /// Order-independent change-detector signature over this node's recency and its
@@ -9546,9 +9556,125 @@ pub(crate) fn classify_stale_mastered_shards(
             shard,
             signature: shard_view_signature(self_recency, &replica_recencies),
             self_behind: is_self_behind_any_replica_coarse(self_recency, &replica_recencies),
+            replica_recencies,
         });
     }
     out
+}
+
+/// W10 composition review P1-3a — RE-CHECK a fence verdict against SELF's
+/// LIVE recency, resolved directly from the engine instead of from the
+/// cached partition-version snapshot.
+///
+/// # The composition defect this closes
+///
+/// Wave 10 replaced the report's per-poll-instant recency scan with a CACHED
+/// per-shard `(digest, max_generation)` snapshot
+/// ([`crate::ops::recency`]). Both sides of
+/// [`is_self_behind_any_replica_coarse`] are now cache-served, and the skew
+/// between the two snapshots is no longer the ~2 s exchange window — it is
+/// the difference between two nodes' last COMPLETED whole-store scans,
+/// unbounded in store size AND systematically directional: a node's own
+/// exchange serves the snapshot from BEFORE the refresh that exchange kicks,
+/// while a peer's snapshot is kicked by every peer's report query as well as
+/// its own exchanges, so peers' snapshots run systematically fresher. Under a
+/// spend-heavy UTXO workload — where generations advance but the record COUNT
+/// does not, so the honest live-count leg never fires — that reads as "a
+/// replica is ahead of me" and `trigger_online_reheal` FENCES the master's
+/// own shard (`heal_pending` → `Transitioning`, keyspace client-invisible)
+/// for a no-op baseline pull. `reverse_heal_online` is ON by default for
+/// RF>1, so this re-creates the scenario-07 read-outage shape the wave was
+/// fixing.
+///
+/// # Why the SELF side is resolved rather than age-compared
+///
+/// The alternative — carry each snapshot's age on the wire and refuse a
+/// verdict when self's snapshot is older — is not fit for purpose: the bias
+/// is systematic, so under a strict age comparison the verdict is suppressed
+/// in the GENUINE divergence case too (self's snapshot is older there as
+/// well) and the online re-heal silently stops working; adding a tolerance
+/// large enough to avoid that also re-admits the false verdicts, because ANY
+/// positive skew produces one. Resolving self's side instead removes the
+/// self-side staleness by construction, and leaves an error direction that is
+/// FAIL-SAFE: a stale REPLICA snapshot can only under-report the generation
+/// it scanned, which makes the replica look less ahead, i.e. it defers a heal
+/// rather than fabricating a fence.
+///
+/// # Cost containment
+///
+/// The confirm resolves ONLY the shards that are otherwise about to be
+/// FENCED (post single-flight, post backoff, `self_behind == true`) — the
+/// destructive set — via ONE [`Engine::keys_by_shard_filtered`] pass, so
+/// device reads are bounded by those shards' keys rather than the store. It
+/// is skipped entirely when the recency cache is not stale (nothing to
+/// correct). The caller records a backoff entry for every REFUTED shard, so
+/// an unchanged source view re-runs neither the classification nor this scan.
+/// It runs on the coordinator event loop after the exchange completes —
+/// never inside a dispatch handler, never inside the exchange window, and
+/// (deliberately, see [`trigger_online_reheal`]) never while holding the
+/// shard-table lock.
+///
+/// # Fail-safe returns
+///
+/// * `total_skipped > 0` from the enumeration (an unreadable footer / a raced
+///   deletion, issue #46) means self's fresh fingerprint may itself omit a
+///   record: NOTHING is confirmed and nothing is refuted, so every candidate
+///   is simply re-evaluated next round.
+/// * A shard whose live count is non-zero but whose scan folded NO readable
+///   record is the fabricated-emptiness shape — no evidence, so it is neither
+///   confirmed nor refuted (deferred, not backed off).
+///
+/// Returns `(confirmed, refuted)`: shards still genuinely behind a live
+/// replica against FRESH self evidence, and shards the fresh evidence clears
+/// (safe to record in the not-behind backoff cache).
+fn confirm_self_behind_with_live_recency(
+    engine: &Engine,
+    candidates: &[(u16, Vec<ShardRecency>)],
+) -> (Vec<u16>, Vec<u16>) {
+    let shards: std::collections::HashSet<u16> = candidates.iter().map(|(s, _)| *s).collect();
+    let (keys_by_shard, total_skipped) = engine.keys_by_shard_filtered(&shards);
+    if total_skipped > 0 {
+        tracing::warn!(
+            skipped = total_skipped,
+            shards = shards.len(),
+            "reverse-heal Phase 3b: live-recency confirm read an INCOMPLETE \
+             key enumeration — deferring every fence verdict this round \
+             (re-evaluated on the next partition view)",
+        );
+        return (Vec::new(), Vec::new());
+    }
+    let mut confirmed = Vec::new();
+    let mut refuted = Vec::new();
+    for (shard, replica_recencies) in candidates {
+        let keys: &[TxKey] = keys_by_shard.get(shard).map_or(&[], |k| k.as_slice());
+        let (scan_count, digest, max_generation) = engine.recency_for_keys(keys);
+        let live_count = engine.shard_record_count(*shard);
+        if scan_count == 0 && live_count > 0 {
+            // Records exist but none folded — the fingerprint is fabricated
+            // emptiness, not evidence. Defer without a backoff entry.
+            tracing::warn!(
+                shard,
+                live_count,
+                "reverse-heal Phase 3b: live-recency confirm folded NO readable \
+                 record for a populated shard — deferring the fence verdict",
+            );
+            continue;
+        }
+        let fresh = ShardRecency {
+            count: live_count,
+            digest,
+            max_generation,
+            recency_unknown: false,
+        };
+        if is_shard_stale_vs_replicas(fresh, replica_recencies)
+            && is_self_behind_any_replica_coarse(fresh, replica_recencies)
+        {
+            confirmed.push(*shard);
+        } else {
+            refuted.push(*shard);
+        }
+    }
+    (confirmed, refuted)
 }
 
 // ---------------------------------------------------------------------------
@@ -10279,6 +10405,12 @@ fn resource_parked_heal_fences(
     started
 }
 
+/// `engine` is the live store this node serves. It is `Option` ONLY because
+/// the unit-test `RunningCluster` fixture carries no engine (see the field
+/// doc on `RunningCluster::engine`); production always supplies one. With no
+/// engine there is no recency CACHE either, so there is no cached-vs-live
+/// distinction to correct and the cached classification stands.
+#[allow(clippy::too_many_arguments)]
 fn trigger_online_reheal(
     self_id: NodeId,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
@@ -10287,6 +10419,7 @@ fn trigger_online_reheal(
     inbound_state_path: &Option<std::path::PathBuf>,
     reheal_backoff: &Arc<Mutex<std::collections::HashMap<u16, u64>>>,
     partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+    engine: Option<&Arc<Engine>>,
 ) -> usize {
     if partition_view.is_empty() {
         return 0;
@@ -10320,46 +10453,109 @@ fn trigger_online_reheal(
     // to the authoritative per-record manifest exchange the boot heal runs (or the
     // next real generation/count change that trips the coarse gate). This trades a
     // rare deferred-completeness gap for the hard invariant that an ahead/equal
-    // master is never fenced online. Detect + classify + select under a single
-    // shard-table read so all three see one consistent table.
-    let sources = {
+    // master is never fenced online.
+    //
+    // W10 composition review P1-3a — the classification is a PRE-FILTER over
+    // CACHED recency on both sides; the fence verdict is re-checked against
+    // self's LIVE recency below. The classify pass and the confirm are
+    // deliberately NOT under one shard-table read: the confirm scans the
+    // engine, and holding the table's read lock across it would stall the
+    // activation writer — under parking_lot's writer preference that blocks
+    // every new reader, `is_master` on the client path included, which is the
+    // very read outage this fix exists to prevent. Consistency is preserved by
+    // pinning the table VERSION instead: if it moves between classify and
+    // select, the round is abandoned and the next partition view re-runs it.
+    let (candidates, table_version) = {
         let table = shard_table.read();
-        let candidates = classify_stale_mastered_shards(self_id, &table, partition_view);
-        // Apply SINGLE-FLIGHT, DIRECTION, and BACKOFF to pick the shards to fence.
-        let mut to_fence: Vec<u16> = Vec::new();
-        {
-            let mut backoff = reheal_backoff.lock();
-            for c in &candidates {
-                // SINGLE-FLIGHT: a shard already inbound-fenced (heal in flight,
-                // fail-closed fence, or forward migration) is skipped so a
-                // being-healed shard never thrashes. `register_heal_source` keys on
-                // `(shard, from_node)`; gating on the per-shard fence here makes the
-                // dedup robust to a source that changes between detector passes.
-                if inbound_atomic.test(c.shard) {
-                    continue;
-                }
-                // BACKOFF: if we already evaluated this exact source view for the
-                // shard and did NOT fence it (an ahead/equal master), skip
-                // re-evaluating until the source view changes — no re-check, no
-                // re-fence on every topology commit.
-                if backoff.get(&c.shard) == Some(&c.signature) {
-                    continue;
-                }
-                if c.self_behind {
-                    // Genuine heal candidate: clear any stale not-behind cache
-                    // entry so a completed/re-diverged heal is never suppressed,
-                    // then fence + pull.
-                    backoff.remove(&c.shard);
-                    to_fence.push(c.shard);
-                } else {
-                    // Ahead/equal master — NEVER fence. Record the source-view
-                    // signature so repeated commits with an unchanged view do not
-                    // re-check (and certainly do not re-fence) this shard.
-                    backoff.insert(c.shard, c.signature);
-                }
+        (
+            classify_stale_mastered_shards(self_id, &table, partition_view),
+            table.version,
+        )
+    };
+    // Apply SINGLE-FLIGHT, DIRECTION, and BACKOFF to pick the fence candidates.
+    let mut to_confirm: Vec<(u16, Vec<ShardRecency>)> = Vec::new();
+    let mut signature_of: std::collections::HashMap<u16, u64> = std::collections::HashMap::new();
+    {
+        let mut backoff = reheal_backoff.lock();
+        for c in candidates {
+            // SINGLE-FLIGHT: a shard already inbound-fenced (heal in flight,
+            // fail-closed fence, or forward migration) is skipped so a
+            // being-healed shard never thrashes. `register_heal_source` keys on
+            // `(shard, from_node)`; gating on the per-shard fence here makes the
+            // dedup robust to a source that changes between detector passes.
+            if inbound_atomic.test(c.shard) {
+                continue;
+            }
+            // BACKOFF: if we already evaluated this exact source view for the
+            // shard and did NOT fence it (an ahead/equal master), skip
+            // re-evaluating until the source view changes — no re-check, no
+            // re-fence on every topology commit. This also keeps the live
+            // confirm below off an unchanged view.
+            if backoff.get(&c.shard) == Some(&c.signature) {
+                continue;
+            }
+            if c.self_behind {
+                // Candidate heal: clear any stale not-behind cache entry so a
+                // completed/re-diverged heal is never suppressed, then confirm.
+                backoff.remove(&c.shard);
+                signature_of.insert(c.shard, c.signature);
+                to_confirm.push((c.shard, c.replica_recencies));
+            } else {
+                // Ahead/equal master — NEVER fence. Record the source-view
+                // signature so repeated commits with an unchanged view do not
+                // re-check (and certainly do not re-fence) this shard.
+                backoff.insert(c.shard, c.signature);
             }
         }
-        if to_fence.is_empty() {
+    }
+    if to_confirm.is_empty() {
+        return started;
+    }
+    // W10 composition review P1-3a — CONFIRM against self's LIVE recency
+    // before fencing anything. A shard the fresh evidence REFUTES is recorded
+    // in the not-behind backoff cache under the same source-view signature the
+    // pre-filter used, so an unchanged view neither re-fences nor re-scans.
+    let to_fence: Vec<u16> = match engine {
+        Some(engine) if engine.recency_cache_is_stale() => {
+            let (confirmed, refuted) = confirm_self_behind_with_live_recency(engine, &to_confirm);
+            if !refuted.is_empty() {
+                let mut backoff = reheal_backoff.lock();
+                for shard in &refuted {
+                    if let Some(sig) = signature_of.get(shard) {
+                        backoff.insert(*shard, *sig);
+                    }
+                }
+                tracing::info!(
+                    refuted = refuted.len(),
+                    confirmed = confirmed.len(),
+                    "reverse-heal Phase 3b: live-recency confirm cleared \
+                     shard(s) the CACHED partition-version snapshot read as \
+                     behind — not fencing them (W10 P1-3a)",
+                );
+            }
+            confirmed
+        }
+        // Cache is current (or no engine attached — the unit-test fixture):
+        // the served self recency IS self's live recency, nothing to correct.
+        _ => to_confirm.iter().map(|(shard, _)| *shard).collect(),
+    };
+    if to_fence.is_empty() {
+        return started;
+    }
+    let sources = {
+        let table = shard_table.read();
+        if table.version != table_version {
+            // The table moved under the confirm: a shard classified as
+            // self-mastered may not be ours anymore, so fencing it now would
+            // be unfounded. Abandon the round — the next partition view
+            // re-classifies against the new table (no backoff entry was
+            // recorded for a confirmed shard, so nothing is suppressed).
+            tracing::info!(
+                classified_at = table_version,
+                now = table.version,
+                "reverse-heal Phase 3b: shard table advanced during the \
+                 live-recency confirm — abandoning this round's fences",
+            );
             return started;
         }
         select_reverse_heal_sources_for(self_id, &table, &to_fence, partition_view)
@@ -17974,6 +18170,7 @@ impl RunningCluster {
             &self.inbound_state_path,
             &self.reheal_backoff,
             partition_view,
+            self.engine.as_ref(),
         )
     }
 
@@ -33963,6 +34160,209 @@ mod tests {
                 .pending_inbound_entries()
                 .is_empty(),
             "no baseline pull may be queued from an UNKNOWN self report",
+        );
+    }
+
+    /// W10 composition review P1-3a (RED→GREEN) — the CACHED-recency
+    /// self-fence, and the read outage it re-creates.
+    ///
+    /// Wave 10 replaced the partition-version report's per-poll-instant scan
+    /// with a cached per-shard `(digest, max_generation)` snapshot, so BOTH
+    /// sides of the destructive direction gate are now cache-served. The skew
+    /// between them is no longer the ~2 s exchange window but the difference
+    /// between two nodes' last COMPLETED whole-store scans — unbounded in
+    /// store size and systematically directional (a node's own exchange serves
+    /// the snapshot from BEFORE the refresh it kicks, while peers' snapshots
+    /// are kicked by every peer's report query too). On a spend-heavy UTXO
+    /// workload generations advance while the record COUNT does not, so the
+    /// honest count leg never fires and the master reads its own STALE
+    /// max_generation as "a replica is ahead of me" — fencing its own mastered
+    /// shard (`heal_pending` → `Transitioning`, CLIENT-INVISIBLE) for a no-op
+    /// baseline pull, with `reverse_heal_online` ON by default at RF>1.
+    ///
+    /// Driven through the REAL report builder over a REAL engine whose cache
+    /// is stale exactly the way the refresh pacing makes it stale.
+    #[test]
+    fn online_reheal_does_not_fence_on_a_stale_self_recency_cache() {
+        let (mut cluster, shard, replica) = three_node_cluster_mastering_with_replica();
+        let k = key_for_shard(shard);
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "precondition: the node masters + serves the shard",
+        );
+
+        // A completed whole-store scan fingerprints the shard at its
+        // pre-churn generations.
+        let engine = Arc::new(test_engine());
+        let spent = tx_key_for_shard(shard, 1);
+        create_test_record(&engine, spent);
+        create_test_record(&engine, tx_key_for_shard(shard, 2));
+        engine.refresh_shard_recency_cache();
+        assert!(!engine.recency_cache_is_stale());
+        let (_, _, cached_max) = engine.shard_recency_cached(shard);
+
+        // Spend churn: a generation advances, the record COUNT does not (so
+        // the honest count leg can never fire), and the next scan has not run
+        // — the RECENCY_REFRESH_MIN_INTERVAL floor guarantees this window.
+        engine
+            .spend(&crate::ops::spend::SpendRequest {
+                tx_key: spent,
+                offset: 0,
+                utxo_hash: [0x44u8; 32],
+                spending_data: [0xAB; 36],
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 100,
+            })
+            .expect("spend must apply");
+        assert!(engine.recency_cache_is_stale());
+        let (live_count, _, live_max) = engine.shard_recency(shard);
+        assert!(
+            live_max > cached_max,
+            "fixture: the spend must advance the shard's live max_generation \
+             past the cached snapshot ({live_max} vs {cached_max})",
+        );
+
+        // The REAL production report builder serves the STALE fingerprint.
+        cluster.test_set_engine(engine.clone());
+        let self_entries = build_self_partition_version_entries(
+            NodeId(1),
+            &engine,
+            &cluster.shard_table(),
+            cluster.inbound_bitmap(),
+        );
+        let self_entry = self_entries
+            .iter()
+            .find(|e| e.shard == shard)
+            .expect("the mastered shard must be reported")
+            .clone();
+        assert_eq!(
+            self_entry.max_generation, cached_max,
+            "the report serves the CACHED (stale) generation, not the live one",
+        );
+        assert_eq!(
+            self_entry.flags & PARTITION_FLAG_RECENCY_UNKNOWN,
+            0,
+            "the entry is KNOWN — a scan HAS evidenced the shard; this is \
+             ordinary staleness, not the P0-1 fabricated-emptiness shape",
+        );
+
+        // A replica whose own scan is CURRENT: same record count (no count
+        // divergence), the post-spend generation, a differing digest.
+        let replica_entry = PartitionVersionEntry {
+            shard,
+            flags: 0,
+            replica_count: 1,
+            last_applied_seq: live_count,
+            manifest_digest: 0xBBBB,
+            max_generation: live_max,
+        };
+        // The trap, pinned: on the CACHED inputs the coarse direction gate
+        // says "self is behind" — this is exactly what used to fence.
+        assert!(
+            is_self_behind_any_replica_coarse(
+                ShardRecency::from_entry(&self_entry),
+                &[ShardRecency::from_entry(&replica_entry)],
+            ),
+            "pin: the cached inputs really do read as self-behind",
+        );
+
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(NodeId(1), self_entries);
+        view.insert(replica, vec![replica_entry]);
+
+        assert_eq!(
+            cluster.run_online_reheal(&view),
+            0,
+            "a master whose LIVE recency is at-or-ahead of the replica must \
+             NOT fence itself on its own stale cache (W10 P1-3a)",
+        );
+        assert!(
+            matches!(cluster.is_master(&k), MasterQueryResult::Yes),
+            "the master keeps SERVING — no heal_pending fence, no read outage",
+        );
+        assert!(
+            cluster
+                .migration
+                .lock()
+                .pending_inbound_entries()
+                .is_empty(),
+            "and no no-op baseline pull is queued",
+        );
+
+        // The refuted shard is recorded in the not-behind backoff cache, so an
+        // unchanged source view re-runs neither the classification nor the
+        // live-recency scan.
+        assert!(
+            cluster.reheal_backoff.lock().contains_key(&shard),
+            "a refuted fence verdict must be backed off on its source-view \
+             signature, not re-scanned every round",
+        );
+        assert_eq!(cluster.run_online_reheal(&view), 0);
+    }
+
+    /// W10 composition review P1-3a — the confirm must not DISARM the online
+    /// re-heal: a master that is GENUINELY behind (its live recency really is
+    /// behind the replica's) is still fenced and still pulls.
+    #[test]
+    fn online_reheal_still_fences_a_genuinely_behind_master() {
+        let (mut cluster, shard, replica) = three_node_cluster_mastering_with_replica();
+        let k = key_for_shard(shard);
+
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(shard, 1));
+        engine.refresh_shard_recency_cache();
+        // Churn AFTER the scan so the cache is stale and the confirm runs.
+        create_test_record(&engine, tx_key_for_shard(shard, 2));
+        assert!(engine.recency_cache_is_stale());
+        let (live_count, _, live_max) = engine.shard_recency(shard);
+        cluster.test_set_engine(engine.clone());
+
+        let self_entries = build_self_partition_version_entries(
+            NodeId(1),
+            &engine,
+            &cluster.shard_table(),
+            cluster.inbound_bitmap(),
+        );
+        // The replica is ahead of self's LIVE recency on BOTH axes — writes
+        // this node genuinely never applied.
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(NodeId(1), self_entries);
+        view.insert(
+            replica,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: live_count + 5,
+                manifest_digest: 0xBBBB,
+                max_generation: live_max.wrapping_add(9),
+            }],
+        );
+
+        assert_eq!(
+            cluster.run_online_reheal(&view),
+            1,
+            "a genuinely-behind master is still fenced + queued for a pull",
+        );
+        assert!(
+            matches!(
+                cluster.is_master(&k),
+                MasterQueryResult::Transitioning { .. }
+            ),
+            "no-serve-before-heal still holds for a real divergence",
+        );
+        assert!(
+            cluster
+                .migration
+                .lock()
+                .pending_inbound_entries()
+                .iter()
+                .any(|(s, from)| *s == shard && *from == replica),
+            "the concrete-source reverse-pull is still queued",
         );
     }
 
