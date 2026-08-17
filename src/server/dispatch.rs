@@ -1559,6 +1559,18 @@ pub(crate) fn handle_request(
                 }
                 _ => false,
             };
+            // W10 review nit-2 — a refused cutoff gate makes the prune
+            // DORMANT for this completion (the source re-verifies with a
+            // fresh fold). On a write-active source→target pair the frozen
+            // cutoff trails the advancing per-source watermark, so this is
+            // the steady state rather than an anomaly; metered so an
+            // operator can see the prune's dormancy instead of inferring it.
+            if source_is_authoritative_complete
+                && !prune_safe_at_cutoff
+                && let Some(m) = crate::metrics::migration_metrics()
+            {
+                m.migration_prune_skipped_cutoff_gate.inc();
+            }
             if source_is_authoritative_complete
                 && prune_safe_at_cutoff
                 && let Some(entries) = source_entries.as_ref()
@@ -5593,14 +5605,19 @@ fn prune_safe_at_enumeration_cutoff(
 ///
 /// Soundness contract (consumed by the target's #29 prune gate): every
 /// NEW-content replica op this node sends to `addr` is labeled strictly above
-/// the receiver's stream watermark at label time, and `last_acked` never
-/// exceeds that watermark (it only advances on a full-batch ACK). So any op
-/// this node fans out to `addr` AFTER reading this value carries a sequence
-/// STRICTLY greater than it — which is exactly what lets the target prove a
-/// local apply postdates the source's manifest enumeration and must not be
-/// pruned. Reading it BEFORE the manifest fold keeps that one-sided bound
-/// (an early read only under-approximates, deferring the prune — never
-/// authorizing a deletion).
+/// the receiver's stream watermark at label time. `last_acked` normally
+/// trails that watermark (it advances only on a full-batch ACK), but it does
+/// NOT bound it in general: `last_acked` is never lowered, so it MAY EXCEED
+/// the receiver's watermark across a regression (a restored/lost
+/// `.repl-applied` tracker, a rebuilt same-identity node), after which a Gap
+/// renegotiation relabels fresh content DOWN to at-or-below a cutoff read
+/// from the stale value. What makes the cutoff safe is therefore not a
+/// sender-side bound but the target-side EQUALITY gate
+/// (`prune_safe_at_enumeration_cutoff`): the prune runs only when the
+/// target's own watermark equals the cutoff, so a source view that is either
+/// ahead of (regressed target) or behind (missed applies) the target's truth
+/// refuses. Reading this value BEFORE the manifest fold only under-
+/// approximates, which defers the prune — never authorizes a deletion.
 ///
 /// Returns `0` when no replication slot exists for `addr` (nothing acked from
 /// this process yet). A `0` cutoff is still sound: the target then prunes

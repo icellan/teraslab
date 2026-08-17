@@ -447,6 +447,16 @@ impl TombstoneLog {
         // P2-3: a weak cause joins the accelerator; a STRONG cause that
         // last-writer-wins over a weak one must LEAVE it (the strong claim now
         // governs, and a stale weak entry would be re-declared to peers).
+        //
+        // NOT ATOMIC with the shard write above (W10 review nit-3): the shard
+        // guard is released before this insert, so a `weak_tombstone_keys()`
+        // racing exactly here UNDER-declares that key for one completion
+        // frame. Same class as the manifest fold's own snapshot race, narrowed
+        // by the per-send recapture (P2-1) from a whole fold to a few
+        // instructions — and the target-side enumeration-cutoff gate, not the
+        // declaration, is the primary guard for the corresponding prune race.
+        // Deliberately not widened to hold both locks: `shards` is the
+        // authority and every read re-verifies the cause against it.
         if weak {
             self.weak_keys.write().insert(*key);
         } else {

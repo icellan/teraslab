@@ -1440,6 +1440,14 @@ pub struct MigrationMetrics {
     /// documented at the exclusion site), so the count is the operator's
     /// visibility into how much residue is being deferred to repair.
     pub migration_prune_weak_declared_retained: PaddedCounter,
+    /// W10 review nit-2 — #29 prunes SKIPPED because the completion's
+    /// enumeration cutoff did not match this node's own stream watermark
+    /// (`prune_safe_at_enumeration_cutoff` refused). On a write-active
+    /// source→target pair the cutoff is frozen at fold time while the
+    /// per-source watermark keeps advancing, so the prune is effectively
+    /// dormant there and its anti-stale role rests on the escalation's
+    /// fresh-fold path. Rising steadily = that dormancy, not a defect.
+    pub migration_prune_skipped_cutoff_gate: PaddedCounter,
     /// W10 review P2-5 — times propose-time member re-validation would have
     /// emptied the settled set and fell back to it unchanged. Expected to
     /// stay ZERO (self is retained unconditionally); a non-zero value means
@@ -1524,6 +1532,7 @@ impl MigrationMetrics {
             migration_completion_manifest_reduced_vetoed: PaddedCounter::new(),
             migration_weak_veto_arbitrations: PaddedCounter::new(),
             migration_prune_weak_declared_retained: PaddedCounter::new(),
+            migration_prune_skipped_cutoff_gate: PaddedCounter::new(),
             topology_proposal_revalidation_emptied: PaddedCounter::new(),
             orphan_cleanup_retained_no_evidence: AtomicU32::new(0),
         }
