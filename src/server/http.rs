@@ -1612,6 +1612,16 @@ pub(crate) fn render_metrics_text(
         "teraslab_reheal_skipped_degenerate_view_total",
         crate::cluster::coordinator::reheal_skipped_degenerate_view_total(),
     );
+    // W11 FIX 3 — same-term re-heal installs declined because the install
+    // would have done nothing but revert refinement the fresh partition view
+    // still justifies. That revert is the time-dependent half of the re-heal:
+    // nodes that go idle at different moments used to install DIFFERENT
+    // tables at the SAME shard-table version.
+    prom_counter(
+        &mut out,
+        "teraslab_reheal_skipped_refinement_revert_total",
+        crate::cluster::coordinator::reheal_skipped_refinement_revert_total(),
+    );
     // W11 FIX 1 — local-holder backfill streams elided because the shared
     // partition view proved the destination already holds the shard. A
     // rising value is the fix working: it counts the whole-store re-stream
@@ -5510,6 +5520,7 @@ mod tests {
             "teraslab_assignment_rejected_total",
             "teraslab_assignment_master_count_alerts_total",
             "teraslab_reheal_skipped_degenerate_view_total",
+            "teraslab_reheal_skipped_refinement_revert_total",
             "teraslab_backfill_tasks_skipped_view_owned_total",
             "teraslab_election_deviations_suppressed_plan_fill_total",
             "teraslab_activation_degraded_degenerate_view_total",

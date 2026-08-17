@@ -6682,6 +6682,20 @@ impl ClusterCoordinator {
         // broken).
         let det_plan_master_shards =
             plan_filled_master_shards(&old_table_snap, &new_table, partition_view);
+        // W11 FIX 3 — the pure deterministic masters, kept for the same-term
+        // re-heal's refinement-revert gate below. Only the re-heal without a
+        // committed assignment can revert refinement, so nothing else pays for
+        // the snapshot.
+        let det_masters: Option<Vec<NodeId>> =
+            if adopt_view_holders && committed_assignment.is_none() {
+                Some(
+                    (0..NUM_SHARDS as u16)
+                        .map(|shard| new_table.target_assignment(shard).master)
+                        .collect(),
+                )
+            } else {
+                None
+            };
         match &committed_assignment {
             // §8 — a committed assignment IS the authority on mastership:
             // install it verbatim (through set_master_for_shard, which
@@ -6706,6 +6720,46 @@ impl ClusterCoordinator {
                     adopt_view_holders,
                     &det_plan_master_shards,
                 );
+            }
+        }
+
+        // W11 FIX 3 — decline a same-term re-heal install whose ONLY effect
+        // would be to revert live, view-justified refinement at the SAME
+        // shard-table version (see `reheal_install_reverts_refinement_only`
+        // for the divergence this closes and its residual). Returning here
+        // leaves the table, the migration manager and every fence exactly as
+        // they were; the caller's post-activation passes (reverse-heal
+        // detection, the #74 parked-fence re-source) still run, so no repair
+        // arc is swallowed.
+        if let Some(det_masters) = &det_masters {
+            let local_repair_pending = {
+                let rolled_back = (0..NUM_SHARDS as u16).any(|shard| {
+                    old_table_snap.target_assignment(shard).master
+                        != old_table_snap.intended_master(shard)
+                });
+                // LOCK ORDER — `old_table_snap` is a detached clone, so no
+                // shard-table guard is held across this migration lock.
+                let mgr = migration.lock();
+                rolled_back
+                    || old_table_snap.pending_handoff_count() > 0
+                    || mgr.active_count() > 0
+                    || stuck_subset_master_count(&old_table_snap, &mgr, self_id) > 0
+            };
+            if reheal_install_reverts_refinement_only(
+                &old_table_snap,
+                &new_table,
+                det_masters,
+                partition_view,
+                epoch,
+                local_repair_pending,
+            ) {
+                REHEAL_SKIPPED_REFINEMENT_REVERT_TOTAL.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    term = epoch,
+                    "cluster: declining same-term re-heal install — it would only revert \
+                     refinement the current partition view still justifies (W11 FIX 3)",
+                );
+                return None;
             }
         }
 
@@ -8424,6 +8478,129 @@ fn same_term_reheal_applicable(
     committed_members: &[NodeId],
 ) -> bool {
     view_term == committed_term && view_members == committed_members
+}
+
+/// W11 FIX 3 — count of same-term re-heal table installs declined because
+/// the install would ONLY have reverted live, view-justified refinement.
+/// Read via [`reheal_skipped_refinement_revert_total`] and exported as
+/// `teraslab_reheal_skipped_refinement_revert_total`.
+static REHEAL_SKIPPED_REFINEMENT_REVERT_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of same-term re-heal installs declined as refinement-revert-only
+/// since process start (W11 FIX 3).
+pub fn reheal_skipped_refinement_revert_total() -> u64 {
+    REHEAL_SKIPPED_REFINEMENT_REVERT_TOTAL.load(Ordering::Relaxed)
+}
+
+/// W11 FIX 3 — would this same-term re-heal install do NOTHING but revert
+/// live, view-justified master refinement?
+///
+/// # The defect
+///
+/// The same-term re-heal replaces the shard table AT THE SAME
+/// `shard_table_version` with a locally recomputed answer, gated only on this
+/// node being idle (`active_count() == 0`; both cooldowns have long expired
+/// during a 60-100 s rebalance wave — measured latency from "last batch
+/// finished" to "re-activating topology" was 41 ms on 06 node1 and 65 ms on 07
+/// node1). That answer is TIME-DEPENDENT: run the election before the
+/// migration fills the deterministic masters and it refines; run it after and
+/// the Task #47 strict-superiority rule decays every deviation back to the
+/// deterministic pick. Two nodes that go idle at different moments therefore
+/// install DIFFERENT tables at the SAME version. CI @ 3a38dc2 default-06 is
+/// the proof: all four nodes activated term 2 with byte-identical refined
+/// tables, then n1 and n4 re-healed to 1024/1024 deterministic while n2 and n3
+/// had not, and the cluster-wide master target sum went to 4408 against 4096.
+/// The ARMED 06 run is the same-commit control — all four re-healed within
+/// 2.8 s of each other and the sum stayed at 4097 — which isolates the
+/// divergence to re-heal TIMING, not to the answer itself.
+///
+/// # The rule
+///
+/// Decline the install exactly when it carries no information the
+/// deterministic activation paths do not already carry, and every local
+/// difference it would erase is a refinement the CURRENT view still justifies:
+///
+/// 1. `recomputed` reproduces the deterministic masters shard for shard —
+///    i.e. the re-heal's own answer carries NO refinement. This is the
+///    "late" half of the time-dependence; a re-heal that DOES refine is
+///    installed as before, because equal views compute it identically on every
+///    node and installing it converges them.
+/// 2. The local table is on the committed term (`local.version ==
+///    committed_term`) and has no repair work outstanding
+///    (`local_repair_pending`: a rolled-back handoff, a pending handoff, a
+///    live migration, or a stuck subset master). Any of those is real work the
+///    activation must re-drive, and the skip must never swallow it.
+/// 3. At least one shard actually differs — otherwise the install is not a
+///    revert and the caller's ordinary path applies.
+/// 4. EVERY differing shard's LOCAL master still fully holds the shard per the
+///    fresh view (`last_applied_seq > 0` with the
+///    [`PARTITION_FLAG_PENDING_INBOUND`] subset bit clear). This is what
+///    separates a refinement from a phantom: a stale table mastering a shard
+///    whose data moved away fails this test on that shard, so the phantom
+///    repair — the reason the re-heal exists — still installs.
+///
+/// # Residual
+///
+/// A node that never installed the refinement (it degraded to the
+/// deterministic table on an incomplete view, or joined late) now keeps the
+/// deterministic table while its peers keep the refined one, where before it
+/// would have been joined by peers decaying down to it. That residual is
+/// bounded — the refined masters are exactly where the data is, so routing
+/// stays correct, and the next committed term installs one table everywhere —
+/// and it is what the COMMITTED master election exists to remove outright
+/// (with `committed_placement_version >= 1` and election armed, the
+/// authority's assignment is the baseline and no node refines unilaterally).
+/// W11 FIX 2 removes the source of these refinements on the fresh-activation
+/// path in the first place, so this gate is defence in depth.
+fn reheal_install_reverts_refinement_only(
+    local_table: &ShardTable,
+    recomputed: &ShardTable,
+    det_masters: &[NodeId],
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+    committed_term: u64,
+    local_repair_pending: bool,
+) -> bool {
+    if local_repair_pending
+        || partition_view.is_empty()
+        || local_table.version != committed_term
+        || det_masters.len() != NUM_SHARDS
+    {
+        return false;
+    }
+
+    // (1) the recomputed answer must itself carry no refinement.
+    for shard in 0..NUM_SHARDS as u16 {
+        if recomputed.target_assignment(shard).master != det_masters[shard as usize] {
+            return false;
+        }
+    }
+
+    // (4) every difference must be a refinement the fresh view still backs.
+    let mut holders: std::collections::HashMap<(NodeId, u16), (u64, u8)> =
+        std::collections::HashMap::new();
+    for (node, entries) in partition_view {
+        for e in entries {
+            holders.insert((*node, e.shard), (e.last_applied_seq, e.flags));
+        }
+    }
+    let mut differing = 0usize;
+    for shard in 0..NUM_SHARDS as u16 {
+        let local_master = local_table.target_assignment(shard).master;
+        if local_master == recomputed.target_assignment(shard).master {
+            continue;
+        }
+        differing += 1;
+        match holders.get(&(local_master, shard)) {
+            Some(&(seq, flags)) if seq > 0 && (flags & PARTITION_FLAG_PENDING_INBOUND) == 0 => {}
+            // The local master holds nothing (or only a subset) — this is a
+            // phantom, not a refinement. Install and repair it.
+            _ => return false,
+        }
+    }
+
+    // (3) a genuine revert, not a no-diff activation.
+    differing > 0
 }
 
 /// Task #73 — count of same-term re-heal activations skipped because their
@@ -33715,6 +33892,18 @@ mod tests {
         GUARD.get_or_init(|| Mutex::new(())).lock()
     }
 
+    /// Serializes the tests that assert on the PROCESS-GLOBAL
+    /// `REHEAL_SKIPPED_DEGENERATE_VIEW_TOTAL` counter. Every
+    /// `admit_exchange_completion(true, ..)` call below the full-member-view
+    /// floor bumps it, and more than one test makes such calls, so an
+    /// absolute `before + 1` assertion raced with a sibling test and failed
+    /// intermittently (reproduced 2 runs in 3 under a narrow test filter).
+    fn reheal_skip_counter_test_guard() -> parking_lot::MutexGuard<'static, ()> {
+        use std::sync::OnceLock;
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        GUARD.get_or_init(|| Mutex::new(())).lock()
+    }
+
     fn make_outbound_master_task(shard: u16, from: NodeId, to: NodeId) -> MigrationTask {
         MigrationTask {
             shard,
@@ -36832,6 +37021,165 @@ mod tests {
                  authority on the production `activate_topology_with_view` path; got {other:?}",
             ),
         }
+    }
+
+    /// W11 FIX 3 test driver — run a SAME-TERM RE-HEAL activation
+    /// (`adopt_view_holders = true`, no committed assignment) for a 2-member
+    /// rf=2 cluster whose local table deviates one shard's master onto the
+    /// replica, with the fresh view reporting `local_master_count` for the
+    /// deviant master and 500 for the deterministic one. Returns
+    /// `(deterministic master, deviant master, master after the activation,
+    ///  table version after, registered migration count after, whether a plan
+    ///  launch was produced)`.
+    fn reheal_refinement_revert_probe(
+        local_master_count: u64,
+    ) -> (NodeId, NodeId, NodeId, u64, usize, bool) {
+        let _guard = migration_metrics_test_guard();
+        // The control arm of this probe REGISTERS a migration plan, which
+        // bumps the process-global `migration_active` gauge; hold the shared
+        // metrics lock so a neighbour's gauge assertion cannot read our
+        // registration as its own (the 3a38dc2 bulk-registration race).
+        let _metrics_guard = crate::metrics::migration_metrics_test_lock();
+        let _metrics = install_test_migration_metrics();
+
+        let members = vec![NodeId(1), NodeId(2)];
+        let rf = 2u8;
+        let placement_version = 1u16;
+        let term = 5u64;
+        let det_table = ShardTable::compute_with_epoch(&members, rf, term, placement_version);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = det_table.target_assignment(s);
+                a.master == NodeId(1) && a.replicas.contains(&NodeId(2))
+            })
+            .expect("some shard has det master N1 and replica N2");
+
+        // The locally refined table: mastership deviated onto the replica,
+        // still stamped with the committed term.
+        let mut local_table = det_table.clone();
+        local_table.set_master_for_shard(shard, NodeId(2));
+        assert_eq!(local_table.version, term);
+        assert_eq!(local_table.target_assignment(shard).master, NodeId(2));
+
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(shard, 7));
+
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            local_table,
+            &[
+                (NodeId(1), "127.0.0.1:1".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:1".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+
+        let entry = |seq: u64| {
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: seq,
+                manifest_digest: 0,
+                max_generation: 0,
+            }]
+        };
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(NodeId(1), entry(500));
+        view.insert(NodeId(2), entry(local_master_count));
+
+        // `defer_plan_launch` keeps any plan this activation DOES build off
+        // the wire; the assertions read the registered task count, not worker
+        // side effects.
+        let deferred = ClusterCoordinator::activate_topology_with_view(
+            &members,
+            term,
+            placement_version,
+            NodeId(1),
+            rf,
+            &cluster.shard_table,
+            &cluster.migration,
+            &cluster.node_addrs,
+            &engine,
+            &None,
+            1,
+            1,
+            1,
+            &cluster.fenced_bitmap,
+            &cluster.migrating_bitmap,
+            &cluster.inbound_atomic,
+            &cluster.active_topology_members,
+            &view,
+            &cluster.migration_throttle,
+            &cluster.cluster_secret,
+            None,
+            true,
+            true,
+        );
+        // The launch closure is dropped un-run, so no worker ever touches the
+        // (unroutable) peer address; the registered task count below is what
+        // the assertions read.
+        let launched = deferred.is_some();
+        drop(deferred);
+
+        let table = cluster.shard_table.read();
+        let after = table.target_assignment(shard).master;
+        let version = table.version;
+        drop(table);
+        let active = cluster.migration.lock().active_count();
+        (NodeId(1), NodeId(2), after, version, active, launched)
+    }
+
+    /// W11 FIX 3 (CI @ 3a38dc2, default-06) — the same-term re-heal replaces
+    /// the shard table AT THE SAME VERSION with a locally recomputed,
+    /// TIME-DEPENDENT answer, gated only on this node being idle (measured
+    /// 41 ms after the last batch on 06 node1, 65 ms on 07 node1). Run the
+    /// election before the migration fills the deterministic masters and it
+    /// refines; run it after and the Task #47 strict-superiority rule decays
+    /// every deviation back. Nodes that go idle at different moments therefore
+    /// install DIFFERENT tables at the SAME version — default-06 had all four
+    /// nodes on byte-identical refined tables, then n1/n4 decayed to
+    /// deterministic while n2/n3 had not, summing 4408 masters against 4096.
+    /// A re-heal whose recomputed answer is the deterministic baseline, and
+    /// whose only local difference is refinement the fresh view still
+    /// justifies, must therefore install NOTHING.
+    #[test]
+    fn same_term_reheal_declines_an_install_that_only_reverts_refinement() {
+        // The deviant master still holds the shard: a live refinement.
+        let (_det, deviant, after, version, active, launched) = reheal_refinement_revert_probe(500);
+        assert_eq!(
+            after, deviant,
+            "a re-heal that would only revert live refinement must leave the table alone",
+        );
+        assert_eq!(version, 5, "the shard table version must be untouched");
+        assert_eq!(
+            active, 0,
+            "a declined re-heal must not register a migration plan",
+        );
+        assert!(
+            !launched,
+            "a declined re-heal must not produce a migration plan launch",
+        );
+    }
+
+    /// W11 FIX 3 — the phantom repair the re-heal exists for must survive the
+    /// decline. When the locally deviating master reports NO data for the
+    /// shard, the deviation is a stale claim rather than a refinement, and the
+    /// recomputed table must be installed exactly as before.
+    #[test]
+    fn same_term_reheal_still_installs_when_the_local_master_holds_nothing() {
+        let (det, _deviant, after, version, _active, _launched) = reheal_refinement_revert_probe(0);
+        assert_eq!(
+            after, det,
+            "a local master holding nothing is a phantom, not a refinement — the re-heal must \
+             still repair it",
+        );
+        assert_eq!(version, 5, "the re-heal installs at the committed term");
     }
 
     /// W9 FIX 3 (CI run 31971906387, default-06) — a det-degraded
@@ -40060,6 +40408,165 @@ mod tests {
     /// Task #47 — a same-term re-heal exchange result may only be applied
     /// while the committed topology it was collected for is still current;
     /// a term advance or member-set change during the exchange invalidates it.
+    /// W11 FIX 3 — every guard on the refinement-revert decline, exercised
+    /// one at a time on the pure predicate. Each guard exists because
+    /// declining under it would swallow real work: an outstanding repair, a
+    /// stale table version, a re-heal that DOES refine (equal views compute it
+    /// identically everywhere, so installing it converges), a no-diff
+    /// activation, and a phantom whose local master holds nothing.
+    #[test]
+    fn reheal_refinement_revert_predicate_guards() {
+        let members = [NodeId(1), NodeId(2)];
+        let term = 5u64;
+        let det = ShardTable::compute_with_epoch(&members, 2, term, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = det.target_assignment(s);
+                a.master == NodeId(1) && a.replicas.contains(&NodeId(2))
+            })
+            .expect("some shard has det master N1 and replica N2");
+        let det_masters: Vec<NodeId> = (0..NUM_SHARDS as u16)
+            .map(|s| det.target_assignment(s).master)
+            .collect();
+
+        let mut local = det.clone();
+        local.set_master_for_shard(shard, NodeId(2));
+
+        let view_with = |seq: u64, flags: u8| {
+            let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+                std::collections::HashMap::new();
+            view.insert(
+                NodeId(2),
+                vec![PartitionVersionEntry {
+                    shard,
+                    flags,
+                    replica_count: 1,
+                    last_applied_seq: seq,
+                    manifest_digest: 0,
+                    max_generation: 0,
+                }],
+            );
+            view
+        };
+
+        // Baseline: recomputed == deterministic, one differing shard whose
+        // local master still holds the data → decline.
+        assert!(
+            reheal_install_reverts_refinement_only(
+                &local,
+                &det,
+                &det_masters,
+                &view_with(500, 0),
+                term,
+                false,
+            ),
+            "a live refinement revert with no outstanding work must be declined",
+        );
+
+        // Guard: outstanding local repair work.
+        assert!(
+            !reheal_install_reverts_refinement_only(
+                &local,
+                &det,
+                &det_masters,
+                &view_with(500, 0),
+                term,
+                true,
+            ),
+            "outstanding repair work must always be re-driven",
+        );
+
+        // Guard: the local table is not on the committed term.
+        assert!(
+            !reheal_install_reverts_refinement_only(
+                &local,
+                &det,
+                &det_masters,
+                &view_with(500, 0),
+                term + 1,
+                false,
+            ),
+            "a stale table version mandates the install",
+        );
+
+        // Guard: empty view — no evidence, no decline.
+        assert!(
+            !reheal_install_reverts_refinement_only(
+                &local,
+                &det,
+                &det_masters,
+                &std::collections::HashMap::new(),
+                term,
+                false,
+            ),
+            "an empty view justifies nothing",
+        );
+
+        // Guard: the local master reports only a SUBSET of the shard.
+        assert!(
+            !reheal_install_reverts_refinement_only(
+                &local,
+                &det,
+                &det_masters,
+                &view_with(500, PARTITION_FLAG_PENDING_INBOUND),
+                term,
+                false,
+            ),
+            "a subset holder is not a justified refinement",
+        );
+
+        // Guard: the local master holds nothing — a phantom, must install.
+        assert!(
+            !reheal_install_reverts_refinement_only(
+                &local,
+                &det,
+                &det_masters,
+                &view_with(0, 0),
+                term,
+                false,
+            ),
+            "a phantom master is exactly what the re-heal exists to repair",
+        );
+
+        // Guard: nothing differs — not a revert at all.
+        assert!(
+            !reheal_install_reverts_refinement_only(
+                &det,
+                &det,
+                &det_masters,
+                &view_with(500, 0),
+                term,
+                false,
+            ),
+            "an install that changes nothing is not a refinement revert",
+        );
+
+        // Guard: the recomputed answer ITSELF refines — install it, since
+        // equal views produce it identically on every node.
+        let mut refined = det.clone();
+        refined.set_master_for_shard(shard, NodeId(2));
+        let other = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                s != shard
+                    && det.target_assignment(s).master == NodeId(1)
+                    && det.target_assignment(s).replicas.contains(&NodeId(2))
+            })
+            .expect("a second N1-mastered shard exists");
+        let mut local_two = det.clone();
+        local_two.set_master_for_shard(other, NodeId(2));
+        assert!(
+            !reheal_install_reverts_refinement_only(
+                &local_two,
+                &refined,
+                &det_masters,
+                &view_with(500, 0),
+                term,
+                false,
+            ),
+            "a re-heal that installs its own refinement must not be declined",
+        );
+    }
+
     #[test]
     fn same_term_reheal_applicable_only_for_current_term_and_members() {
         let members = vec![NodeId(1), NodeId(2), NodeId(3)];
@@ -40085,6 +40592,7 @@ mod tests {
     /// re-fires with a fresh exchange on the next cooldown tick.
     #[test]
     fn same_term_reheal_degenerate_view_skips_activation() {
+        let _guard = reheal_skip_counter_test_guard();
         let before = reheal_skipped_degenerate_view_total();
         // Admitted completions must not count a skip. (Asserted inside this
         // test — the only incrementer — so parallel tests cannot race it.)
@@ -40119,6 +40627,7 @@ mod tests {
     /// activation (armed-15), and holding costs one cooldown tick.
     #[test]
     fn same_term_reheal_requires_full_member_view() {
+        let _guard = reheal_skip_counter_test_guard();
         assert_eq!(
             admit_exchange_completion(true, 7, 3, 3),
             ExchangeAdmission::Admit,
@@ -40246,6 +40755,7 @@ mod tests {
     /// same-term re-heal.
     #[test]
     fn armed_15_three_different_two_of_three_views_all_degrade_det() {
+        let _guard = reheal_skip_counter_test_guard();
         let members = [NodeId(1), NodeId(2), NodeId(3)];
         let rf = 2;
         let term = 15u64;
