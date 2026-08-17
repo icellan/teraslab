@@ -3852,10 +3852,8 @@ impl ClusterCoordinator {
                                 // W11 FIX 3(a) — repair is "already
                                 // dispatched" if it is streaming now OR was
                                 // signaled against this same retained view.
-                                let mut already_dispatched =
-                                    resync_inflight.lock().clone();
-                                already_dispatched
-                                    .extend(resync_signaled.lock().iter().copied());
+                                let mut already_dispatched = resync_inflight.lock().clone();
+                                already_dispatched.extend(resync_signaled.lock().iter().copied());
                                 let (_signaled, dropped, _dead_skipped, _dispatched_skipped) =
                                     run_under_replication_pass(
                                         &view,
@@ -5941,9 +5939,7 @@ impl ClusterCoordinator {
                                             epoch = committed_term,
                                             "cluster: shard transfer request accepted",
                                         ),
-                                        Ok(resp)
-                                            if transfer_request_was_refused(&resp.payload) =>
-                                        {
+                                        Ok(resp) if transfer_request_was_refused(&resp.payload) => {
                                             // W11 FIX 4(a) — the source says
                                             // it will NEVER send these: we are
                                             // neither a target holder nor its
@@ -5975,8 +5971,8 @@ impl ClusterCoordinator {
                                                     )
                                                 })
                                             };
-                                            if dropped > 0 && let Some(m) =
-                                                crate::metrics::migration_metrics()
+                                            if dropped > 0
+                                                && let Some(m) = crate::metrics::migration_metrics()
                                             {
                                                 m.migration_dangling_inbound_dropped
                                                     .inc_by(dropped as u64);
@@ -12202,6 +12198,15 @@ fn run_migration_batch_with_origin(
                 // per-shard snapshot sequences (Phase 1) plus late-key and
                 // delta streaming (Phase 3) make each shard's transfer
                 // independent of when its sub-batch starts.
+                // W11 FIX 5 (default-15) — retry budget for
+                // ERR_MIGRATION_TARGET_NOT_READY completions, shared by every
+                // shard this worker handles. See
+                // `retry_completion_while_target_not_ready`: the condition is
+                // per-TARGET (its shard-table version), never per-shard, so
+                // one shard's wait covers the activation for all of them —
+                // and if the target never activates, the whole worker pays
+                // the 4 s budget ONCE instead of once per shard.
+                let mut not_ready_budget = TARGET_NOT_READY_MAX_RETRIES;
                 let mut task_idx = 0;
                 while task_idx < chunk.len() {
                     if !migration_epoch_current(shard_table, topology_epoch) {
@@ -12729,20 +12734,38 @@ fn run_migration_batch_with_origin(
                             }
                         };
                         let manifest_hash = compute_manifest_for_entries(&manifest_entries);
-                        let verify_result = send_migration_complete(
-                            addr,
-                            task.shard,
-                            task.from_node,
-                            manifest_entries.len() as u64,
-                            fence_seq,
-                            topology_epoch,
-                            Some(&mut stream),
-                            &manifest_hash,
-                            &manifest_entries,
-                            true,
-                            auth_secret,
-                            enumeration_cutoff,
-                            &engine.weak_tombstone_keys_for_shard(task.shard),
+                        // W11 FIX 5 (default-15) — a `code=37`
+                        // ERR_MIGRATION_TARGET_NOT_READY rejection is the
+                        // target saying "I have not activated your epoch
+                        // YET": pending, not failed. The batch-complete path
+                        // has always treated it that way (bounded retries
+                        // with the same backoff), but here ANY non-exact-key
+                        // rejection skipped escalation entirely and went
+                        // straight to the terminal abort — so a 404 ms
+                        // staggered activation made 91 handoffs terminal
+                        // while the identical race was won 6 s later on the
+                        // very next path. Retry it first; anything else falls
+                        // through to the historical machinery untouched.
+                        let verify_result = retry_completion_while_target_not_ready(
+                            &mut not_ready_budget,
+                            TARGET_NOT_READY_RETRY_DELAY,
+                            || {
+                                send_migration_complete(
+                                    addr,
+                                    task.shard,
+                                    task.from_node,
+                                    manifest_entries.len() as u64,
+                                    fence_seq,
+                                    topology_epoch,
+                                    Some(&mut stream),
+                                    &manifest_hash,
+                                    &manifest_entries,
+                                    true,
+                                    auth_secret,
+                                    enumeration_cutoff,
+                                    &engine.weak_tombstone_keys_for_shard(task.shard),
+                                )
+                            },
                         );
                         if let Err(e) = verify_result {
                             tracing::warn!(shard = task.shard, err = %e, "cluster: shard completion rejected");
@@ -13915,6 +13938,68 @@ fn migration_error_is_stale_epoch(err: &str) -> bool {
         "(code={}",
         crate::protocol::opcodes::ERR_STALE_EPOCH
     ))
+}
+
+/// W11 FIX 5 (default-15) — does a completion rejection mean "the target has
+/// not activated this epoch YET"?
+///
+/// The mirror of [`migration_error_is_stale_epoch`] for the OTHER direction:
+/// there the PEER is ahead of us, here the peer is behind us. Both are
+/// activation-ordering races, and both are answered by waiting rather than by
+/// failing the task — but only the peer-ahead case was ever handled at the
+/// per-shard completion arm.
+///
+/// Matches the shape [`migration_complete_rejection_error`] emits for the
+/// `[code][msg_len][msg]` envelope, exactly as the stale-epoch predicate does.
+fn completion_rejection_target_not_ready(err: &str) -> bool {
+    err.contains(&format!("(code={ERR_MIGRATION_TARGET_NOT_READY}"))
+}
+
+/// W11 FIX 5 — retry budget for `ERR_MIGRATION_TARGET_NOT_READY` at the
+/// per-shard completion arm. Matches `send_completion_only_handshakes`'
+/// long-standing budget (40 × 100 ms ≈ 4 s), which is what makes the two
+/// paths agree about the same race instead of one committing what the other
+/// declared terminal.
+const TARGET_NOT_READY_MAX_RETRIES: usize = 40;
+/// W11 FIX 5 — delay between [`TARGET_NOT_READY_MAX_RETRIES`] attempts.
+const TARGET_NOT_READY_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// W11 FIX 5 — drive `attempt` until it stops answering
+/// `ERR_MIGRATION_TARGET_NOT_READY`, the shared `budget` runs out, or it
+/// returns anything else (success or a different rejection, both returned
+/// verbatim to the caller's existing handling).
+///
+/// `budget` is `&mut` and SHARED across every shard a migration worker
+/// handles, deliberately: the condition is a property of the TARGET (whether
+/// it has activated our epoch), not of any one shard. So the first shard's
+/// wait covers the activation for all the rest — and a target that never
+/// activates costs the worker one budget in total instead of one per shard,
+/// which is the difference between a 4 s hiccup and a 2000-shard batch
+/// spending hours in `sleep`.
+///
+/// `delay` is a parameter so the cadence is unit-testable without sleeping.
+/// Retrying re-sends the SAME fold: nothing about the manifest is in
+/// question here, only whether the target has installed the epoch yet.
+fn retry_completion_while_target_not_ready(
+    budget: &mut usize,
+    delay: Duration,
+    mut attempt: impl FnMut() -> std::result::Result<(), String>,
+) -> std::result::Result<(), String> {
+    let mut last = attempt();
+    loop {
+        match &last {
+            Err(e) if completion_rejection_target_not_ready(e) => {}
+            _ => return last,
+        }
+        if *budget == 0 {
+            return last;
+        }
+        *budget -= 1;
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+        last = attempt();
+    }
 }
 
 /// F3 — how many times a `code=19` "missing exact key" completion rejection is
@@ -17497,25 +17582,6 @@ fn encode_transfer_request_payload(epoch: u64, requester: NodeId, shards: &[u16]
     payload
 }
 
-/// W1.1 FIX B — translate an inbound [`ShardTransferRequest`] into the
-/// outbound migration tasks this source should (re-)run, plus a count of
-/// *diverged* shards.
-///
-/// For each requested shard:
-/// - If the source's active table already names the requester as the
-///   shard's target master (or a target replica), the handoff either
-///   completed earlier (the source committed but the requester never
-///   acknowledged — re-running the migration re-sends the completion
-///   handshake idempotently) or is mid-flight. A task is synthesized;
-///   the caller filters out shards with a live tracked migration so an
-///   in-flight worker is never duplicated.
-/// - If the table does NOT name the requester but the activation's
-///   *intent* did (`intended_master` — i.e. the handoff was rolled back
-///   after a failed completion), the shard is counted as diverged. The
-///   caller repairs divergence by re-running the full topology
-///   activation, which rebuilds the handoff and re-pushes.
-/// - Shards where the requester is neither a current target holder nor
-///   the intended master are ignored (stale or malicious request).
 /// W11 FIX 4(a) — does an `OP_MIGRATION_TRANSFER_REQUEST` error payload carry
 /// the source's TERMINAL "I have no tasks for you" refusal?
 ///
@@ -17526,17 +17592,12 @@ fn encode_transfer_request_payload(epoch: u64, requester: NodeId, shards: &[u16]
 /// different rejection (stale epoch, target-not-ready) or a transport error
 /// all leave the requester's state exactly as it was.
 ///
-/// Exposed as [`transfer_request_rejection_is_no_tasks`] so the dispatch-side
-/// test can drive the REAL rejection envelope through this REAL detector,
-/// pinning producer and consumer together.
-fn transfer_request_was_refused(payload: &[u8]) -> bool {
-    payload.len() >= 2
-        && u16::from_le_bytes([payload[0], payload[1]]) == ERR_MIGRATION_NO_TASKS
-}
-
-/// Test-visible alias of [`transfer_request_was_refused`] — see its doc.
-pub(crate) fn transfer_request_rejection_is_no_tasks(payload: &[u8]) -> bool {
-    transfer_request_was_refused(payload)
+/// Crate-visible so the dispatch-side test can drive the REAL rejection
+/// envelope through this REAL detector, pinning producer and consumer
+/// together the way `stale_epoch_detail_is_recognised` does for the
+/// completion path.
+pub(crate) fn transfer_request_was_refused(payload: &[u8]) -> bool {
+    payload.len() >= 2 && u16::from_le_bytes([payload[0], payload[1]]) == ERR_MIGRATION_NO_TASKS
 }
 
 /// W11 FIX 4(a) — [`split_transfer_request_tasks`]'s verdict as counts, for
@@ -17562,6 +17623,28 @@ pub(crate) fn transfer_request_match_counts(
     (tasks.len(), diverged)
 }
 
+/// W1.1 FIX B — translate an inbound [`ShardTransferRequest`] into the
+/// outbound migration tasks this source should (re-)run, plus a count of
+/// *diverged* shards.
+///
+/// For each requested shard:
+/// - If the source's active table already names the requester as the
+///   shard's target master (or a target replica), the handoff either
+///   completed earlier (the source committed but the requester never
+///   acknowledged — re-running the migration re-sends the completion
+///   handshake idempotently) or is mid-flight. A task is synthesized;
+///   the caller filters out shards with a live tracked migration so an
+///   in-flight worker is never duplicated.
+/// - If the table does NOT name the requester but the activation's
+///   *intent* did (`intended_master` — i.e. the handoff was rolled back
+///   after a failed completion), the shard is counted as diverged. The
+///   caller repairs divergence by re-running the full topology
+///   activation, which rebuilds the handoff and re-pushes.
+/// - Shards where the requester is neither a current target holder nor
+///   the intended master are ignored (stale or malicious request). W11
+///   FIX 4(a): that verdict — `(0 tasks, 0 diverged)` for the WHOLE
+///   request — is what the dispatch handler refuses on, via
+///   [`transfer_request_match_counts`].
 fn split_transfer_request_tasks(
     table: &ShardTable,
     self_id: NodeId,
@@ -21169,8 +21252,7 @@ mod tests {
             Mutex::new(std::collections::HashSet::new());
 
         let dispatched = |set: &Mutex<std::collections::HashSet<(u64, u16)>>| {
-            let mut d: std::collections::HashSet<(u64, u16)> =
-                std::collections::HashSet::new();
+            let mut d: std::collections::HashSet<(u64, u16)> = std::collections::HashSet::new();
             d.extend(set.lock().iter().copied());
             d
         };
@@ -21249,8 +21331,7 @@ mod tests {
         // skip WITHOUT consuming cap, so a third shard still gets in.
         signaled_set.lock().clear();
         signaled_set.lock().insert((replica.0, 7));
-        let mut streaming: std::collections::HashSet<(u64, u16)> =
-            std::collections::HashSet::new();
+        let mut streaming: std::collections::HashSet<(u64, u16)> = std::collections::HashSet::new();
         streaming.insert((replica.0, 8));
         let mut all = streaming;
         all.extend(signaled_set.lock().iter().copied());
@@ -26802,9 +26883,11 @@ mod tests {
             }];
             let populated: std::collections::HashSet<u16> = [shard].into_iter().collect();
             match origin {
-                MigrationRunOrigin::Resync => migration
-                    .lock()
-                    .start_outbound_resync(&tasks, NodeId(1), &populated),
+                MigrationRunOrigin::Resync => {
+                    migration
+                        .lock()
+                        .start_outbound_resync(&tasks, NodeId(1), &populated)
+                }
                 MigrationRunOrigin::Handoff => {
                     migration
                         .lock()
@@ -26826,8 +26909,23 @@ mod tests {
             let eng = engine.clone();
             let run = std::thread::spawn(move || {
                 run_migration_batch_with_origin(
-                    tasks, Some(addr), &keys, eng, &mig, &st, &None, epoch, 1, 100, fb, mb, ib,
-                    NodeId(1), None, None, origin,
+                    tasks,
+                    Some(addr),
+                    &keys,
+                    eng,
+                    &mig,
+                    &st,
+                    &None,
+                    epoch,
+                    1,
+                    100,
+                    fb,
+                    mb,
+                    ib,
+                    NodeId(1),
+                    None,
+                    None,
+                    origin,
                 )
             });
 
@@ -26928,8 +27026,7 @@ mod tests {
                     };
                     let _ = op_tx.send((request.op_code, request.flags));
                     if request.op_code == OP_MIGRATION_COMPLETE {
-                        while !gate.load(Ordering::Relaxed)
-                            && std::time::Instant::now() < deadline
+                        while !gate.load(Ordering::Relaxed) && std::time::Instant::now() < deadline
                         {
                             std::thread::sleep(Duration::from_millis(5));
                         }
@@ -28059,11 +28156,7 @@ mod tests {
             "precondition: the pre-fix counter closes the gate forever",
         );
         assert!(
-            event_orphan_cleanup_admissible(
-                9,
-                9,
-                mgr.inbound_plan_work_count(&table, self_id)
-            ),
+            event_orphan_cleanup_admissible(9, 9, mgr.inbound_plan_work_count(&table, self_id)),
             "the pass must run so the orphaned records can be reclaimed — \
              removing them is what finally lets the prune drop this entry",
         );
@@ -28078,11 +28171,7 @@ mod tests {
             .expect("the node holds some shard");
         assert!(mgr.register_inbound_source(held, NodeId(9)));
         assert!(
-            !event_orphan_cleanup_admissible(
-                9,
-                9,
-                mgr.inbound_plan_work_count(&table, self_id)
-            ),
+            !event_orphan_cleanup_admissible(9, 9, mgr.inbound_plan_work_count(&table, self_id)),
             "genuine plan-driven inbound work must still defer the pass",
         );
     }
@@ -32887,6 +32976,109 @@ mod tests {
             })
         );
         assert!(!migration_error_is_stale_epoch(&ack_err));
+    }
+
+    /// W11 FIX 5 (RED→GREEN, default-15) — an
+    /// `ERR_MIGRATION_TARGET_NOT_READY` (code=37) completion rejection must
+    /// be RETRIED at the per-shard completion arm, not treated as terminal.
+    ///
+    /// It means "I have not activated your epoch YET" — pending, not failed.
+    /// `send_completion_only_handshakes` has always retried it with a bounded
+    /// backoff; the per-shard arm sent any non-exact-key rejection straight
+    /// to the terminal abort, so a 404 ms staggered activation made 91
+    /// handoffs terminal while the identical race was won 6 s later on the
+    /// batch path.
+    ///
+    /// Driven through the REAL rejection envelope (`migration_complete_
+    /// rejection_error`, the string `send_migration_complete` returns) so the
+    /// producer and this detector cannot drift apart, and through the REAL
+    /// retry driver so the shared-budget contract is pinned too.
+    #[test]
+    fn target_not_ready_completion_is_retried_not_terminal() {
+        use crate::protocol::opcodes::{ERR_MIGRATION_IN_PROGRESS, STATUS_ERROR};
+
+        let envelope = |code: u16, msg: &str| {
+            let mut p = Vec::new();
+            p.extend_from_slice(&code.to_le_bytes());
+            p.extend_from_slice(&(msg.len() as u16).to_le_bytes());
+            p.extend_from_slice(msg.as_bytes());
+            p
+        };
+        let not_ready = migration_complete_rejection_error(
+            STATUS_ERROR,
+            &envelope(
+                ERR_MIGRATION_TARGET_NOT_READY,
+                "shard 7 target shard-table version 4 has not activated migration epoch 5",
+            ),
+        );
+        let in_progress = migration_complete_rejection_error(
+            STATUS_ERROR,
+            &envelope(ERR_MIGRATION_IN_PROGRESS, "shard 7 record count mismatch"),
+        );
+        assert!(
+            completion_rejection_target_not_ready(&not_ready),
+            "the real code=37 envelope must be recognised, got: {not_ready}",
+        );
+        assert!(
+            !completion_rejection_target_not_ready(&in_progress),
+            "only code=37 may be retried here, got: {in_progress}",
+        );
+
+        // The target activates on the 3rd attempt: the completion succeeds
+        // and only the attempts actually needed are spent.
+        let mut budget = 40usize;
+        let attempts = std::cell::Cell::new(0usize);
+        let got = retry_completion_while_target_not_ready(&mut budget, Duration::ZERO, || {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() < 3 {
+                Err(not_ready.clone())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(got.is_ok(), "the activation race must be won, got: {got:?}");
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(budget, 38, "only the retries taken are charged");
+
+        // Any OTHER rejection returns immediately, verbatim, for the
+        // historical escalation machinery — and costs no budget.
+        let mut budget = 40usize;
+        let attempts = std::cell::Cell::new(0usize);
+        let got = retry_completion_while_target_not_ready(&mut budget, Duration::ZERO, || {
+            attempts.set(attempts.get() + 1);
+            Err(in_progress.clone())
+        });
+        assert_eq!(got.as_ref().err(), Some(&in_progress));
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(budget, 40);
+
+        // A target that NEVER activates exhausts the budget and returns the
+        // rejection — and the budget is SHARED, so the next shard in the same
+        // worker does not pay it again. That is the whole reason the budget
+        // is not per-shard: a 2000-shard batch would otherwise sleep for
+        // hours against a wedged target.
+        let mut budget = 2usize;
+        let attempts = std::cell::Cell::new(0usize);
+        let got = retry_completion_while_target_not_ready(&mut budget, Duration::ZERO, || {
+            attempts.set(attempts.get() + 1);
+            Err(not_ready.clone())
+        });
+        assert_eq!(got.as_ref().err(), Some(&not_ready));
+        assert_eq!(attempts.get(), 3, "initial attempt plus the whole budget");
+        assert_eq!(budget, 0);
+
+        let attempts = std::cell::Cell::new(0usize);
+        let got = retry_completion_while_target_not_ready(&mut budget, Duration::ZERO, || {
+            attempts.set(attempts.get() + 1);
+            Err(not_ready.clone())
+        });
+        assert_eq!(got.as_ref().err(), Some(&not_ready));
+        assert_eq!(
+            attempts.get(),
+            1,
+            "an exhausted shared budget costs the next shard one attempt, \
+             not another full backoff window",
+        );
     }
 
     /// A failure reported against a SUPERSEDED epoch must still retire the task.
