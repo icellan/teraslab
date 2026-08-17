@@ -7570,6 +7570,12 @@ const ALREADY_SERVING_PROBE_BUDGET: usize = 32;
 /// re-election.
 const ALREADY_SERVING_VERIFY_DEADLINE: Duration = Duration::from_secs(10);
 
+/// The verify-only superset check [`verify_already_serving_skips`] runs
+/// against the migration target — `confirm_target_holds_superset` in
+/// production, a counting stub in tests. Injected so the probe BUDGET this
+/// phase enforces is observable without a network.
+type SupersetProbe<'a> = dyn Fn(&MigrationTask, &[(TxKey, u32)]) -> bool + Sync + 'a;
+
 /// Per-candidate dispositions produced by [`verify_already_serving_skips`].
 #[derive(Default)]
 struct AlreadyServingVerification {
@@ -7686,7 +7692,7 @@ fn verify_already_serving_skips(
     probe_budget: usize,
     max_concurrent_probes: usize,
     deadline: Duration,
-    probe: &(dyn Fn(&MigrationTask, &[(TxKey, u32)]) -> bool + Sync),
+    probe: &SupersetProbe<'_>,
 ) -> AlreadyServingVerification {
     let mut out = AlreadyServingVerification::default();
     // Split the free candidates (empty shard: nothing could be streamed
@@ -7714,8 +7720,7 @@ fn verify_already_serving_skips(
     }
 
     // ONE index pass for every budgeted shard, instead of one per candidate.
-    let shard_set: std::collections::HashSet<u16> =
-        needs_verify.iter().map(|t| t.shard).collect();
+    let shard_set: std::collections::HashSet<u16> = needs_verify.iter().map(|t| t.shard).collect();
     let (mut keys_map, enum_skipped) = engine.keys_by_shard_filtered(&shard_set);
     // `keys_by_shard_filtered` reports a TOTAL skip count, so on the (rare)
     // skip the batched pass cannot say WHICH shard was short. Re-enumerate
@@ -7806,7 +7811,7 @@ fn verify_one_already_serving_skip(
     engine: &Arc<Engine>,
     task: &MigrationTask,
     per_shard: &std::collections::HashMap<u16, (Vec<TxKey>, usize)>,
-    probe: &(dyn Fn(&MigrationTask, &[(TxKey, u32)]) -> bool + Sync),
+    probe: &SupersetProbe<'_>,
 ) -> AlreadyServingOutcome {
     let empty = (Vec::new(), 0usize);
     let (keys, enum_skipped) = per_shard.get(&task.shard).unwrap_or(&empty);
@@ -40515,7 +40520,10 @@ mod tests {
         migration.lock().start_outbound(
             &tasks,
             NodeId(1),
-            &shards.iter().copied().collect::<std::collections::HashSet<u16>>(),
+            &shards
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<u16>>(),
         );
 
         let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());

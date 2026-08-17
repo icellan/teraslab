@@ -959,7 +959,10 @@ impl MigrationManager {
                     .get(&shard)
                     .is_some_and(|r| r.contains(&node));
                 if !already_present || already_repair {
-                    self.resync_dual_write.entry(shard).or_default().insert(node);
+                    self.resync_dual_write
+                        .entry(shard)
+                        .or_default()
+                        .insert(node);
                 }
             }
         }
@@ -983,12 +986,7 @@ impl MigrationManager {
         self_id: NodeId,
         populated_shards: &std::collections::HashSet<u16>,
     ) {
-        self.start_outbound_with_origin(
-            tasks,
-            self_id,
-            populated_shards,
-            DualWriteOrigin::Handoff,
-        );
+        self.start_outbound_with_origin(tasks, self_id, populated_shards, DualWriteOrigin::Handoff);
     }
 
     /// Register Phase-H RESYNC backfill tasks (a repair toward a node the
