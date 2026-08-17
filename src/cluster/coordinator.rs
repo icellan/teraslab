@@ -6675,6 +6675,18 @@ impl ClusterCoordinator {
         // computing election here still removes ghost-master scenarios
         // when the partition view is populated.
         let evicted: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+        // W11 FIX 2 — the shards whose master this activation's own
+        // DETERMINISTIC plan is about to hand off. Computed BEFORE the
+        // election (the plan below is built against the refined table, which
+        // is exactly the circularity being broken): for these shards the
+        // deterministic master's current emptiness is the plan's precondition,
+        // never evidence that the placement is wrong.
+        let det_plan_master_shards: std::collections::HashSet<u16> =
+            ShardTable::migration_plan(&old_table_snap, &new_table)
+                .iter()
+                .filter(|task| task.is_master)
+                .map(|task| task.shard)
+                .collect();
         match &committed_assignment {
             // §8 — a committed assignment IS the authority on mastership:
             // install it verbatim (through set_master_for_shard, which
@@ -6697,6 +6709,7 @@ impl ClusterCoordinator {
                     partition_view,
                     &evicted,
                     adopt_view_holders,
+                    &det_plan_master_shards,
                 );
             }
         }
@@ -17442,12 +17455,48 @@ fn classify_shard_candidates(
 /// reactivation paths (`activate_topology` on startup/drain repair) rely on
 /// this to install the deterministic round-robin table identically on every
 /// node.
+///
+/// # This activation's own plan is not evidence of loss — W11 FIX 2
+///
+/// `plan_master_shards` names the shards for which the caller's freshly
+/// computed DETERMINISTIC plan already carries a master task, i.e. the shards
+/// whose deterministic master is about to be filled BY THIS ACTIVATION. On a
+/// fresh activation (`adopt_view_holders == false`) those shards are exempt
+/// from deviation entirely.
+///
+/// The reasoning is the one already applied to view-evidenced EXTERNAL
+/// holders a few lines below, extended to the assignment-internal case. A
+/// deviation exists to route reads to a node that demonstrably has the data.
+/// Mid-rebalance the deterministic master is empty *because this very
+/// activation's plan is what fills it*, so the emptiness is not evidence of a
+/// stale or lost placement — it is the plan's precondition. Deviating on it
+/// buys nothing (the handoff protocol, not the table, is what keeps the
+/// current master serving until the new master holds the data — see
+/// `begin_handoff_with` and the no-loss note on
+/// [`phantom_master_shard_count`]) and costs a great deal: the deviation is
+/// transient by construction, so its only lasting effect is to arm the
+/// same-term re-heal, which reverts it once the fill lands (the Task #47
+/// strict-superiority decay) — a second whole rebalance, and, because each
+/// node reaches that point at its own moment, two nodes can install DIFFERENT
+/// tables at the SAME shard-table version. Measured on CI @ 3a38dc2:
+/// 1240 shards deviated by construction in scenario 06 and 978 in
+/// scenario 07, and in default-06 all four nodes activated term 2 with
+/// byte-identical refined tables, after which n1/n4 re-healed to pure
+/// deterministic while n2/n3 had not — masters summing 4408 against 4096.
+///
+/// The exemption is deliberately NOT applied when the deterministic master is
+/// in `evicted` (a known-dead node cannot be filled by any plan) and NOT
+/// applied on the same-term re-heal, whose whole job is to re-decide
+/// mastership from settled evidence: `plan_master_shards` is empty there by
+/// construction (the re-heal re-plans against an already-installed table),
+/// but the `adopt_view_holders` guard states the intent independently of that.
 pub fn apply_master_election(
     table: &mut ShardTable,
     _prev_table: &ShardTable,
     partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
     evicted: &std::collections::HashSet<NodeId>,
     adopt_view_holders: bool,
+    plan_master_shards: &std::collections::HashSet<u16>,
 ) {
     let view_empty = partition_view.is_empty();
     // Task #22 — an empty view carries no ownership signal. Returning here
@@ -17526,8 +17575,22 @@ pub fn apply_master_election(
         }
     }
 
+    let mut suppressed_by_plan: u64 = 0;
     for shard in 0..NUM_SHARDS as u16 {
         let assignment = table.target_assignment(shard);
+
+        // W11 FIX 2 — this activation's OWN plan fills the deterministic
+        // master for this shard, so its current emptiness proves nothing about
+        // placement. Leave the deterministic pick alone (see the fn doc for the
+        // full argument). An evicted deterministic master is exempt from the
+        // exemption: no plan can fill a dead node.
+        if !adopt_view_holders
+            && plan_master_shards.contains(&shard)
+            && !evicted.contains(&assignment.master)
+        {
+            suppressed_by_plan = suppressed_by_plan.saturating_add(1);
+            continue;
+        }
 
         let mut candidate_nodes: Vec<NodeId> = Vec::with_capacity(1 + assignment.replicas.len());
         candidate_nodes.push(assignment.master);
@@ -17726,6 +17789,31 @@ pub fn apply_master_election(
             }
         }
     }
+
+    if suppressed_by_plan > 0 {
+        ELECTION_DEVIATIONS_SUPPRESSED_PLAN_FILL_TOTAL
+            .fetch_add(suppressed_by_plan, Ordering::Relaxed);
+        tracing::debug!(
+            shards = suppressed_by_plan,
+            "cluster: master election left the deterministic pick for shards this \
+             activation's own plan fills",
+        );
+    }
+}
+
+/// W11 FIX 2 — count of shards whose master election was left at the
+/// deterministic pick because this activation's own plan carries their master
+/// handoff. Read via [`election_deviations_suppressed_plan_fill_total`] and
+/// exported as `teraslab_election_deviations_suppressed_plan_fill_total`.
+static ELECTION_DEVIATIONS_SUPPRESSED_PLAN_FILL_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of election deviations declined because the shard's deterministic
+/// master is being filled by the same activation's plan (W11 FIX 2). The
+/// counter is process-global bookkeeping only — the election's OUTPUT stays a
+/// pure function of its inputs.
+pub fn election_deviations_suppressed_plan_fill_total() -> u64 {
+    ELECTION_DEVIATIONS_SUPPRESSED_PLAN_FILL_TOTAL.load(Ordering::Relaxed)
 }
 
 /// Phase H — `Send`-able handle for posting resync requests from a
@@ -29133,6 +29221,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             false,
+            &std::collections::HashSet::new(),
         );
 
         // Sanity: the election actually deviated from round-robin,
@@ -29930,6 +30019,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             false,
+            &std::collections::HashSet::new(),
         );
 
         // Election must have deviated from round-robin (otherwise the test
@@ -38192,6 +38282,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             false,
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(
@@ -38271,6 +38362,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             false,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(
             table.target_assignment(shard).master,
@@ -38979,6 +39071,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             false,
+            &std::collections::HashSet::new(),
         );
         (NodeId(1), NodeId(2), table.target_assignment(shard).master)
     }
@@ -39039,6 +39132,114 @@ mod tests {
         assert_eq!(
             elected, det,
             "equal reported counts are a data tie; the deterministic master must be preserved",
+        );
+    }
+
+    /// W11 FIX 2 (CI @ 3a38dc2, scenarios 06 scale-up / 07 scale-down) — a
+    /// fresh activation must not demote a deterministic master whose fill is
+    /// carried by its OWN plan.
+    ///
+    /// Mid-rebalance the deterministic master is empty *because this
+    /// activation's plan has not run yet*, so the material-lag demotion fires
+    /// by construction: 1240 shards deviated in scenario 06, 978 in scenario
+    /// 07. Every one of those deviations is transient — the plan fills the
+    /// deterministic master, the Task #47 strict-superiority rule then decays
+    /// the deviation back, and the same-term re-heal that performs the decay
+    /// re-plans the whole store a second time. Worse, nodes reach the decay at
+    /// different moments, so two nodes install DIFFERENT tables at the SAME
+    /// shard-table version (default-06: n1/n4 decayed, n2/n3 had not, masters
+    /// summing 4408 against 4096).
+    ///
+    /// The mechanism itself must survive for its real purpose, so the
+    /// same-term re-heal with identical inputs still deviates, as does a fresh
+    /// activation whose plan does NOT carry the shard (a genuinely stale
+    /// placement) and one whose deterministic master has been evicted (no plan
+    /// can fill a dead node).
+    #[test]
+    fn apply_master_election_keeps_det_master_this_activations_plan_fills() {
+        let members = [NodeId(1), NodeId(2)];
+        let prev_table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let table = ShardTable::compute_with_epoch(&members, 2, 2, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| table.target_assignment(s).master == NodeId(1))
+            .expect("at least one shard mastered by N1 in a 2-member ring");
+        assert!(
+            table.target_assignment(shard).replicas.contains(&NodeId(2)),
+            "precondition: N2 is the shard's replica",
+        );
+
+        let entry = |seq: u64| {
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: seq,
+                manifest_digest: 0,
+                max_generation: 0,
+            }]
+        };
+        let view_for = |det_count: u64| {
+            let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+                std::collections::HashMap::new();
+            view.insert(NodeId(1), entry(det_count));
+            view.insert(NodeId(2), entry(500));
+            view
+        };
+        let in_plan = std::collections::HashSet::from([shard]);
+        let no_evictions = std::collections::HashSet::new();
+        let elect = |view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+                     evicted: &std::collections::HashSet<NodeId>,
+                     adopt: bool,
+                     plan: &std::collections::HashSet<u16>| {
+            let mut t = table.clone();
+            apply_master_election(&mut t, &prev_table, view, evicted, adopt, plan);
+            t.target_assignment(shard).master
+        };
+
+        // Empty deterministic master, full replica, shard in this
+        // activation's plan → the deterministic pick stands.
+        assert_eq!(
+            elect(&view_for(0), &no_evictions, false, &in_plan),
+            NodeId(1),
+            "an empty det master this activation's own plan fills must not be demoted",
+        );
+        // Same for the material-lag shape (1 record of 500) — a partly filled
+        // destination is still mid-plan.
+        assert_eq!(
+            elect(&view_for(1), &no_evictions, false, &in_plan),
+            NodeId(1),
+            "a partially filled det master mid-plan must not be demoted",
+        );
+
+        // The mechanism survives where it belongs: the SAME-TERM RE-HEAL
+        // re-decides mastership from settled evidence and still deviates.
+        assert_eq!(
+            elect(&view_for(0), &no_evictions, true, &in_plan),
+            NodeId(2),
+            "the same-term re-heal must still promote the node holding the data",
+        );
+        // A fresh activation whose plan does NOT carry the shard still
+        // deviates — that emptiness is genuine evidence, not a precondition.
+        assert_eq!(
+            elect(
+                &view_for(0),
+                &no_evictions,
+                false,
+                &std::collections::HashSet::new()
+            ),
+            NodeId(2),
+            "a det master no plan fills is genuinely stale and must be demoted",
+        );
+        // An EVICTED deterministic master cannot be filled by any plan.
+        assert_eq!(
+            elect(
+                &view_for(0),
+                &std::collections::HashSet::from([NodeId(1)]),
+                false,
+                &in_plan,
+            ),
+            NodeId(2),
+            "no plan can fill a dead node; eviction overrides the plan exemption",
         );
     }
 
@@ -39103,6 +39304,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             true,
+            &std::collections::HashSet::new(),
         );
         let mut table_node4 = ShardTable::compute_with_epoch(&members, rf, term, 1);
         apply_master_election(
@@ -39111,6 +39313,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             true,
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(
@@ -39167,6 +39370,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             false,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(
             table.target_assignment(shard).master,
@@ -39194,6 +39398,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             false,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(
             table.target_assignment(7),
@@ -39218,7 +39423,14 @@ mod tests {
         let mut evicted = std::collections::HashSet::new();
         evicted.insert(NodeId(1));
 
-        apply_master_election(&mut table, &prev_table, &view, &evicted, false);
+        apply_master_election(
+            &mut table,
+            &prev_table,
+            &view,
+            &evicted,
+            false,
+            &std::collections::HashSet::new(),
+        );
         assert_ne!(
             table.target_assignment(shard).master,
             NodeId(1),
@@ -39294,6 +39506,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             true,
+            &std::collections::HashSet::new(),
         );
         let mut table_node4 = ShardTable::compute_with_epoch(&members, rf, term, 1);
         apply_master_election(
@@ -39302,6 +39515,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             true,
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(
@@ -39371,6 +39585,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             true,
+            &std::collections::HashSet::new(),
         );
         let mut reheal_node4 = ShardTable::compute_with_epoch(&members, rf, term, 1);
         apply_master_election(
@@ -39379,6 +39594,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             true,
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(
@@ -39452,6 +39668,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             true,
+            &std::collections::HashSet::new(),
         );
         let mut table_node4 = ShardTable::compute_with_epoch(&members, rf, term, 1);
         apply_master_election(
@@ -39460,6 +39677,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             true,
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(
@@ -39541,6 +39759,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             false,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(
             table.target_assignment(shard).master,
@@ -39608,6 +39827,7 @@ mod tests {
             &forward,
             &std::collections::HashSet::new(),
             true,
+            &std::collections::HashSet::new(),
         );
         let mut table_rev = ShardTable::compute_with_epoch(&members, rf, term, 1);
         apply_master_election(
@@ -39616,6 +39836,7 @@ mod tests {
             &reversed,
             &std::collections::HashSet::new(),
             true,
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(
@@ -39681,6 +39902,7 @@ mod tests {
             &view,
             &std::collections::HashSet::new(),
             true,
+            &std::collections::HashSet::new(),
         );
 
         assert_ne!(
@@ -39935,6 +40157,7 @@ mod tests {
                 &empty_view,
                 &std::collections::HashSet::new(),
                 false,
+                &std::collections::HashSet::new(),
             );
             tables.push(
                 (0..NUM_SHARDS as u16)
