@@ -1537,6 +1537,21 @@ pub(crate) fn render_metrics_text(
             mm.orphan_cleanup_retained_no_evidence
                 .load(Ordering::Relaxed) as u64,
         );
+        // W12 — the two outcomes of the proof-of-elsewhere path that drains
+        // the gauge above. Read them together: `retained_no_evidence` falling
+        // while `proof_reclaimed` rises is convergence; `proof_refused`
+        // climbing while `proof_reclaimed` stays flat means the committed
+        // holders are not confirming, so the copies are (correctly) kept.
+        prom_counter(
+            &mut out,
+            "teraslab_orphan_cleanup_proof_reclaimed_total",
+            mm.orphan_cleanup_proof_reclaimed.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_orphan_cleanup_proof_refused_total",
+            mm.orphan_cleanup_proof_refused.get(),
+        );
         // W10 composition review P1 — the reverse-heal live-recency confirm
         // runs synchronously on the coordinator event loop and pays one
         // filtered index walk per round, so its rate, admitted volume,

@@ -1498,6 +1498,20 @@ pub struct MigrationMetrics {
     /// pass (event-driven or batch-completion); a pass that reclaims (or
     /// finds no retained shard) resets it to the new census.
     pub orphan_cleanup_retained_no_evidence: AtomicU32,
+    /// W12 — shards reclaimed by the proof-of-elsewhere path: the #28
+    /// committed-handoff evidence was missing (and, in the SIGKILL /
+    /// never-handed-off case, unearnable), but every CURRENT committed holder
+    /// positively confirmed it already holds a superset of this node's copy.
+    /// This is the counter that drains the permanent over-replication
+    /// `orphan_cleanup_retained_no_evidence` used to gauge forever.
+    pub orphan_cleanup_proof_reclaimed: PaddedCounter,
+    /// W12 — shards the proof-of-elsewhere path REFUSED: at least one
+    /// committed holder did not confirm containment (it is behind on a record,
+    /// unreachable, or its address is unknown). Fail-closed and expected to be
+    /// non-zero during churn; a value that climbs while
+    /// `orphan_cleanup_proof_reclaimed` stays flat means the holders are not
+    /// converging, not that reclamation is broken.
+    pub orphan_cleanup_proof_refused: PaddedCounter,
     /// W10 composition review P1 — completed LIVE-RECENCY CONFIRM rounds
     /// (`confirm_self_behind_with_live_recency`). Each round costs one
     /// filtered primary-index walk plus the device reads for the shards it
@@ -1597,6 +1611,8 @@ impl MigrationMetrics {
             topology_proposal_revalidation_emptied: PaddedCounter::new(),
             topology_catch_up_reproposal_skipped: PaddedCounter::new(),
             orphan_cleanup_retained_no_evidence: AtomicU32::new(0),
+            orphan_cleanup_proof_reclaimed: PaddedCounter::new(),
+            orphan_cleanup_proof_refused: PaddedCounter::new(),
             reheal_live_confirm_rounds: PaddedCounter::new(),
             reheal_live_confirm_shards: PaddedCounter::new(),
             reheal_live_confirm_deferred: PaddedCounter::new(),
