@@ -5958,6 +5958,10 @@ impl ClusterCoordinator {
             cluster_secret,
             committed_cluster_key: self.committed_cluster_key.clone(),
             topology_authority: self.topology_authority.clone(),
+            committed_master_cache: Arc::new(RwLock::new(CommittedMasterCache {
+                term: 0,
+                masters: Arc::new(Vec::new()),
+            })),
             active_topology_members: active_topology_members_for_cluster,
             inbound_state_path,
             outbound_state_path,
@@ -18083,6 +18087,10 @@ pub struct RunningCluster {
     cluster_secret: Option<Arc<Vec<u8>>>,
     /// Topology authority for quorum-committed term management.
     topology_authority: Arc<crate::cluster::topology::TopologyAuthority>,
+    /// W11 FIX 3 — memoized committed-term master row for the stale-table
+    /// gate ([`stale_table_may_serve_shard`]). Recomputed only when the
+    /// committed term advances.
+    committed_master_cache: Arc<RwLock<CommittedMasterCache>>,
     /// Atomic mirror of `topology_authority.committed_term()` — the
     /// cluster_key value stamped on outbound `OP_REPLICA_BATCH` traffic and
     /// gated on inbound traffic.
@@ -18205,21 +18213,116 @@ pub struct RunningCluster {
 /// topology writers.
 pub struct MasterSnapshot {
     /// Per-shard authoritative master, indexed by shard id (`0..NUM_SHARDS`).
-    /// Every entry is `NodeId(0)` when the local shard table lags the
-    /// committed topology term — the same sentinel
+    /// An entry is `NodeId(0)` when the local shard table lags the committed
+    /// topology term AND that shard's ownership actually moves between the
+    /// two (W11 FIX 3) — the same sentinel
     /// [`RunningCluster::authoritative_master_for_shard`] returns, so the
     /// dispatcher redirects with `NodeId(0)` and the client refetches its
     /// partition map.
     masters: Vec<NodeId>,
-    /// The `shard_table.version` these masters were captured at. A commit that
-    /// lands AFTER capture advances `committed_term` beyond this value while
-    /// the local table has not yet been installed; in that window the frozen
-    /// `masters` are stale and [`RunningCluster::is_master_snapshot`] must fall
-    /// back to the `NodeId(0)` sentinel, exactly as a live
-    /// [`RunningCluster::authoritative_master_for_shard`] does once
-    /// `table.version < committed_term`. See
+    /// W11 FIX 3 — the `committed_term` the per-shard fence decisions above
+    /// were made against. (This replaces the captured `shard_table.version`:
+    /// the staleness question is no longer "is the frozen table behind?" but
+    /// "has the term those per-shard decisions were judged against moved?")
+    ///
+    /// The masters vector already encodes "stale table, but this shard's
+    /// owner does not move" per shard. That judgement is only valid for the
+    /// committed term it was computed from: a commit that lands AFTER capture
+    /// advances `committed_term` past this value and re-opens the question
+    /// for every shard, so [`RunningCluster::is_master_snapshot`] falls back
+    /// wholesale to `No` rather than trusting decisions made against a
+    /// superseded term. See
     /// `master_snapshot_goes_stale_when_commit_lands_after_capture`.
-    version: u64,
+    committed_at_capture: u64,
+}
+
+/// W11 FIX 3 — memoized per-shard MASTER row of the committed term's
+/// deterministic baseline table.
+///
+/// The stale-table gate needs "who does the COMMITTED term say masters this
+/// shard?" on the routing hot path, and the answer costs a full
+/// `NUM_SHARDS`-wide placement computation. It only changes when the
+/// committed term does, so it is computed once per term and reused.
+struct CommittedMasterCache {
+    /// The committed term `masters` was computed for. `0` = nothing cached
+    /// (no committed term can be `0` once a topology exists).
+    term: u64,
+    /// Indexed by shard id (`0..NUM_SHARDS`). `Arc` so a snapshot capture
+    /// can hold the whole row without copying 4096 ids.
+    masters: Arc<Vec<NodeId>>,
+}
+
+/// W11 FIX 3 — may a shard be served from a shard table that LAGS the
+/// committed topology term?
+///
+/// # The outage this opens up
+///
+/// [`RunningCluster::route`] and
+/// [`RunningCluster::authoritative_master_for_shard`] used to reject EVERY
+/// key while `table.version < committed_term`, returning the `NodeId(0)`
+/// sentinel. CI @ 3a38dc2 scenario 07 shows the cost: 3.11 s in which the
+/// union of the survivors answered `ERR_NO_QUORUM` to everything (3193
+/// failed GETs), because the activation of a freshly committed term takes an
+/// exchange phase to arrive. Most of those keys belonged to shards the new
+/// term does not move at all.
+///
+/// # Safety argument
+///
+/// The gate exists because the active table's MEMBER SET is superseded, so
+/// its ownership answers may be wrong. For a shard whose master is
+/// IDENTICAL under the active table and the committed term's deterministic
+/// baseline, that answer is not wrong: there is no ownership transition in
+/// flight for it, no migration is planned for it (a handoff is generated
+/// exactly for shards whose master moves), and the node that serves it now
+/// is the node that will still serve it after activation. Serving it from
+/// the active table therefore cannot create a second master.
+///
+/// Three conditions, all required:
+///
+///  * `active_effective == active_target` — the LOCAL table has no handoff
+///    in flight for the shard. A shard mid-handoff has two candidate owners
+///    already; the stale-table gate is not the place to arbitrate that.
+///  * `active_target == committed_master` — the committed term keeps the
+///    shard exactly where it is.
+///  * `committed_master != NodeId(0)` — never serve from the unassigned
+///    sentinel.
+///
+/// # Residual, stated deliberately
+///
+/// The committed baseline is the DETERMINISTIC assignment for the committed
+/// term (round-robin/HRW, with the committed §8 assignment overlaid when the
+/// term carries one). When a term carries no assignment, each node's own
+/// activation may additionally run [`apply_master_election`], which can
+/// deviate from that baseline for a shard whose baseline master looks like a
+/// subset holder in that node's partition view. So a peer that already
+/// activated the term could, in principle, have elected itself master of a
+/// shard this predicate is willing to serve.
+///
+/// That is not a hazard this predicate introduces:
+///  * the ONLY mastership it ever serves is the deterministic one every node
+///    derives identically — never a superseded or invented assignment — and
+///    election deviation is defined to DECAY back to exactly that pick (see
+///    `apply_master_election`'s Task #47 rules);
+///  * election divergence is a pre-existing, per-node condition that the
+///    stale-table gate never guarded: two nodes BOTH at `version ==
+///    committed` can already elect different masters for one shard (Task
+///    #22, the `masters = 4671/4096` case), which is why the phantom-master
+///    detector exists;
+///  * the deviation needs the baseline master to look data-poor in the
+///    peer's view, and the baseline master here is also the node that has
+///    been serving and replicating the shard under the previous term — the
+///    most likely FULL holder. W11 FIX 2 (apply-before-broadcast) removes
+///    the specific way it went missing from that view in CI, where a stale
+///    `local_cluster_key` made it answer `STATUS_ERROR` to every exchange
+///    query.
+fn stale_table_may_serve_shard(
+    active_effective_master: NodeId,
+    active_target_master: NodeId,
+    committed_master: NodeId,
+) -> bool {
+    committed_master != NodeId(0)
+        && active_effective_master == active_target_master
+        && active_target_master == committed_master
 }
 
 /// Per-shard "this node HOLDS a copy of this shard's records" view, captured
@@ -18300,14 +18403,103 @@ impl RunningCluster {
         }
     }
 
-    fn authoritative_master_for_shard(&self, shard: u16) -> NodeId {
-        let table = self.shard_table.read();
-        let committed = self.topology_authority.committed_term();
-        if table.version < committed {
-            return NodeId(0);
+    /// W11 FIX 3 — the committed term's deterministic per-shard MASTER row,
+    /// memoized per term (see [`CommittedMasterCache`]).
+    ///
+    /// `committed_term` is the value the caller already read; passing it in
+    /// keeps the caller's gate decision and this lookup on the SAME term.
+    ///
+    /// Returns `None` — and the caller must then fence wholesale, exactly as
+    /// before this fix — when the baseline cannot be trusted:
+    ///
+    ///  * `committed_members` is empty (nothing committed yet), or
+    ///  * a commit landed while this function was reading the authority's
+    ///    committed state. Terms are strictly increasing and members /
+    ///    placement version / assignment advance WITH the term under the
+    ///    authority's `commit_apply` lock, so re-reading the term after the
+    ///    other three and finding it unchanged proves the four belong to the
+    ///    same term. Any change fails closed rather than caching a mixed row.
+    ///
+    /// `rf` only shapes the REPLICA columns — the master row of
+    /// `ShardTable::compute_with_epoch` is `members[shard % n]` at placement
+    /// v1 and the HRW argmax over `members` at v2, neither of which reads
+    /// `rf` — so passing the active table's rf cannot skew the comparison.
+    fn committed_masters(&self, committed_term: u64, rf: u8) -> Option<Arc<Vec<NodeId>>> {
+        {
+            let cache = self.committed_master_cache.read();
+            if cache.term == committed_term {
+                return Some(cache.masters.clone());
+            }
         }
-        let addrs = self.node_addrs.read();
-        Self::preferred_master_for_shard(&table, self.self_id, &addrs, shard)
+        let members = self.topology_authority.committed_members();
+        if members.is_empty() {
+            return None;
+        }
+        let placement_version = self.topology_authority.committed_placement_version();
+        let assignment = self.topology_authority.committed_assignment();
+        if self.topology_authority.committed_term() != committed_term {
+            // Raced a commit — the members/placement/assignment just read may
+            // straddle two terms. Fail closed; the next call recomputes.
+            return None;
+        }
+        let baseline = committed_baseline_table(
+            &members,
+            rf,
+            committed_term,
+            placement_version,
+            assignment.as_ref(),
+        );
+        let masters: Arc<Vec<NodeId>> = Arc::new(
+            (0..NUM_SHARDS as u16)
+                .map(|shard| baseline.target_assignment(shard).master)
+                .collect(),
+        );
+        {
+            let mut cache = self.committed_master_cache.write();
+            // Never let a slower thread's older row overwrite a newer one.
+            if cache.term <= committed_term {
+                *cache = CommittedMasterCache {
+                    term: committed_term,
+                    masters: masters.clone(),
+                };
+            }
+        }
+        Some(masters)
+    }
+
+    /// The authoritative master for `shard`, or the `NodeId(0)` sentinel when
+    /// this node's view is not trustworthy for it.
+    ///
+    /// W11 FIX 3 — when the local table lags the committed term, the sentinel
+    /// is returned only for shards whose ownership actually MOVES between the
+    /// active table and the committed term's deterministic baseline; a shard
+    /// both agree on is answered from the active table. See
+    /// [`stale_table_may_serve_shard`] for the safety argument.
+    fn authoritative_master_for_shard(&self, shard: u16) -> NodeId {
+        let (version, rf, effective, target, preferred) = {
+            let table = self.shard_table.read();
+            let addrs = self.node_addrs.read();
+            (
+                table.version,
+                table.replication_factor(),
+                table.effective_assignment(shard).master,
+                table.target_assignment(shard).master,
+                Self::preferred_master_for_shard(&table, self.self_id, &addrs, shard),
+            )
+        };
+        let committed = self.topology_authority.committed_term();
+        if version < committed {
+            let serviceable = self
+                .committed_masters(committed, rf)
+                .and_then(|masters| masters.get(shard as usize).copied())
+                .is_some_and(|committed_master| {
+                    stale_table_may_serve_shard(effective, target, committed_master)
+                });
+            if !serviceable {
+                return NodeId(0);
+            }
+        }
+        preferred
     }
 
     /// This node's ID.
@@ -18525,26 +18717,47 @@ impl RunningCluster {
     /// [`Self::is_master_snapshot`] without re-locking for each item.
     ///
     /// Each shard resolves exactly as [`Self::authoritative_master_for_shard`]
-    /// would: `NodeId(0)` for every shard when the local table lags the
-    /// committed term, otherwise the per-shard preferred master. Take one per
+    /// would: the per-shard preferred master, or `NodeId(0)` for a shard the
+    /// stale-table gate withholds (W11 FIX 3 — only shards whose ownership
+    /// moves between the active table and the committed term). Take one per
     /// batch immediately before the per-item ownership loop.
     pub fn master_snapshot(&self) -> MasterSnapshot {
-        let table = self.shard_table.read();
         let committed = self.topology_authority.committed_term();
+        let table = self.shard_table.read();
         let version = table.version;
-        if version < committed {
-            // Stale local table: `authoritative_master_for_shard` returns the
-            // `NodeId(0)` sentinel for every shard — match that exactly.
+        // W11 FIX 3 — resolved BEFORE the per-shard loop so the whole snapshot
+        // is judged against one committed row (and one memoized lookup),
+        // rather than per shard. `None` keeps the pre-fix behaviour: withhold
+        // every shard.
+        let committed_masters = if version < committed {
+            self.committed_masters(committed, table.replication_factor())
+        } else {
+            None
+        };
+        if version < committed && committed_masters.is_none() {
             return MasterSnapshot {
                 masters: vec![NodeId(0); NUM_SHARDS],
-                version,
+                committed_at_capture: committed,
             };
         }
         let addrs = self.node_addrs.read();
         let masters = (0..NUM_SHARDS as u16)
-            .map(|shard| Self::preferred_master_for_shard(&table, self.self_id, &addrs, shard))
+            .map(|shard| {
+                if let Some(row) = committed_masters.as_deref() {
+                    let effective = table.effective_assignment(shard).master;
+                    let target = table.target_assignment(shard).master;
+                    let committed_master = row.get(shard as usize).copied().unwrap_or(NodeId(0));
+                    if !stale_table_may_serve_shard(effective, target, committed_master) {
+                        return NodeId(0);
+                    }
+                }
+                Self::preferred_master_for_shard(&table, self.self_id, &addrs, shard)
+            })
             .collect();
-        MasterSnapshot { masters, version }
+        MasterSnapshot {
+            masters,
+            committed_at_capture: committed,
+        }
     }
 
     /// Like [`Self::is_master`], but resolves the key's shard master from a
@@ -18576,14 +18789,21 @@ impl RunningCluster {
                 last_known_term: committed,
             };
         }
-        // Stale-table gate: a quorum commit that landed AFTER this snapshot was
-        // captured advances `committed_term` past the `shard_table.version`
-        // the snapshot froze, while the new table has not yet been installed.
-        // In that window a live `authoritative_master_for_shard` returns the
-        // `NodeId(0)` sentinel (→ `No`/redirect); the frozen `masters` would
-        // otherwise answer from the pre-commit assignment. Mirror the sentinel
-        // exactly rather than trust the stale snapshot.
-        if committed > snap.version {
+        // Stale-table gate: a quorum commit that landed AFTER this snapshot
+        // was captured re-opens the ownership question for every shard, while
+        // the new table has not yet been installed. The frozen `masters`
+        // would otherwise answer from the pre-commit assignment.
+        //
+        // W11 FIX 3 — the snapshot already encodes the per-shard stale-table
+        // decision (`NodeId(0)` for shards whose ownership moves between the
+        // active table and the committed term it was captured against), so
+        // the gate here is no longer `committed > snap.version` but
+        // `committed > snap.committed_at_capture`: it fires only when the
+        // committed term has moved PAST the one those decisions were made
+        // for, and then still falls back wholesale to `No`. For a snapshot
+        // captured while current, `committed_at_capture == snap.version` and
+        // this is bit-for-bit the old condition.
+        if committed > snap.committed_at_capture {
             return MasterQueryResult::No;
         }
         let shard = ShardTable::shard_for_key(key);
@@ -18610,10 +18830,16 @@ impl RunningCluster {
         let table = self.shard_table.read();
         let committed = self.topology_authority.committed_term();
         if table.version < committed {
-            // Stale local table: the master snapshot degrades to the `NodeId(0)`
-            // sentinel (nothing is locally mastered) and holdership is equally
-            // untrustworthy. Claim nothing — the sweep skips every candidate
-            // until the committed table is installed.
+            // Stale local table: holdership is untrustworthy. Claim nothing —
+            // the sweep skips every candidate until the committed table is
+            // installed.
+            //
+            // W11 FIX 3 deliberately did NOT relax this alongside the master
+            // gates. Withholding holdership only postpones a DAH space
+            // reclaim (no client-visible outage, which is what that fix was
+            // about), and holdership is the EFFECTIVE ∪ TARGET union rather
+            // than a single owner, so the "master unchanged ⇒ no transition
+            // in flight" argument does not transfer to it. Fail closed.
             return HolderSnapshot {
                 holds: vec![false; NUM_SHARDS],
             };
@@ -18663,22 +18889,45 @@ impl RunningCluster {
 
     /// Determine how to route a request for the given key.
     ///
-    /// If the local shard table is behind the committed topology, returns
-    /// a redirect with `NodeId(0)` to signal the client should re-fetch
-    /// the partition map.
+    /// If the local shard table is behind the committed topology, returns a
+    /// redirect with `NodeId(0)` to signal the client should re-fetch the
+    /// partition map — but W11 FIX 3 narrows that to the shards whose
+    /// ownership actually MOVES between the active table and the committed
+    /// term. A shard both agree on has no ownership transition in flight and
+    /// is routed normally; see [`stale_table_may_serve_shard`].
+    ///
+    /// Before that narrowing, one un-activated commit meant a TOTAL routing
+    /// outage: CI @ 3a38dc2 scenario 07 measured a 3.11 s union window in
+    /// which the survivors answered `ERR_NO_QUORUM` to every key (3193 failed
+    /// GETs) while most shards had not moved at all.
     pub fn route(&self, key: &TxKey) -> RouteDecision {
         let shard = ShardTable::shard_for_key(key);
-        let table = self.shard_table.read();
+        let (version, rf, effective, target, master) = {
+            let table = self.shard_table.read();
+            let addrs = self.node_addrs.read();
+            (
+                table.version,
+                table.replication_factor(),
+                table.effective_assignment(shard).master,
+                table.target_assignment(shard).master,
+                Self::preferred_master_for_shard(&table, self.self_id, &addrs, shard),
+            )
+        };
         let committed = self.topology_authority.committed_term();
-        if table.version < committed {
-            return RouteDecision::RedirectTo {
-                node: NodeId(0),
-                shard_table_version: table.version,
-            };
+        if version < committed {
+            let serviceable = self
+                .committed_masters(committed, rf)
+                .and_then(|masters| masters.get(shard as usize).copied())
+                .is_some_and(|committed_master| {
+                    stale_table_may_serve_shard(effective, target, committed_master)
+                });
+            if !serviceable {
+                return RouteDecision::RedirectTo {
+                    node: NodeId(0),
+                    shard_table_version: version,
+                };
+            }
         }
-        let version = table.version;
-        let addrs = self.node_addrs.read();
-        let master = Self::preferred_master_for_shard(&table, self.self_id, &addrs, shard);
 
         if master == self.self_id {
             RouteDecision::HandleLocally
@@ -20592,6 +20841,49 @@ impl RunningCluster {
         self.engine = Some(engine);
     }
 
+    /// Test-only — apply a quorum commit for `members` at `term`, so a test
+    /// can drive the authority's committed term AND membership forward
+    /// together (as production always does) instead of poking the
+    /// `committed_term` atomic and leaving `committed_members` behind.
+    ///
+    /// The stale-table gate ([`stale_table_may_serve_shard`]) compares the
+    /// active table against the COMMITTED term's membership, so a test that
+    /// desynchronizes the two exercises a state that cannot occur.
+    #[cfg(test)]
+    pub(crate) fn test_commit_topology(&self, members: &[NodeId], term: u64) {
+        let rf = self.shard_table.read().replication_factor();
+        let placement_version = self.shard_table.read().placement_version();
+        let cluster_id = self.topology_authority.cluster_id();
+        let peak = (members.len() as u64).max(self.topology_authority.peak_cluster_size());
+        self.topology_authority
+            .set_committed_voter_ever_seen(members);
+        let commit = crate::cluster::topology::TopologyCommit {
+            term,
+            proposer: self.self_id,
+            members: members.to_vec(),
+            cluster_id,
+            placement_version,
+            committed_peak: peak,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(
+                term,
+                &cluster_id,
+                members,
+                placement_version,
+                peak,
+                rf,
+                crate::cluster::topology::ASSIGNMENT_ABSENT_DIGEST,
+            ),
+            voters: members.to_vec(),
+            rf,
+            assignment: None,
+        };
+        assert_eq!(
+            self.topology_authority.handle_commit(&commit),
+            Some(term),
+            "fixture: the seeded commit must apply (rf / digest / gate mismatch?)",
+        );
+    }
+
     /// Shut down the cluster.
     ///
     /// Persists the current topology state to disk before stopping so
@@ -20780,6 +21072,10 @@ pub(crate) fn new_test_running_cluster(
         cluster_secret: None,
         committed_cluster_key: topology_authority.committed_term_shared(),
         topology_authority,
+        committed_master_cache: Arc::new(RwLock::new(CommittedMasterCache {
+            term: 0,
+            masters: Arc::new(Vec::new()),
+        })),
         active_topology_members,
         inbound_state_path: None,
         outbound_state_path: None,
@@ -32816,7 +33112,7 @@ mod tests {
                     &crate::protocol::frame::ResponseFrame {
                         request_id: request.request_id,
                         status: crate::protocol::opcodes::STATUS_OK,
-                        payload: vote.serialize().into(),
+                        payload: vote.serialize(),
                     }
                     .encode(),
                 )
@@ -37773,112 +38069,209 @@ mod tests {
         }
     }
 
-    /// A local shard table that lags the committed topology term must resolve
-    /// every shard's master to the `NodeId(0)` sentinel through the snapshot,
-    /// exactly as `authoritative_master_for_shard` does — so the dispatcher
-    /// redirects with `NodeId(0)` (client refetches its map) rather than
-    /// trusting a stale local view. Here that surfaces as `No` for every
-    /// shard (self is NodeId(1), never NodeId(0)), matching `is_master`.
+    /// W11 FIX 3 — the pure per-shard predicate behind the narrowed
+    /// stale-table gate.
     #[test]
-    fn master_snapshot_stale_table_resolves_sentinel_like_is_master() {
-        let members = vec![NodeId(1)];
+    fn stale_table_serves_only_shards_with_no_ownership_transition() {
+        // Master identical in the active table and the committed baseline,
+        // no local handoff: serve it.
+        assert!(
+            stale_table_may_serve_shard(NodeId(7), NodeId(7), NodeId(7)),
+            "a shard both tables agree on has no ownership transition in flight",
+        );
+        // The committed term moves the shard: fence it — the data has to
+        // migrate before the new owner may serve.
+        assert!(
+            !stale_table_may_serve_shard(NodeId(7), NodeId(7), NodeId(8)),
+            "a shard whose master differs between the two tables must fence",
+        );
+        // A local handoff is already in flight for the shard (effective !=
+        // target): two candidate owners exist and the stale-table gate is not
+        // the place to arbitrate them, even though the target agrees with the
+        // committed baseline.
+        assert!(
+            !stale_table_may_serve_shard(NodeId(7), NodeId(8), NodeId(8)),
+            "an in-flight handoff must keep the shard fenced",
+        );
+        // Never serve from the unassigned sentinel.
+        assert!(
+            !stale_table_may_serve_shard(NodeId(0), NodeId(0), NodeId(0)),
+            "NodeId(0) is the unassigned sentinel, never a servable master",
+        );
+    }
+
+    /// W11 FIX 3 (P2) — a local shard table that lags the committed topology
+    /// term must withhold only the shards whose ownership actually MOVES.
+    ///
+    /// CI @ 3a38dc2 scenario 07: `route()` rejected EVERY key while
+    /// `table.version < committed`, so one un-activated commit produced a
+    /// 3.11 s TOTAL read outage across the survivors (3193 failed GETs) even
+    /// though a quarter of the shards were not moving at all.
+    ///
+    /// Fixture: the active table is the term-5 round-robin over `{1,2}`; the
+    /// cluster then commits term 6 over `{1,2,3}` without activating it.
+    /// Under v1 round-robin (`members[shard % n]`) that leaves shard 0 on
+    /// node 1 and shard 1 on node 2 — unchanged, servable — while shards 2
+    /// and 3 move (1→3 and 2→1) and must still fence.
+    #[test]
+    fn stale_table_serves_unmoved_shards_and_fences_the_moved_ones() {
+        let members = vec![NodeId(1), NodeId(2)];
         let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
         let cluster = new_test_running_cluster(
             NodeId(1),
             table,
-            &[(NodeId(1), "127.0.0.1:4861".parse().unwrap())],
+            &[
+                (NodeId(1), "127.0.0.1:4861".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4862".parse().unwrap()),
+            ],
             &members,
             &[],
             &[],
             &[],
-            1,
+            2,
         );
-        // Force the committed term AHEAD of the local shard table's version
-        // (version 5): a freshly-rejoined node whose table trails the quorum.
-        let committed = cluster.shard_table.read().version + 1;
-        cluster
-            .topology_authority
-            .committed_term_shared()
-            .store(committed, Ordering::Relaxed);
+        // A quorum commit this node has NOT activated: term 6 grows the
+        // cluster to {1,2,3}. The local table stays at version 5.
+        cluster.test_commit_topology(&[NodeId(1), NodeId(2), NodeId(3)], 6);
+        assert_eq!(cluster.shard_table.read().version, 5, "table not activated");
         // Keep topology_epoch at the committed term so the transitioning gate
         // does not pre-empt the stale-table path we are exercising.
-        cluster.topology_epoch.store(committed, Ordering::Release);
+        cluster.topology_epoch.store(6, Ordering::Release);
 
         let snap = cluster.master_snapshot();
-        for shard in [0u16, 1, 1234, (NUM_SHARDS - 1) as u16] {
+
+        // Shard 0: master is node 1 (self) under BOTH tables → served.
+        assert_eq!(
+            cluster.route(&key_for_shard(0)),
+            RouteDecision::HandleLocally,
+            "shard 0 does not move (node 1 in both tables) — serve it locally",
+        );
+        assert_eq!(
+            cluster.is_master(&key_for_shard(0)),
+            MasterQueryResult::Yes,
+            "shard 0 is still this node's",
+        );
+
+        // Shard 1: master is node 2 under BOTH tables → routed, not fenced.
+        assert_eq!(
+            cluster.route(&key_for_shard(1)),
+            RouteDecision::RedirectTo {
+                node: NodeId(2),
+                shard_table_version: 5,
+            },
+            "shard 1 does not move (node 2 in both tables) — redirect to it, \
+             NOT to the NodeId(0) refetch sentinel",
+        );
+
+        // Shards 2 and 3 DO move under term 6 — still fenced.
+        for shard in [2u16, 3] {
+            assert_eq!(
+                cluster.route(&key_for_shard(shard)),
+                RouteDecision::RedirectTo {
+                    node: NodeId(0),
+                    shard_table_version: 5,
+                },
+                "shard {shard} changes owner under the committed term — it must \
+                 stay fenced until the table activates",
+            );
+            assert_eq!(
+                cluster.is_master(&key_for_shard(shard)),
+                MasterQueryResult::No,
+                "shard {shard} must not be claimed while its ownership moves",
+            );
+        }
+
+        // The batch snapshot must agree with the per-item path on every one.
+        for shard in [0u16, 1, 2, 3] {
             let key = key_for_shard(shard);
             assert_eq!(
                 cluster.is_master_snapshot(&snap, &key),
                 cluster.is_master(&key),
                 "stale-table snapshot must match per-item is_master for shard {shard}",
             );
-            assert_eq!(
-                cluster.is_master_snapshot(&snap, &key),
-                MasterQueryResult::No,
-                "stale-table shard {shard} must resolve to No via the NodeId(0) sentinel",
-            );
         }
     }
 
     /// FU#1 regression: a batch snapshot must not answer from a pre-commit
-    /// assignment after a quorum commit lands mid-batch. The snapshot freezes
-    /// the `shard_table.version` it was captured at; once `committed_term`
-    /// advances beyond that version — the same condition under which a live
-    /// `authoritative_master_for_shard` returns the `NodeId(0)` sentinel — the
-    /// frozen masters are stale, so `is_master_snapshot` must resolve to `No`
-    /// (redirect / refetch), NOT trust a stale `self == Yes` assignment. This
-    /// window is distinct from `master_snapshot_stale_table_resolves_sentinel_*`
-    /// (table already stale AT capture): here the snapshot is captured while
-    /// current, then the commit lands under it.
+    /// assignment after a quorum commit lands mid-batch. The snapshot records
+    /// the `committed_term` its per-shard decisions were judged against; once
+    /// `committed_term` moves past that value the frozen masters are stale, so
+    /// `is_master_snapshot` must resolve to `No` (redirect / refetch), NOT
+    /// trust a stale `self == Yes` assignment. This window is distinct from
+    /// `stale_table_serves_unmoved_shards_and_fences_the_moved_ones` (table
+    /// already stale AT capture): here the snapshot is captured while current,
+    /// then the commit lands under it.
+    ///
+    /// W11 FIX 3 leaves this gate WHOLESALE on purpose: a commit landing after
+    /// capture re-opens the ownership question for every shard at once, and
+    /// the snapshot cannot re-judge itself. Shard 0 below pins that — it does
+    /// NOT move under the new term, so the live path serves it while the
+    /// snapshot still refuses. That conservative divergence is the price of
+    /// lock-free per-item resolution and is pinned again by
+    /// `stale_snapshot_stays_conservative_even_after_table_catches_up`.
     #[test]
     fn master_snapshot_goes_stale_when_commit_lands_after_capture() {
-        let members = vec![NodeId(1)];
+        let members = vec![NodeId(1), NodeId(2)];
         let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
         let cluster = new_test_running_cluster(
             NodeId(1),
             table,
-            &[(NodeId(1), "127.0.0.1:4871".parse().unwrap())],
+            &[
+                (NodeId(1), "127.0.0.1:4871".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4872".parse().unwrap()),
+            ],
             &members,
             &[],
             &[],
             &[],
-            1,
+            2,
         );
 
         // Snapshot captured while the local table is CURRENT (version ==
-        // committed term == 5): this single-node cluster masters shard 0
-        // itself, so the fresh snapshot answers Yes.
+        // committed term == 5): under round-robin over {1,2} this node
+        // masters shard 0, so the fresh snapshot answers Yes.
         let snap = cluster.master_snapshot();
-        let key = key_for_shard(0);
+        let unmoved = key_for_shard(0);
+        let moved = key_for_shard(2);
         assert_eq!(
-            cluster.is_master_snapshot(&snap, &key),
+            cluster.is_master_snapshot(&snap, &unmoved),
             MasterQueryResult::Yes,
             "precondition: a snapshot captured while current owns shard 0",
         );
 
-        // A quorum commit lands AFTER the snapshot: committed_term advances to
-        // 6 while the local shard table (still version 5) has not yet been
-        // installed. topology_epoch is kept AT the committed term so the
+        // A quorum commit lands AFTER the snapshot: term 6 grows the cluster
+        // to {1,2,3} while the local shard table (still version 5) has not
+        // been installed. topology_epoch is kept AT the committed term so the
         // transitioning gate (observed > committed) does NOT fire — isolating
-        // the stale-table window this fix closes.
-        cluster
-            .topology_authority
-            .committed_term_shared()
-            .store(6, Ordering::Relaxed);
+        // the stale-table window this test covers.
+        cluster.test_commit_topology(&[NodeId(1), NodeId(2), NodeId(3)], 6);
         cluster.topology_epoch.store(6, Ordering::Release);
 
-        // Live is_master now sees table.version (5) < committed (6) → the
-        // NodeId(0) sentinel → No. The snapshot path MUST agree.
+        // Shard 2 MOVES under term 6 (node 1 → node 3): both paths refuse.
         assert_eq!(
-            cluster.is_master(&key),
+            cluster.is_master(&moved),
             MasterQueryResult::No,
-            "live is_master must redirect once the local table trails the commit",
+            "live is_master must refuse a shard whose owner the commit moves",
         );
         assert_eq!(
-            cluster.is_master_snapshot(&snap, &key),
+            cluster.is_master_snapshot(&snap, &moved),
             MasterQueryResult::No,
             "a snapshot gone stale under a mid-batch commit must resolve to No \
              (NodeId(0) sentinel), not a pre-commit Yes",
+        );
+
+        // Shard 0 does NOT move — the live path serves it, the snapshot still
+        // refuses, because its decisions were judged against term 5.
+        assert_eq!(
+            cluster.is_master(&unmoved),
+            MasterQueryResult::Yes,
+            "the live path serves a shard the commit leaves in place (W11 FIX 3)",
+        );
+        assert_eq!(
+            cluster.is_master_snapshot(&snap, &unmoved),
+            MasterQueryResult::No,
+            "the snapshot's per-shard decisions predate the commit, so it falls \
+             back wholesale rather than re-judging itself",
         );
     }
 
