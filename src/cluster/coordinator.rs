@@ -7268,17 +7268,27 @@ fn split_already_serving_migration_tasks(
 ///   unreadable records enumerates SHORT and an unread-aware manifest
 ///   would either be empty, "confirming" with zero verification, or
 ///   partial, probing a superset of the readable subset only): ANY
-///   enumeration skip demotes immediately. Otherwise the verify-only
-///   superset probe runs ([`confirm_target_holds_superset`] — the manifest
-///   machinery the completion handshake already carries): a confirmed
-///   superset keeps the cheap completion-only path (no pointless full
-///   re-stream on the routine FIX-B / re-drive handshake resends);
-///   anything else — target holds nothing, rejects, or is unreachable —
-///   DEMOTES the task to the normal streaming path with its readable live
-///   keys, whose count+manifest completion re-verifies end-to-end. An
-///   unreadable-footer manifest-collection failure also demotes (issue-#46
-///   posture: never commit an unverified non-empty shard; the streaming
-///   path's own error handling owns the outcome).
+///   enumeration skip demotes immediately with an EMPTY key list (P1
+///   residual — the readable subset must NOT stream: the no-churn
+///   manifest would be built from it, the target would verify M/M, the
+///   completion would COMMIT and record #28 evidence, and orphan cleanup
+///   could then delete the never-shipped records). The empty list routes
+///   the task onto the EMPTY path, whose skip-aware fenced recheck owns
+///   the disposition: a persistent skip refuses and parks the task Failed
+///   (visible, re-driven); a healed skip promotes back to the data path,
+///   where the short-snapshot guard re-verifies the manifest against the
+///   live count. Otherwise (a clean, complete enumeration) the
+///   verify-only superset probe runs ([`confirm_target_holds_superset`] —
+///   the manifest machinery the completion handshake already carries): a
+///   confirmed superset keeps the cheap completion-only path (no
+///   pointless full re-stream on the routine FIX-B / re-drive handshake
+///   resends); anything else — target holds nothing, rejects, or is
+///   unreachable — DEMOTES the task to the normal streaming path with its
+///   complete readable keys, whose count+manifest completion re-verifies
+///   end-to-end. An unreadable-footer manifest-collection failure also
+///   demotes with its keys (issue-#46 posture: never commit an unverified
+///   non-empty shard; those keys are a complete skip-free enumeration, so
+///   the streaming path's own error handling owns the outcome).
 ///
 /// Returns `(confirmed_completion_only, demoted)` where each demoted entry
 /// carries the live keys to stream.
@@ -7317,9 +7327,21 @@ fn verify_already_serving_skips(
                 readable = keys.len(),
                 %target_addr,
                 "cluster: already-serving verification enumerated unreadable \
-                 record(s) — demoting to the streaming path (issue #46)",
+                 record(s) — routing to the empty path's fenced recheck (issue #46)",
             );
-            demoted.push((task, keys));
+            // P1 residual: demote with an EMPTY key list, NOT the readable
+            // subset. Carrying the M readable keys would move the acked
+            // loss onto the streaming path: the no-churn manifest is built
+            // from the demoted set, the target verifies M/M, the
+            // completion COMMITS and records #28 evidence — and orphan
+            // cleanup may then delete the N−M records never shipped. The
+            // empty list routes the task onto the EMPTY path, whose
+            // skip-aware fenced recheck owns the disposition: a persistent
+            // skip refuses and parks the task Failed (visible, re-driven);
+            // a healed skip promotes back to the data path, where the
+            // short-snapshot guard re-verifies the manifest against the
+            // live count before any completion.
+            demoted.push((task, Vec::new()));
             continue;
         }
         let target_holds = match collect_manifest_entries(engine, task.shard, &keys) {
@@ -10183,8 +10205,12 @@ fn run_migration_batch(
     // W10 (armed-11) — a completion-only skip commits mastership on the
     // target, so it must first be VERIFIED: a candidate whose shard holds
     // LIVE source records (the snapshot was stale) may only stay
-    // completion-only if the target provably retains those records;
-    // otherwise it is demoted to the streaming path with its live keys.
+    // completion-only if the target provably retains those records.
+    // Otherwise it is demoted: probe-refused candidates carry their
+    // complete readable keys onto the data path; enumeration-skip
+    // candidates carry an EMPTY key list so they route onto the empty
+    // path's skip-aware fenced recheck (P1 residual — a readable SUBSET
+    // must never be streamed-and-committed).
     let (skipped_tasks, demoted) =
         verify_already_serving_skips(&engine, addr, skip_candidates, topology_epoch, auth_secret);
     // Owned storage for the demoted shards' live keys; must outlive
@@ -10851,6 +10877,72 @@ fn run_migration_batch(
                         } else {
                             shard_keys_snapshot.iter().map(|k| **k).collect()
                         };
+                        // W10 re-review (P1 residual) — never commit an EMPTY
+                        // no-churn manifest over a shard that live-holds
+                        // records. The healed-skip promotion re-enters the
+                        // data path in exactly this shape: an
+                        // unreadable-at-enumeration shard demoted with an
+                        // empty key list heals at the empty-path fenced
+                        // recheck, is promoted here with a ZERO-key snapshot,
+                        // and — because transiently unreadable old footers
+                        // produce NO redo churn — takes the snapshot branch:
+                        // the record_count=0 completion verifies 0/0 on a
+                        // data-less target, COMMITS, records #28 evidence, and
+                        // source-side orphan cleanup may then delete the whole
+                        // never-shipped shard. Nothing downstream reconciles
+                        // that: nothing streamed, nothing verifies. Refuse and
+                        // park for the re-drive, which re-enumerates fresh.
+                        //
+                        // Deliberately EMPTY-only, not `len < live`: a
+                        // non-empty-but-short no-churn snapshot arises
+                        // legitimately from writes landing between task
+                        // registration and the Phase-1 snapshot stamp — those
+                        // records reached the target through the dual-write
+                        // window and the exact-count+manifest verify (plus the
+                        // mismatch escalation) reconciles them; refusing those
+                        // rounds churned real-cluster convergence (observed as
+                        // intermittent cluster_tcp failures). The shard is
+                        // fenced at this point, so the live count is stable,
+                        // and the changed-shards branch is already skip-aware
+                        // via `rescan_skipped` above.
+                        let live_records = engine.shard_record_count(task.shard);
+                        if !changed_shards.contains(&task.shard)
+                            && fenced_keys.is_empty()
+                            && live_records > 0
+                        {
+                            tracing::error!(
+                                shard = task.shard,
+                                live_records,
+                                "cluster: refusing completion — the no-churn manifest is \
+                                 EMPTY while the shard live-holds records (issue #46); \
+                                 parking for re-drive",
+                            );
+                            send_migration_abort_completion_best_effort(
+                                addr,
+                                task,
+                                "empty no-churn manifest over a live shard (issue #46)",
+                                auth_secret,
+                            );
+                            if fail_migration_task_current_epoch(
+                                &migration,
+                                shard_table,
+                                &fenced_bm,
+                                &migrating_bm,
+                                task,
+                                topology_epoch,
+                                // W3 FIX C disposition (re-review P2-1): only a
+                                // MASTER handoff rolls the table back to self;
+                                // a replica-side task leaves it untouched.
+                                if task.is_master {
+                                    FailedTaskTableAction::Rollback
+                                } else {
+                                    FailedTaskTableAction::None
+                                },
+                            ) {
+                                failed.fetch_add(1, Ordering::Relaxed);
+                            }
+                            continue;
+                        }
                         // Close the window between Phase 1 snapshot and Phase 2
                         // fence: any key present after fence but NOT streamed
                         // in Phase 1 is a late write whose data never made it
@@ -24458,16 +24550,25 @@ mod tests {
         target.join().unwrap();
     }
 
-    /// W10 re-review P1-1 — the already-serving verification must be
-    /// skip-AWARE: `keys_for_shard` discards the unreadable-footer count,
-    /// so a shard whose live count is positive but whose records read
-    /// unreadable (relocation churn / torn CRC) enumerates SHORT. With
-    /// zero readable keys the empty-manifest branch then confirmed the
-    /// completion-only commit with NO verification at all — the exact
+    /// W10 re-review P1-1 (+ residual) — the already-serving verification
+    /// must be skip-AWARE: `keys_for_shard` discards the unreadable-footer
+    /// count, so a shard whose live count is positive but whose records
+    /// read unreadable (relocation churn / torn CRC) enumerates SHORT.
+    /// With zero readable keys the empty-manifest branch then confirmed
+    /// the completion-only commit with NO verification at all — the exact
     /// armed-11 commit shape, relabeled "every live key resolved stale" —
     /// and with a partial set the probe confirmed a superset of the
-    /// READABLE SUBSET only. Both shapes must DEMOTE to the streaming
-    /// path, whose issue-#46 machinery owns the outcome.
+    /// READABLE SUBSET only.
+    ///
+    /// Residual round: demoting WITH the readable keys just moved the
+    /// acked loss onto the streaming path (the no-churn manifest is built
+    /// from the demoted set, the target verifies M/M, the completion
+    /// COMMITS and records #28 evidence — and orphan cleanup may then
+    /// delete the N−M records never shipped). A skip therefore demotes
+    /// with an EMPTY key list, routing the task onto the EMPTY path whose
+    /// skip-aware fenced recheck refuses and parks it Failed while the
+    /// skip persists — nothing streamed, nothing committed, no #28
+    /// evidence.
     #[test]
     fn already_serving_verification_demotes_on_unreadable_footer() {
         use crate::index::TxIndexEntry;
@@ -24560,7 +24661,7 @@ mod tests {
         drop(listener);
 
         let (confirmed, demoted) =
-            verify_already_serving_skips(&engine, dead_addr, vec![task_a, task_b], 3, None);
+            verify_already_serving_skips(&engine, dead_addr, vec![task_a, task_b.clone()], 3, None);
         assert!(
             confirmed.is_empty(),
             "an unreadably-enumerated shard must NEVER confirm a \
@@ -24569,17 +24670,233 @@ mod tests {
         assert_eq!(
             demoted.len(),
             2,
-            "both skip shapes (M=0 and 0<M<N) must demote to streaming"
+            "both skip shapes (M=0 and 0<M<N) must demote"
         );
-        let demoted_b = demoted
-            .iter()
-            .find(|(t, _)| t.shard == shard_b)
-            .expect("shard B must be demoted");
+        for (task, keys) in &demoted {
+            assert!(
+                keys.is_empty(),
+                "a skip demotion must carry NO keys (shard {}: a readable \
+                 subset would stream M/M, verify, COMMIT, and record #28 \
+                 evidence — acked loss of the unreadable records; the empty \
+                 key list routes the task onto the EMPTY path's skip-aware \
+                 fenced recheck instead; got {keys:?})",
+                task.shard,
+            );
+        }
+
+        // Downstream: the demoted short set must never be
+        // streamed-and-committed. Driving the full batch against the
+        // still-corrupt engine must refuse via the empty path's fenced
+        // recheck — task parked Failed, nothing streamed, no commit
+        // handshake, no #28 committed-handoff evidence for orphan cleanup.
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 3, 1);
+        assert_eq!(table.shard_handoff_state(shard_b), ShardHandoff::ServingNew);
+        let epoch = table.version;
+        let shard_table = Arc::new(ShardTableLock::new(table));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration.lock().start_outbound(
+            std::slice::from_ref(&task_b),
+            NodeId(1),
+            &[shard_b].into_iter().collect(),
+        );
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let (addr, op_rx, stop, target) = spawn_ack_all_target(false);
+        let (completed, failed) = run_migration_batch(
+            vec![task_b],
+            Some(addr),
+            &[],
+            engine.clone(),
+            &migration,
+            &shard_table,
+            &None,
+            epoch,
+            1,
+            100,
+            fenced_bm,
+            migrating_bm,
+            inbound_bm,
+            NodeId(1),
+            None,
+            None,
+        );
         assert_eq!(
-            demoted_b.1,
-            vec![key_b_clean],
-            "the demoted stream must carry the READABLE keys"
+            (completed, failed),
+            (0, 1),
+            "an unreadably-enumerated shard must refuse this round (park \
+             Failed for the re-drive), never stream-and-commit a short set"
         );
+        {
+            let mgr = migration.lock();
+            assert_eq!(
+                mgr.failed_count(),
+                1,
+                "the task must park in the retry queue"
+            );
+            assert!(
+                !mgr.has_committed_handoff(shard_b, epoch),
+                "no #28 committed-handoff evidence may be recorded — it would \
+                 authorize orphan cleanup to delete the never-shipped records"
+            );
+        }
+        let seen: Vec<(u16, u16)> = op_rx.try_iter().collect();
+        assert!(
+            !seen
+                .iter()
+                .any(|(op, _)| *op == crate::protocol::opcodes::OP_REPLICA_BATCH),
+            "nothing may stream from a short enumeration (saw: {seen:?})"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|(op, _)| *op == OP_MIGRATION_BATCH_COMPLETE),
+            "no commit handshake may be sent for a refused shard (saw: {seen:?})"
+        );
+        stop.store(true, Ordering::Relaxed);
+        target.join().unwrap();
+    }
+
+    /// W10 re-review P1 residual (downstream guard) — the data path must
+    /// never COMMIT an EMPTY no-churn manifest over a shard that
+    /// live-holds records. This is the healed-skip promotion shape: an
+    /// unreadable-at-enumeration shard enters the batch with a zero-key
+    /// snapshot, its footers heal by the empty-path fenced recheck, the
+    /// task is promoted to the data path — and because healed old footers
+    /// produce NO redo churn, the no-churn branch builds the manifest
+    /// from the (empty) snapshot: the record_count=0 completion verifies
+    /// 0/0 on a data-less target, COMMITS, records #28 evidence, and
+    /// source-side orphan cleanup may then delete the whole never-shipped
+    /// shard. (A non-empty-but-short no-churn snapshot is deliberately
+    /// NOT refused — those records reached the target through the
+    /// dual-write window and the exact-count+manifest verify reconciles
+    /// them; refusing them churned real-cluster convergence.)
+    #[test]
+    fn data_path_refuses_empty_no_churn_manifest_over_live_shard() {
+        let old_members = vec![NodeId(1), NodeId(2)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                old_table.target_assignment(s).master == NodeId(1)
+                    && new_table.target_assignment(s).master == NodeId(3)
+            })
+            .expect("a shard whose master moves 1 -> 3");
+        // The shard is mid-Copying — the batch believes it must hand the
+        // (per its empty snapshot) shard to the new master.
+        let mut handoff = old_table.clone();
+        handoff.begin_handoff_with(&new_table, |s| s == shard);
+        assert_eq!(handoff.shard_handoff_state(shard), ShardHandoff::Copying);
+        let epoch = handoff.version;
+        let shard_table = Arc::new(ShardTableLock::new(handoff));
+
+        // Two READABLE records the batch's snapshot missed (unreadable at
+        // enumeration time, healed since). Created BEFORE the redo log is
+        // attached, so their existence produces no window churn — exactly
+        // like healed old footers.
+        let engine = Arc::new(test_engine());
+        let key1 = tx_key_for_shard(shard, 1);
+        let key2 = tx_key_for_shard(shard, 2);
+        create_test_record(&engine, key1);
+        create_test_record(&engine, key2);
+        assert_eq!(engine.shard_record_count(shard), 2);
+
+        // A redo log with a non-zero sequence and NO churn for the shard:
+        // `shard_membership_changed_in_window` proves "unchanged" and the
+        // manifest is built from the (empty) snapshot — the exact branch
+        // the guard protects. (Without a redo log every shard is
+        // conservatively rescanned live, which is already skip-aware and
+        // late-key-repairing.)
+        let redo_dev: Arc<dyn crate::device::BlockDevice> =
+            Arc::new(crate::device::MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let redo = Arc::new(ParkingMutex::new(
+            RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap(),
+        ));
+        engine.set_redo_log(redo.clone());
+        redo.lock()
+            .append_and_flush(crate::redo::RedoOp::SetLocked {
+                tx_key: tx_key_for_shard(shard.wrapping_add(1) % NUM_SHARDS as u16, 7),
+                value: true,
+            })
+            .unwrap();
+        let redo_log = Some(redo);
+
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: true,
+        };
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration.lock().start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let (addr, op_rx, stop, target) = spawn_ack_all_target(false);
+        // EMPTY snapshot: the batch routes the task onto the empty path,
+        // whose fenced recheck finds the (healed) records and PROMOTES it
+        // to the data path with a zero-key no-churn snapshot.
+        let (completed, failed) = run_migration_batch(
+            vec![task],
+            Some(addr),
+            &[],
+            engine.clone(),
+            &migration,
+            &shard_table,
+            &redo_log,
+            epoch,
+            1,
+            100,
+            fenced_bm,
+            migrating_bm,
+            inbound_bm,
+            NodeId(1),
+            None,
+            None,
+        );
+        assert_eq!(
+            (completed, failed),
+            (0, 1),
+            "an EMPTY no-churn manifest over a live shard must REFUSE (park \
+             Failed for re-drive), never verify 0/0 and commit"
+        );
+        assert!(
+            !migration.lock().has_committed_handoff(shard, epoch),
+            "no #28 evidence may be recorded — it would authorize deleting \
+             the never-shipped records"
+        );
+        {
+            let table = shard_table.read();
+            assert_eq!(
+                table.target_assignment(shard).master,
+                NodeId(1),
+                "the refused master handoff must roll back to self"
+            );
+        }
+        let seen: Vec<(u16, u16)> = op_rx.try_iter().collect();
+        assert!(
+            !seen
+                .iter()
+                .any(|(op, _)| *op == OP_MIGRATION_BATCH_COMPLETE),
+            "no commit handshake may be sent for the refused shard (saw: {seen:?})"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|(op, flags)| *op == OP_MIGRATION_COMPLETE
+                    && *flags & FLAG_MIGRATION_ABORT == 0),
+            "no non-abort completion may be sent for the refused shard \
+             (saw: {seen:?})"
+        );
+        stop.store(true, Ordering::Relaxed);
+        target.join().unwrap();
     }
 
     /// W10 DEFECT 3 (armed-11) — the event-driven orphan-cleanup pass is
