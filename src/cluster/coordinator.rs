@@ -897,9 +897,9 @@ const EXCHANGE_PEER_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 /// collection). Every spawn site uses this single value; the det-degrade
 /// plan-launch grace is derived from it
 /// ([`DET_DEGRADE_PLAN_LAUNCH_GRACE`]), so the two cannot silently drift
-/// apart. With the W9 P1-2 quorum early-return the exchange usually
-/// finishes far sooner — this bounds only the wait for a quorum that
-/// never materializes.
+/// apart. With the W9 P1-2 / W10 FIX 3 full-view early-return the
+/// exchange usually finishes far sooner — this bounds only the wait for
+/// a full member view that never materializes.
 const EXCHANGE_PHASE_TIMEOUT: Duration = Duration::from_millis(2000);
 
 /// W10 FIX 2 — per-attempt frame READ timeout for the exchange's
@@ -3112,10 +3112,11 @@ impl ClusterCoordinator {
             // flight; cleared implicitly by advancing as the term advances.
             let mut prompt_exchange_term: u64 = 0;
             // W8-R2-1 — `Some(term)` while the ACTIVE table for `term` was
-            // installed via the det degrade (below-quorum first activation,
-            // emptied view). Lets a later same-term completion whose member
-            // view reaches quorum through the duplicate-activation gate as
-            // an upgrade; cleared by any admitted quorum activation.
+            // installed via the det degrade (incomplete-view first
+            // activation, emptied view). Lets a later same-term completion
+            // whose member view is FULL (W10 FIX 3) through the
+            // duplicate-activation gate as an upgrade; cleared by any
+            // admitted full-view activation.
             let mut degraded_activation_term: Option<u64> = None;
             // W9 FIX 2 — retry pacing for a det-degraded activation:
             // `(last_attempt, fired_rounds)`, seeded when the degrade is
@@ -4146,10 +4147,10 @@ impl ClusterCoordinator {
                 }
 
                 // W9 FIX 2 — degraded-upgrade retry. While the ACTIVE table
-                // for the committed term is the det degrade (below-quorum
-                // first activation), re-fire the exchange on a doubling
-                // backoff so a late-applying peer can still deliver the
-                // quorum view; the completion routes through the normal
+                // for the committed term is the det degrade
+                // (incomplete-view first activation), re-fire the exchange
+                // on a doubling backoff so a late-applying peer can still
+                // complete the full view; the completion routes through the normal
                 // duplicate-gate upgrade path (`degraded_term_upgrade_-
                 // admissible`). Without this the degrade was terminal: the
                 // det table matches the committed placement so no divergence
@@ -4174,7 +4175,7 @@ impl ClusterCoordinator {
                                     degraded_upgrade_retry_backoff(fired_rounds.saturating_add(1))
                                         .as_secs(),
                                 "cluster: det-degraded activation — re-running the \
-                                 exchange for a quorum upgrade view",
+                                 exchange for a full-view upgrade",
                             );
                             let exchange_tx = exchange_complete_tx.clone();
                             let node_addrs_x = node_addrs.clone();
@@ -4733,7 +4734,7 @@ impl ClusterCoordinator {
                             // term is not terminal: the commit-signal and
                             // prompt arms race two exchanges for the same
                             // term, and the LATER completion often carries
-                            // the quorum view the first one missed. Let a
+                            // the full view the first one missed. Let a
                             // strictly better same-term completion through
                             // the duplicate gate as an UPGRADE; everything
                             // else is a true duplicate. Gated on no live
@@ -6997,7 +6998,7 @@ impl ClusterCoordinator {
         let mut received = 0usize;
         while received < peer_addrs.len() {
             // Opportunistically drain every answer ALREADY in the channel
-            // before deciding anything, so a quorum early-return never
+            // before deciding anything, so the full-view early-return never
             // discards evidence that has already arrived — only peers
             // still silent are left absent.
             while let Ok((peer, entries)) = rx.try_recv() {
@@ -7962,7 +7963,7 @@ fn degraded_upgrade_retry_backoff(fired_rounds: u32) -> Duration {
 ///
 /// The resulting exchange completion is routed through the EXISTING
 /// duplicate-activation upgrade gate ([`degraded_term_upgrade_admissible`])
-/// like any other same-term completion — a below-quorum retry view is
+/// like any other same-term completion — an incomplete retry view is
 /// simply discarded there and the cadence continues.
 fn degraded_upgrade_retry_due(
     degraded_activation_term: Option<u64>,
@@ -7983,9 +7984,9 @@ fn degraded_upgrade_retry_due(
 /// Sized (and pinned by `det_plan_launch_grace_covers_first_retry_rescue_window`)
 /// to outlast the first degraded-upgrade retry's WHOLE window:
 /// `degraded_upgrade_retry_backoff(0)` (2 s) until the retry fires, plus
-/// the full [`EXCHANGE_PHASE_TIMEOUT`] (2 s — the quorum early-return can
-/// land any time inside it, e.g. when the lagging peer applies the commit
-/// near the end and answers the next 500 ms re-query), plus event-loop
+/// the full [`EXCHANGE_PHASE_TIMEOUT`] (2 s — the full-view early-return
+/// can land any time inside it, e.g. when the lagging peer applies the
+/// commit near the end and answers the next 500 ms re-query), plus event-loop
 /// tick slack. The racing commit/prompt-arm exchanges (~0 s) are covered
 /// a fortiori. Serving and the shard-table install are NEVER held — only
 /// the worker launch.
