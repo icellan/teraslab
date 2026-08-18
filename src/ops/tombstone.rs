@@ -217,16 +217,20 @@ fn decode_entry(src: &[u8]) -> Result<(TxKey, TombValue), TombstoneDecodeError> 
             generation,
             height,
             cause: src[CAUSE_OFF],
+            veto_suspended: false,
         },
     ))
 }
 
-/// W10 FIX 2 — outcome of a weak-veto arbitration clear
-/// ([`TombstoneLog::clear_weak`]).
+/// W10 FIX 2 / W13 — outcome of a weak-veto arbitration
+/// ([`TombstoneLog::suspend_weak_veto`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeakTombstoneClear {
-    /// A weak-cause tombstone was present and has been cleared.
-    Cleared,
+    /// A weak-cause tombstone was present and its RULE-DS veto is now
+    /// SUSPENDED. The marker survives so it keeps declaring the omission to
+    /// peers — see [`TombstoneLog::suspend_weak_veto`] for why removing it
+    /// re-opened the last-live-copy prune chain.
+    Suspended,
     /// No tombstone covers the key (idempotent success for a retried round).
     Absent,
     /// The tombstone carries a STRONG cause (`ClientDelete` / `Dah` / an
@@ -235,11 +239,37 @@ pub enum WeakTombstoneClear {
 }
 
 /// In-RAM per-key tombstone state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq)]
 struct TombValue {
     generation: u32,
     height: u32,
     cause: u8,
+    /// W13 — the weak-veto arbitration has SUSPENDED this marker's RULE-DS
+    /// veto ([`TombstoneLog::suspend_weak_veto`]), but the marker itself
+    /// survives so it keeps DECLARING the omission to peers
+    /// ([`TombstoneLog::weak_tombstone_keys`]).
+    ///
+    /// RAM-only and deliberately absent from the 48-byte on-disk entry: a
+    /// suspension that does not survive a restart re-arms the veto, which is
+    /// the conservative direction (the source re-drives a completion, gets a
+    /// fresh refusal, and re-arbitrates). Because it is not durable it must
+    /// also not perturb the compaction bookkeeping in [`TombstoneLog::persist`],
+    /// which compares a buffered append against the written snapshot — hence
+    /// the hand-written [`PartialEq`] below over the DURABLE fields only.
+    veto_suspended: bool,
+}
+
+impl PartialEq for TombValue {
+    /// Durable-field equality: `veto_suspended` is RAM-only (see the field
+    /// doc), so two values that differ only in suspension describe the same
+    /// on-disk entry and must compare equal — otherwise `persist`'s
+    /// `pending.retain` would keep re-appending an already-written entry every
+    /// time an arbitration suspended it.
+    fn eq(&self, other: &Self) -> bool {
+        self.generation == other.generation
+            && self.height == other.height
+            && self.cause == other.cause
+    }
 }
 
 /// File-side state guarded by a single mutex, disjoint from the per-shard
@@ -272,9 +302,11 @@ pub struct TombstoneLog {
     /// tombstones).
     ///
     /// Maintained in lockstep with `shards` by EVERY mutation path
-    /// ([`Self::record`], [`Self::clear`], [`Self::clear_weak`],
-    /// [`Self::gc`], [`Self::reconcile_against_live`], and the [`Self::load`]
-    /// replay). It is a pure accelerator: `shards` remains the authority, and
+    /// ([`Self::record`], [`Self::clear`], [`Self::gc`],
+    /// [`Self::reconcile_against_live`], and the [`Self::load`] replay).
+    /// [`Self::suspend_weak_veto`] deliberately does NOT touch it: a suspended
+    /// marker keeps declaring its omission (that is the point of suspending
+    /// rather than removing). It is a pure accelerator: `shards` remains the authority, and
     /// [`Self::weak_tombstone_keys`] re-verifies each candidate's cause
     /// against `shards` before returning it, so a stale entry here can only
     /// cost a wasted lookup — never a wrong answer.
@@ -422,6 +454,10 @@ impl TombstoneLog {
             generation,
             height,
             cause: cause as u8,
+            // W13 — a FRESH record always re-arms the veto: a re-delete of a
+            // key whose earlier marker had been arbitration-suspended is new
+            // evidence, not a continuation of the suspended one.
+            veto_suspended: false,
         };
         let weak = matches!(
             cause,
@@ -610,9 +646,19 @@ impl TombstoneLog {
     ///      floor only filters the rare provably-stale same-lineage image;
     ///      cross-lineage generation comparability remains out of scope
     ///      (#78), exactly as for every other generation-gated leg.
+    /// - W13 — a WEAK marker whose veto the arbitration has SUSPENDED
+    ///   ([`Self::suspend_weak_veto`]) does not block at all. The marker stays
+    ///   in the log for its DECLARATION role (see [`Self::gc`]); only its veto
+    ///   is lifted, and only after this node itself refused a completion naming
+    ///   the key and a ticketed holder redeemed that refusal. Suspension is
+    ///   RAM-only, so a restart re-arms the veto.
     pub fn blocks_heal_apply(&self, key: &TxKey, incoming_generation: u32) -> bool {
         match self.shards[self.shard_index(key)].read().get(key) {
             None => false,
+            // W13 — arbitration-suspended weak marker: declaration only.
+            // Checked before the cause arms so it cannot be reached for a
+            // strong cause (which `suspend_weak_veto` refuses to set it on).
+            Some(v) if v.veto_suspended && is_weak_cause(v.cause) => false,
             // Generation-gated legs (Dah-style): block a source at-or-behind
             // the frozen generation, admit a strictly-newer one.
             Some(v)
@@ -750,10 +796,15 @@ impl TombstoneLog {
     ///
     /// * [`Self::clear`] — Invariant TS-1: the key comes back LIVE (client
     ///   create, replica create, migration baseline apply);
-    /// * [`Self::clear_weak`] — the `OP_MIGRATION_WEAK_VETO_ARBITRATE`
-    ///   handshake: the shard's authoritative epoch-current source, holding a
-    ///   LIVE copy, instructs this node to drop the marker and re-pushes;
     /// * [`Self::reconcile_against_live`] — the boot reconcile.
+    ///
+    /// W13 — the `OP_MIGRATION_WEAK_VETO_ARBITRATE` handshake is NO LONGER one
+    /// of them. It used to remove the marker, which withdrew the declaration
+    /// whether or not the re-push that was supposed to follow ever landed —
+    /// exactly the conversion this doc warns about, performed on demand. It now
+    /// SUSPENDS the veto ([`Self::suspend_weak_veto`]) and leaves the marker in
+    /// place, so the drain in that flow is the re-push landing, i.e.
+    /// [`Self::clear`] above.
     ///
     /// ACCEPTED RESIDUALS (documented, not fixed here):
     /// 1. A key that is NEVER repaired keeps one tombstone entry (in RAM and
@@ -854,50 +905,87 @@ impl TombstoneLog {
         removed
     }
 
-    /// W10 FIX 2 — weak-veto arbitration clear: drop `key`'s tombstone via the
-    /// TS-1 clear path ([`Self::clear`]) ONLY when its recorded cause is WEAK
-    /// ([`TombstoneCause::PruneReplace`] or
-    /// [`TombstoneCause::CompensatedCreate`]).
+    /// W10 FIX 2 / W13 — weak-veto arbitration: SUSPEND `key`'s RULE-DS veto,
+    /// ONLY when its recorded cause is WEAK ([`TombstoneCause::PruneReplace`]
+    /// or [`TombstoneCause::CompensatedCreate`]). The marker itself SURVIVES.
     ///
-    /// The cause check and the removal happen under ONE shard write lock, so
+    /// # W13 — why suspend rather than remove (the data-loss direction)
+    ///
+    /// W10 removed the entry outright. A weak marker has a SECOND role the
+    /// removal destroyed: it is this node's only proof that a key missing from
+    /// the manifest it SHIPS is its own prune/rollback damage rather than
+    /// deletion-intent ([`Self::weak_tombstone_keys`] ->
+    /// `Engine::weak_tombstone_keys_for_shard` -> the completion frame ->
+    /// the peer's prune exclusion). [`Self::gc`] already refuses to expire weak
+    /// causes on the retention clock for exactly that reason, and names the
+    /// consequence: withdrawing the declaration "silently converts 'my own
+    /// damage' into 'deletion-intent' … and the target's #29 prune deletes its
+    /// LAST LIVE COPY — the armed-05 loss chain".
+    ///
+    /// `gc` lists arbitration as an acceptable drain only on the strength of
+    /// "instructs this node to drop the marker AND re-pushes" — but the
+    /// re-push is NOT atomic with the clear: `send_weak_veto_arbitration`
+    /// returns the moment this node ACKs, and the caller's
+    /// `repush_and_retry_reduced_completion` runs afterwards and can fail on a
+    /// stream break, source crash, or a later refusal. Removing the entry
+    /// therefore performed that conversion on demand.
+    ///
+    /// Suspension keeps both properties: the veto stops blocking the repair
+    /// (the wedge W13 fixes), while the declaration survives regardless of
+    /// whether the re-push lands. The entry's real drain is unchanged and
+    /// remains the repair itself — [`Self::clear`] (Invariant TS-1) removes it
+    /// when the record comes back LIVE.
+    ///
+    /// # Concurrency
+    ///
+    /// The cause check and the mutation happen under ONE shard write lock, so
     /// a concurrent strong-cause upgrade (a client delete landing between a
-    /// caller's lookup and this clear) can never be clobbered: whatever cause
-    /// is present AT CLEAR TIME decides. A strong cause (`ClientDelete`,
+    /// caller's lookup and this call) can never be clobbered: whatever cause
+    /// is present AT SUSPEND TIME decides. A strong cause (`ClientDelete`,
     /// `Dah`, or any unrecognized future byte — fail closed) is REFUSED; an
     /// absent tombstone reports [`WeakTombstoneClear::Absent`] so retried
-    /// arbitration rounds are idempotent.
+    /// arbitration rounds are idempotent. Re-suspending an already-suspended
+    /// marker is a no-op reported as [`WeakTombstoneClear::Suspended`].
     ///
-    /// SAFETY ARGUMENT (why this can never resurrect a client-deleted
-    /// record): a weak cause is only ever produced by this node's own LOCAL
-    /// rollback/reconcile markers, never by a client delete (cause separation
-    /// at every producer — see [`Self::record`]); [`Self::record`]'s
-    /// precedence never lets a weak cause REPLACE a strong one, while a later
-    /// strong cause LWW-upgrades a weak one — so wherever a client-delete
-    /// claim exists for the key, the cause read here is `ClientDelete` and
-    /// the clear is refused. Clearing a weak marker leaves this node exactly
-    /// as exposed as a node that never recorded one (the posture RULE-DS/#78
-    /// always accepted for non-deleting nodes).
-    pub fn clear_weak(&self, key: &TxKey) -> WeakTombstoneClear {
-        {
-            let mut shard = self.shards[self.shard_index(key)].write();
-            match shard.get(key) {
-                None => return WeakTombstoneClear::Absent,
-                Some(v)
-                    if v.cause == TombstoneCause::PruneReplace as u8
-                        || v.cause == TombstoneCause::CompensatedCreate as u8 =>
-                {
-                    shard.remove(key);
-                }
-                Some(_) => return WeakTombstoneClear::RefusedStrongCause,
+    /// SAFETY ARGUMENT (why this cannot lift the veto of a record the CLIENT
+    /// deleted ON THIS NODE): a weak cause is only ever produced by this
+    /// node's own LOCAL rollback/reconcile markers, never by a client delete
+    /// (cause separation at every producer — see [`Self::record`]);
+    /// [`Self::record`]'s precedence never lets a weak cause REPLACE a strong
+    /// one, while a later strong cause LWW-upgrades a weak one. So wherever a
+    /// client delete was APPLIED TO A PRESENT RECORD on this node, the cause
+    /// read here is `ClientDelete` and the suspension is refused.
+    ///
+    /// KNOWN LIMIT (the "W9 concern-A residual", `server::dispatch`): a client
+    /// delete that finds the key ABSENT records NO tombstone at all
+    /// (`Engine::delete_inner` returns `TxNotFound` before the log write; the
+    /// replicated form swallows it). A node that pruned the key FIRST and
+    /// received the authoritative delete SECOND therefore keeps a WEAK marker
+    /// that is really the local proxy for another node's `ClientDelete`, and
+    /// this call will suspend it. That predates W10/W13 — the marker was
+    /// always weak on that path — but it is the residual that makes the
+    /// arbitration's authority predicate load-bearing, and it is NOT closed
+    /// here. See the P0-1 discussion on the handler.
+    pub fn suspend_weak_veto(&self, key: &TxKey) -> WeakTombstoneClear {
+        let mut shard = self.shards[self.shard_index(key)].write();
+        match shard.get_mut(key) {
+            None => WeakTombstoneClear::Absent,
+            Some(v) if is_weak_cause(v.cause) => {
+                v.veto_suspended = true;
+                WeakTombstoneClear::Suspended
             }
+            Some(_) => WeakTombstoneClear::RefusedStrongCause,
         }
-        self.weak_keys.write().remove(key);
-        // Drain the un-persisted append exactly as `clear` does, so a later
-        // compaction cannot re-append the cleared tombstone (Invariant TS-1).
-        let mut fs = self.file.lock();
-        fs.pending.retain(|(pk, _)| pk != key);
-        fs.needs_compaction = true;
-        WeakTombstoneClear::Cleared
+    }
+
+    /// Whether `key` carries a weak marker whose veto is currently suspended.
+    /// Diagnostic companion to [`Self::suspend_weak_veto`]; the veto decision
+    /// itself lives in [`Self::blocks_heal_apply`].
+    pub fn weak_veto_suspended(&self, key: &TxKey) -> bool {
+        self.shards[self.shard_index(key)]
+            .read()
+            .get(key)
+            .is_some_and(|v| v.veto_suspended && is_weak_cause(v.cause))
     }
 
     /// Make the tombstone set durable at a checkpoint: GC past the retention
@@ -1222,12 +1310,35 @@ mod tests {
         assert!(log.blocks_heal_apply(&pruned, 6));
         assert!(!log.blocks_heal_apply(&pruned, 7));
 
-        // The repair paths — and only they — drain the claim.
+        // W13 — the ARBITRATION is NOT a drain. It suspends the veto so the
+        // repair can land; the claim itself survives, because the re-push is
+        // not atomic with the arbitration and a withdrawn declaration lets a
+        // peer's #29 prune delete the key's last live copy.
         assert_eq!(
-            log.clear_weak(&pruned),
-            WeakTombstoneClear::Cleared,
-            "the OP_MIGRATION_WEAK_VETO_ARBITRATE drain",
+            log.suspend_weak_veto(&pruned),
+            WeakTombstoneClear::Suspended,
+            "the OP_MIGRATION_WEAK_VETO_ARBITRATE effect",
         );
+        assert!(
+            !log.blocks_heal_apply(&pruned, 6),
+            "the veto stops blocking the repair…",
+        );
+        let mut still_declared = log.weak_tombstone_keys();
+        still_declared.sort_by_key(|k| k.txid);
+        let mut both = vec![pruned, rolled_back];
+        both.sort_by_key(|k| k.txid);
+        assert_eq!(
+            still_declared, both,
+            "…but the omission is STILL declared while the repair is in flight",
+        );
+        assert!(
+            log.weak_veto_suspended(&pruned) && !log.weak_veto_suspended(&rolled_back),
+            "and suspension is per-key",
+        );
+
+        // The REPAIR LANDING is the drain — Invariant TS-1's create-path clear,
+        // for a suspended marker exactly as for an un-suspended one.
+        assert!(log.clear(&pruned), "the repair landed for the pruned key");
         assert!(
             log.clear(&rolled_back),
             "the Invariant TS-1 re-create drain"
@@ -1367,8 +1478,9 @@ mod tests {
     /// W10 review P2-3 — the weak-key accelerator must stay in lockstep with
     /// the authoritative shard maps across EVERY mutation path, so a
     /// per-send `weak_tombstone_keys()` capture is both cheap and exact:
-    /// record (weak in / strong-upgrade out), clear, clear_weak, gc,
-    /// reconcile_against_live, and the on-disk load replay.
+    /// record (weak in / strong-upgrade out), clear, gc,
+    /// reconcile_against_live, and the on-disk load replay. Suspension is
+    /// deliberately absent: it must NOT remove the key from the accelerator.
     #[test]
     fn weak_key_index_tracks_every_mutation_path() {
         let dir = tempfile::tempdir().unwrap();
@@ -1403,14 +1515,22 @@ mod tests {
             "and the authority records the upgrade",
         );
 
-        // clear_weak on a weak key drops it; on a strong key it is refused
+        // W13 — suspend_weak_veto on a weak key lifts its veto but KEEPS the
+        // entry (and therefore the declaration); on a strong key it is refused
         // and the index is unchanged.
         log.record(&tk(4), 0, 100, TombstoneCause::PruneReplace);
-        assert_eq!(log.clear_weak(&tk(4)), WeakTombstoneClear::Cleared);
+        assert_eq!(log.suspend_weak_veto(&tk(4)), WeakTombstoneClear::Suspended);
+        assert!(!log.blocks_heal_apply(&tk(4), 0));
         assert_eq!(
-            log.clear_weak(&tk(1)),
+            log.suspend_weak_veto(&tk(1)),
             WeakTombstoneClear::RefusedStrongCause
         );
+        assert_eq!(
+            sorted(log.weak_tombstone_keys()),
+            sorted(vec![tk(2), tk(4)])
+        );
+        // The repair landing is what removes it.
+        assert!(log.clear(&tk(4)));
         assert_eq!(sorted(log.weak_tombstone_keys()), vec![tk(2)]);
 
         // clear() drops a weak entry from the index too.
@@ -1438,8 +1558,15 @@ mod tests {
             sorted(vec![tk(2), tk(6)]),
             "the omission claim outlives the retention horizon",
         );
-        // …and the accelerator still drains through the repair paths.
-        assert_eq!(log.clear_weak(&tk(6)), WeakTombstoneClear::Cleared);
+        // …and the accelerator still drains through the repair LANDING (W13:
+        // the arbitration only suspends, so it is not a drain).
+        assert_eq!(log.suspend_weak_veto(&tk(6)), WeakTombstoneClear::Suspended);
+        assert_eq!(
+            sorted(log.weak_tombstone_keys()),
+            sorted(vec![tk(2), tk(6)]),
+            "a suspended marker keeps declaring",
+        );
+        assert!(log.clear(&tk(6)));
         assert_eq!(sorted(log.weak_tombstone_keys()), vec![tk(2)]);
 
         // reconcile_against_live(): a weak entry whose key came back LIVE
@@ -1473,13 +1600,14 @@ mod tests {
         );
     }
 
-    /// W10 FIX 2 — `clear_weak` drops ONLY weak-cause tombstones
-    /// (PruneReplace / CompensatedCreate): a strong cause (ClientDelete /
-    /// Dah) is refused untouched, an absent key is idempotent, and — like
-    /// `clear` — the un-persisted pending append is drained so a later
-    /// compaction cannot resurrect the cleared marker.
+    /// W10 FIX 2 / W13 — `suspend_weak_veto` lifts the RULE-DS veto of ONLY
+    /// weak-cause tombstones (PruneReplace / CompensatedCreate): a strong
+    /// cause (ClientDelete / Dah) is refused untouched, an absent key is
+    /// idempotent, and the marker itself SURVIVES so it keeps declaring the
+    /// omission to peers (W13 — removing it re-opened the last-live-copy prune
+    /// chain, because the arbitration's re-push is not atomic with it).
     #[test]
-    fn clear_weak_clears_weak_causes_only() {
+    fn suspend_weak_veto_lifts_weak_vetoes_only_and_keeps_the_marker() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.tombstones");
         let log = TombstoneLog::new(path.clone(), 0, 4, 100);
@@ -1488,39 +1616,85 @@ mod tests {
         log.record(&tk(3), 5, 500, TombstoneCause::ClientDelete);
         log.record(&tk(4), 5, 500, TombstoneCause::Dah);
 
-        assert_eq!(log.clear_weak(&tk(1)), WeakTombstoneClear::Cleared);
-        assert_eq!(log.clear_weak(&tk(2)), WeakTombstoneClear::Cleared);
+        assert_eq!(log.suspend_weak_veto(&tk(1)), WeakTombstoneClear::Suspended);
+        assert_eq!(log.suspend_weak_veto(&tk(2)), WeakTombstoneClear::Suspended);
         assert_eq!(
-            log.clear_weak(&tk(3)),
+            log.suspend_weak_veto(&tk(3)),
             WeakTombstoneClear::RefusedStrongCause,
             "a ClientDelete veto is never arbitrable",
         );
         assert_eq!(
-            log.clear_weak(&tk(4)),
+            log.suspend_weak_veto(&tk(4)),
             WeakTombstoneClear::RefusedStrongCause,
             "a Dah veto is never arbitrable",
         );
         assert_eq!(
-            log.clear_weak(&tk(1)),
-            WeakTombstoneClear::Absent,
-            "a retried clear of an already-cleared key is idempotent",
+            log.suspend_weak_veto(&tk(1)),
+            WeakTombstoneClear::Suspended,
+            "a retried suspension of an already-suspended key is idempotent",
         );
-        assert_eq!(log.clear_weak(&tk(99)), WeakTombstoneClear::Absent);
+        assert_eq!(log.suspend_weak_veto(&tk(99)), WeakTombstoneClear::Absent);
+        let mut declared = log.weak_tombstone_keys();
+        declared.sort_by_key(|k| k.txid);
+        let mut want = vec![tk(1), tk(2)];
+        want.sort_by_key(|k| k.txid);
+        assert_eq!(
+            declared, want,
+            "both suspended markers keep DECLARING their omission",
+        );
+        assert!(log.weak_veto_suspended(&tk(1)) && log.weak_veto_suspended(&tk(2)));
+        assert!(
+            !log.weak_veto_suspended(&tk(3)) && !log.weak_veto_suspended(&tk(4)),
+            "a refused strong cause is never marked suspended",
+        );
+        // A FRESH delete re-arms the veto: new evidence, not a continuation.
+        log.record(&tk(1), 0, 600, TombstoneCause::PruneReplace);
+        assert!(
+            !log.weak_veto_suspended(&tk(1)) && log.blocks_heal_apply(&tk(1), 0),
+            "re-recording a weak marker re-arms its veto",
+        );
+        assert_eq!(log.suspend_weak_veto(&tk(1)), WeakTombstoneClear::Suspended);
 
-        // The cleared weak markers no longer veto; the strong ones still do.
+        // The suspended weak markers no longer veto; the strong ones still do.
         assert!(!log.blocks_heal_apply(&tk(1), 0));
         assert!(!log.blocks_heal_apply(&tk(2), 0));
         assert!(log.blocks_heal_apply(&tk(3), 99));
         assert!(log.blocks_heal_apply(&tk(4), 5));
 
-        // TS-1: the pending append is drained, so compaction cannot
-        // re-append the cleared markers; the refused strong ones persist.
+        // W13 durability contract — the MARKER is durable (it must keep
+        // declaring across a restart), the SUSPENSION is not: a reload
+        // re-arms the veto, which is the conservative direction. The source
+        // re-drives a completion, gets a fresh refusal + ticket, and
+        // re-arbitrates.
         log.persist(0, |_| false).unwrap();
         let reloaded = TombstoneLog::load(path, 0, 4, 100).unwrap();
-        assert!(reloaded.lookup(&tk(1)).is_none());
-        assert!(reloaded.lookup(&tk(2)).is_none());
-        assert!(reloaded.lookup(&tk(3)).is_some());
-        assert!(reloaded.lookup(&tk(4)).is_some());
+        for k in [tk(1), tk(2), tk(3), tk(4)] {
+            assert!(
+                reloaded.lookup(&k).is_some(),
+                "every marker survives the reload, suspended or not",
+            );
+        }
+        assert!(
+            !reloaded.weak_veto_suspended(&tk(1)) && !reloaded.weak_veto_suspended(&tk(2)),
+            "suspension is RAM-only",
+        );
+        assert!(
+            reloaded.blocks_heal_apply(&tk(1), 0),
+            "so the PruneReplace veto re-arms on restart",
+        );
+        // `tk(2)` is a CompensatedCreate at generation 0, whose rule blocks
+        // only a STRICTLY-BEHIND image — vacuous at 0, as its own doc concedes.
+        // Drive it at a generation where the rule has content instead.
+        log.record(&tk(9), 7, 500, TombstoneCause::CompensatedCreate);
+        assert!(
+            log.blocks_heal_apply(&tk(9), 6),
+            "strictly behind is dropped"
+        );
+        assert_eq!(log.suspend_weak_veto(&tk(9)), WeakTombstoneClear::Suspended);
+        assert!(
+            !log.blocks_heal_apply(&tk(9), 6),
+            "suspension lifts the CompensatedCreate veto too",
+        );
     }
 
     /// Reverse-heal Phase 2c RULE-DS gate is CAUSE-AWARE: a `Dah` (terminal)

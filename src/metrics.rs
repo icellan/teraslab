@@ -1432,6 +1432,24 @@ pub struct MigrationMetrics {
     /// consensus-relevant override of a local anti-resurrection marker, so it
     /// stays operator-visible.
     pub migration_weak_veto_arbitrations: PaddedCounter,
+    /// W13 review P2-3 — weak-veto arbitrations this node HONORED as the
+    /// TARGET: one per marker whose RULE-DS veto was suspended for a ticketed
+    /// holder.
+    ///
+    /// The two counters above/below it are SOURCE-side, so before W13 a node
+    /// whose anti-resurrection markers were being overridden incremented
+    /// nothing and looked healthy on `/metrics`. This is the override rate
+    /// measured where the override happens; pair it with
+    /// [`Self::migration_weak_veto_arbitrations_refused_target`]. A rising
+    /// value with a flat `teraslab_tombstone_weak_entries` means overrides are
+    /// happening without repairs landing.
+    pub migration_weak_veto_arbitrations_honored: PaddedCounter,
+    /// W13 review P2-3 — arbitration frames this node REFUSED as the TARGET
+    /// (unknown/stale epoch, requester is not a named holder, no outstanding
+    /// veto ticket, key outside the named shard, or a strong-cause marker).
+    /// Sustained non-zero without a matching source-side counter is the
+    /// signature of unsolicited or replayed arbitration.
+    pub migration_weak_veto_arbitrations_refused_target: PaddedCounter,
     /// W12 TAIL 3 — weak-veto arbitrations the TARGET refused on AUTHORITY
     /// grounds (`ERR_INVARIANT_VIOLATION`), which terminally abort the
     /// handoff instead of re-driving it. Counted per refused round at the
@@ -1638,6 +1656,8 @@ impl MigrationMetrics {
             replica_abort_forced_resyncs: PaddedCounter::new(),
             migration_completion_manifest_reduced_vetoed: PaddedCounter::new(),
             migration_weak_veto_arbitrations: PaddedCounter::new(),
+            migration_weak_veto_arbitrations_honored: PaddedCounter::new(),
+            migration_weak_veto_arbitrations_refused_target: PaddedCounter::new(),
             migration_weak_veto_arbitration_refused: PaddedCounter::new(),
             migration_prune_weak_declared_retained: PaddedCounter::new(),
             migration_prune_skipped_cutoff_gate: PaddedCounter::new(),

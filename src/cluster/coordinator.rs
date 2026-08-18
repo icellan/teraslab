@@ -6445,6 +6445,9 @@ impl ClusterCoordinator {
             drop_commit_signals: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             dual_write_lookup_calls: AtomicU64::new(0),
+            weak_veto_tickets: Arc::new(Mutex::new(
+                crate::cluster::migration::WeakVetoTicketStore::new(),
+            )),
             event_loop_heartbeat: loop_heartbeat,
             _swim_handle: swim_handle,
             _event_handle: event_handle,
@@ -15926,11 +15929,22 @@ pub(crate) fn completion_rejection_manifest_mismatch(err: &str) -> bool {
 /// never overcome?
 ///
 /// The arbitration handler answers `ERR_INVARIANT_VIOLATION` for exactly the
-/// structural refusals: the requester is not the shard's target-or-effective
-/// master in the target's table; the target has no open inbound transfer from
-/// the requester; the key carries a ClientDelete/Dah tombstone (never
-/// arbitrable); arbitration is disarmed on the target; or the key is not in
-/// the named shard. None of those change by asking again at the same epoch.
+/// structural refusals: the target's own table does not name the requester a
+/// HOLDER of the shard across the in-flight activation; no outstanding VETO
+/// TICKET covers a named key (this node never refused that key to that source,
+/// or the ticket has expired or already been redeemed — W13); the key carries a
+/// ClientDelete/Dah tombstone (never arbitrable); arbitration is disarmed on
+/// the target; or the key is not in the named shard. None of those change by
+/// asking again at the same epoch with the same frame.
+///
+/// W13 — the pre-W13 wording named the removed conditions ("is not the shard's
+/// target-or-effective MASTER", "no open inbound transfer"). Both are gone; the
+/// classification is unchanged because every replacement refusal uses the same
+/// code, which is what this parser matches on.
+///
+/// The ticket refusal is deliberately terminal for THIS frame and not for the
+/// task: the source's next escalation round re-drives a completion, which mints
+/// a fresh ticket if the veto is still standing.
 ///
 /// Deliberately NOT matched:
 /// * `ERR_STALE_EPOCH` — the two sides are on different activated versions
@@ -20599,6 +20613,14 @@ pub struct RunningCluster {
     /// key. Test-only — no production overhead.
     #[cfg(test)]
     dual_write_lookup_calls: AtomicU64,
+    /// W13 — outstanding weak-veto arbitration tickets minted by THIS node's
+    /// own completion refusals.
+    ///
+    /// Its own mutex rather than a field on the `MigrationManager`: both
+    /// touchpoints (the completion-refusal path and the arbitration handler)
+    /// are cold, and keeping it off the hot migration lock avoids adding a new
+    /// edge to that lock's documented ordering constraints.
+    weak_veto_tickets: Arc<Mutex<crate::cluster::migration::WeakVetoTicketStore>>,
     /// Task #75 — event-loop liveness heartbeat, stamped by the event loop
     /// and read (atomics only) by the stall watchdog and `/status`.
     event_loop_heartbeat: Arc<crate::cluster::watchdog::LoopHeartbeat>,
@@ -21601,10 +21623,6 @@ impl RunningCluster {
             .has_pending_heal_from_source(shard, from_node)
     }
 
-    /// W10 FIX 2 — the weak-veto arbitration's "fence still held" check: does
-    /// this node hold ANY active (uncompleted) inbound entry for `shard`
-    /// sourced from `from_node` (forward migration or reverse-heal)? See
-    /// [`crate::cluster::migration::MigrationManager::has_pending_inbound_from_source`].
     /// W10 review P2-6 — is weak-veto arbitration armed on this node? The
     /// `OP_MIGRATION_WEAK_VETO_ARBITRATE` handler consults it so a disabled
     /// node neither initiates NOR honours an arbitration (a complete local
@@ -21613,10 +21631,82 @@ impl RunningCluster {
         self.migration.lock().weak_veto_arbitration_enabled()
     }
 
+    /// Does this node hold ANY active (uncompleted) inbound entry for `shard`
+    /// sourced from `from_node` (forward migration or reverse-heal)? See
+    /// [`crate::cluster::migration::MigrationManager::has_pending_inbound_from_source`].
+    ///
+    /// W13 — this was the arbitration handler's "fence still held" condition
+    /// until the W13 review; it is unsatisfiable for a replica fill (the target
+    /// only records an inbound source while the shard is inbound-expected or in
+    /// `Copying`), so the arbitration is bound to a veto TICKET instead
+    /// ([`Self::issue_weak_veto_tickets`]). Still used by the migration
+    /// machinery for its own fencing decisions.
     pub fn has_pending_inbound_from_source(&self, shard: u16, from_node: NodeId) -> bool {
         self.migration
             .lock()
             .has_pending_inbound_from_source(shard, from_node)
+    }
+
+    /// W13 — mint the veto tickets authorizing `source` to arbitrate `keys` in
+    /// `shard`, stamped now.
+    ///
+    /// Called from the `OP_MIGRATION_COMPLETE` verify when it refuses a
+    /// completion naming WEAK-cause tombstone vetoes: the refusal IS the
+    /// authorization. Only weak-cause vetoes mint a ticket — a
+    /// `ClientDelete`/`Dah` veto is never arbitrable, so a ticket for one would
+    /// authorize nothing and only enlarge the store.
+    pub fn issue_weak_veto_tickets(&self, shard: u16, source: NodeId, keys: &[TxKey]) {
+        if keys.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let mut store = self.weak_veto_tickets.lock();
+        for key in keys {
+            store.issue(shard, source, *key, now);
+        }
+    }
+
+    /// W13 — the first of `keys` with NO outstanding veto ticket for
+    /// `(shard, source)` at `now`, or `None` when every key is ticketed.
+    ///
+    /// A PEEK: the all-or-nothing pre-scan must not consume tickets for a frame
+    /// it is about to refuse. Redemption happens in
+    /// [`Self::redeem_weak_veto_ticket`] once the frame is committed.
+    pub fn first_unticketed_weak_veto_key(
+        &self,
+        shard: u16,
+        source: NodeId,
+        keys: &[TxKey],
+        now: std::time::Instant,
+    ) -> Option<TxKey> {
+        let store = self.weak_veto_tickets.lock();
+        keys.iter()
+            .find(|key| !store.peek(shard, source, key, now))
+            .copied()
+    }
+
+    /// W13 — redeem (and CONSUME) the ticket authorizing `source` to arbitrate
+    /// `key` in `shard`. `true` iff an unexpired ticket existed.
+    ///
+    /// Consumption is the replay defence: a captured arbitration frame
+    /// re-delivered inside the authentication layer's timestamp window finds
+    /// nothing outstanding.
+    pub fn redeem_weak_veto_ticket(
+        &self,
+        shard: u16,
+        source: NodeId,
+        key: &TxKey,
+        now: std::time::Instant,
+    ) -> bool {
+        self.weak_veto_tickets
+            .lock()
+            .redeem(shard, source, key, now)
+    }
+
+    /// W13 — outstanding veto-ticket count. Observability + the bound the
+    /// store's cap is tested against.
+    pub fn weak_veto_ticket_count(&self) -> usize {
+        self.weak_veto_tickets.lock().len()
     }
 
     /// W10 review P2-6 — disarm/arm weak-veto arbitration on a test cluster
@@ -23643,6 +23733,9 @@ pub(crate) fn new_test_running_cluster(
         drop_commit_signals: Arc::new(AtomicBool::new(false)),
         #[cfg(test)]
         dual_write_lookup_calls: AtomicU64::new(0),
+        weak_veto_tickets: Arc::new(Mutex::new(
+            crate::cluster::migration::WeakVetoTicketStore::new(),
+        )),
         event_loop_heartbeat: Arc::new(crate::cluster::watchdog::LoopHeartbeat::new()),
         _swim_handle: std::thread::spawn(|| {}),
         _event_handle: std::thread::spawn(|| {}),

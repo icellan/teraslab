@@ -296,13 +296,37 @@ pub const OP_MIGRATION_TRANSFER_REQUEST: u16 = 244;
 /// tombstone so the subsequent re-push (the normal replica-create apply,
 /// generation guard included) can land. Payload:
 /// `[shard:2][from_node:8][migration_epoch:8][key_count:4][txid:32 × count]`.
-/// The target verifies: the fence is still held (an active inbound entry from
-/// `from_node` for `shard`), the epoch is current, `from_node` is the shard's
-/// committed/effective master, and each key's tombstone cause is WEAK — a
-/// `ClientDelete`/`Dah` veto is NEVER arbitrable (unconditional posture
-/// unchanged). All-or-nothing per frame: the first refused key rejects the
-/// request (keys already cleared stay cleared — clearing a weak marker is
-/// idempotent-safe, see `Engine::arbitrate_clear_weak_tombstone`).
+/// The target verifies, in this order (W13 — the pre-W13 spec required an open
+/// inbound entry from `from_node` and `from_node` being the shard's
+/// committed/effective MASTER; both were unsatisfiable for the replica fills
+/// this opcode exists to unstrand):
+///
+/// 1. EPOCH — `migration_epoch` equals the target's currently-activated
+///    shard-table version (a legacy epoch-0 frame cannot be proven current);
+/// 2. HOLDER — the target's OWN table names `from_node` a holder of `shard`
+///    (master or replica) in the target assignment, the effective assignment,
+///    or, while that shard's own mastership is still in transition, the
+///    assignment this activation superseded
+///    (`ShardTable::holder_across_activation`);
+/// 3. TICKET — every named key redeems an outstanding VETO TICKET the target
+///    itself minted when it refused THIS source's completion for THIS shard
+///    naming THIS key (`WeakVetoTicketStore`, 60 s TTL, consumed on
+///    redemption). This is what binds the override to a real in-flight
+///    transfer, and it is what makes a replayed frame a no-op;
+/// 4. CAUSE — each key's tombstone cause is WEAK. A `ClientDelete`/`Dah`/
+///    unrecognised veto is NEVER arbitrable (unconditional posture unchanged),
+///    re-checked under the tombstone shard lock at mutation time.
+///
+/// ALL-OR-NOTHING per frame: every key is decoded, ticket-checked and
+/// cause-checked BEFORE anything is mutated, so a refused frame changes no
+/// state and cannot be used to probe which keys carry a strong-cause marker.
+///
+/// The target SUSPENDS the veto rather than deleting the marker
+/// (`Engine::arbitrate_suspend_weak_veto`): the marker's second role is
+/// declaring to peers that this key's absence from the manifests this node
+/// ships is its own prune damage, and the re-push is not atomic with the
+/// arbitration, so deleting it let a peer's #29 prune remove the key's last
+/// live copy. The marker drains when the repair lands (Invariant TS-1).
 pub const OP_MIGRATION_WEAK_VETO_ARBITRATE: u16 = 245;
 
 // Cluster (inter-node)
