@@ -466,9 +466,19 @@ impl ShardTable {
     }
 
     /// Get the handoff state for a shard.
+    ///
+    /// A shard outside `0..NUM_SHARDS` reports `ServingNew` (the no-handoff
+    /// answer) rather than panicking the caller's indexing — the shard reaches
+    /// this from the wire. NOTE that [`Self::target_assignment`] and
+    /// [`Self::effective_assignment`] cannot be made range-safe the same way
+    /// (they return a reference), so a wire-decoded shard must still be
+    /// range-checked at the handler boundary.
     pub fn shard_handoff_state(&self, shard: u16) -> ShardHandoff {
         match &self.handoff_state {
-            Some(hs) => hs[shard as usize],
+            Some(hs) => hs
+                .get(shard as usize)
+                .copied()
+                .unwrap_or(ShardHandoff::ServingNew),
             None => ShardHandoff::ServingNew,
         }
     }

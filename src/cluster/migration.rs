@@ -1351,7 +1351,7 @@ impl MigrationManager {
     ///
     /// Rewrites the uncompleted `heal_pending` `NodeId(0)`-sentinel entry for
     /// `shard` to name `from_node` IN PLACE (mirroring the forward-migration
-    /// sentinel replacement in [`Self::register_migrations`]) — never adding a
+    /// sentinel replacement in [`Self::start_outbound_resync`]) — never adding a
     /// second entry, because the completion handshake
     /// ([`Self::mark_inbound_complete_from_source`]) completes ONE entry and a
     /// leftover sibling sentinel would hold the fence bit forever. Clears any
@@ -1925,7 +1925,7 @@ impl MigrationManager {
         }
     }
 
-    /// W9 nit — exact-task variant of [`mark_failed`]: resolves the entry
+    /// W9 nit — exact-task variant of [`Self::mark_failed`]: resolves the entry
     /// by the FULL task identity INCLUDING `is_master`, where
     /// `mark_failed`'s (shard, from, to) lookup can hit the twin entry
     /// when a master and a replica task share the same endpoints. Used by
@@ -1933,7 +1933,7 @@ impl MigrationManager {
     /// (`cancel_deferred_plan_launch`), which iterates the held plan's
     /// task list and must fail exactly the tasks it names — a twin left
     /// active would be preservable as a workerless task. Fence-lift,
-    /// dual-write close, and metrics bookkeeping match [`mark_failed`].
+    /// dual-write close, and metrics bookkeeping match [`Self::mark_failed`].
     pub fn mark_failed_exact(&mut self, task: &MigrationTask) {
         let Some(idx) = self.active.iter().position(|p| {
             p.shard == task.shard
@@ -3398,289 +3398,10 @@ impl Default for MigrationManager {
     }
 }
 
-// ---------------------------------------------------------------------------
-// W13 — weak-veto arbitration tickets
-// ---------------------------------------------------------------------------
-
-/// How long a veto ticket stays redeemable.
-///
-/// The source arbitrates immediately on parsing the completion refusal that
-/// minted the ticket — sub-millisecond in the observed CI traces — so this is
-/// already orders of magnitude of slack. It is deliberately far below the
-/// authentication layer's +/-5 minute timestamp window (`cluster::auth`), which
-/// is what a captured frame would be replayed inside: a ticket that has expired
-/// cannot be redeemed by a replay even before the consume-on-redeem rule below
-/// applies.
-pub const WEAK_VETO_TICKET_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Hard cap on outstanding tickets, so a peer that drives refusals in a loop
-/// cannot grow this map without bound. One completion refusal names at most 512
-/// keys (`MAX_VETOED_KEYS_NAMED` in `server::dispatch`); at the cap the oldest
-/// entries are evicted first, which can only cause a legitimate arbitration to
-/// be REFUSED (the pre-W13 disposition — safe), never honored spuriously.
-pub const MAX_WEAK_VETO_TICKETS: usize = 65_536;
-
-/// W13 — the target-side record that THIS node refused `source`'s completion
-/// for `shard` naming `key` with a WEAK-cause veto, and will therefore honor
-/// one arbitration of that key from that source.
-///
-/// # Why this exists
-///
-/// The weak-veto arbitration is a destructive override: it lifts an
-/// anti-resurrection marker on the caller's say-so. Before W13 it was
-/// implicitly bound to an in-flight transfer by requiring an open inbound
-/// migration entry from the requester. That entry can only exist while the
-/// shard is `Copying` / inbound-expected — i.e. while the shard is
-/// client-INVISIBLE on this node — so it was, incidentally, a CONTEXT binding
-/// as well as a (forgeable) identity one. It was also unsatisfiable for the
-/// replica fills the arbitration exists to unstrand, so W13 removed it.
-///
-/// A ticket restores the context binding in a form a replica fill CAN satisfy,
-/// because it is minted on the veto path (which does not depend on handoff
-/// state at all) rather than on the fence path: an arbitration is honored only
-/// if this node itself refused that source's completion for that shard naming
-/// that key, recently. An unsolicited frame — the steady-state, no-migration
-/// case — redeems nothing and is refused.
-///
-/// Redemption CONSUMES the ticket, which is also the replay defence: a captured
-/// frame replayed inside the authentication layer's timestamp window finds
-/// nothing outstanding. A source that legitimately needs to arbitrate the same
-/// key again first re-drives a completion, which mints a fresh ticket.
-#[derive(Debug, Default)]
-pub struct WeakVetoTicketStore {
-    tickets: std::collections::HashMap<(u16, NodeId, crate::index::TxKey), std::time::Instant>,
-}
-
-impl WeakVetoTicketStore {
-    /// An empty store.
-    pub fn new() -> Self {
-        Self {
-            tickets: std::collections::HashMap::new(),
-        }
-    }
-
-    /// Mint (or refresh) the ticket authorizing `source` to arbitrate `key` in
-    /// `shard`, stamped `now`.
-    ///
-    /// Called from the completion-refusal path for each WEAK-cause veto it
-    /// names. Refreshing an existing ticket is deliberate: the source is being
-    /// told about the veto again, so the clock restarts. Expired entries are
-    /// swept first; at [`MAX_WEAK_VETO_TICKETS`] the oldest surviving entry is
-    /// evicted to make room.
-    pub fn issue(
-        &mut self,
-        shard: u16,
-        source: NodeId,
-        key: crate::index::TxKey,
-        now: std::time::Instant,
-    ) {
-        // The sweep is O(n) and purely a memory reclaim — `peek` / `redeem`
-        // check each ticket's own age, so a not-yet-swept expired ticket is
-        // already unredeemable. Running it on EVERY issue made minting a
-        // refusal's 512 tickets O(n) each; run it only at the cap, which makes
-        // `issue` O(1) amortized.
-        if self.tickets.len() >= MAX_WEAK_VETO_TICKETS
-            && !self.tickets.contains_key(&(shard, source, key))
-        {
-            self.expire(now);
-            if self.tickets.len() >= MAX_WEAK_VETO_TICKETS {
-                self.evict_oldest_half();
-            }
-        }
-        self.tickets.insert((shard, source, key), now);
-    }
-
-    /// Drop the oldest half of the outstanding tickets, oldest-first by issue
-    /// instant.
-    ///
-    /// Half rather than one, so the O(n) pass is amortized over the next n/2
-    /// insertions instead of running on every insertion at the cap — a
-    /// completion refusal mints up to 512 tickets at a time, and an exact
-    /// evict-one-per-insert made that quadratic. Evicting can only cause a
-    /// later arbitration to be REFUSED (the pre-W13 disposition, safe), never
-    /// honored spuriously.
-    fn evict_oldest_half(&mut self) {
-        let mut entries: Vec<((u16, NodeId, crate::index::TxKey), std::time::Instant)> =
-            self.tickets.iter().map(|(k, v)| (*k, *v)).collect();
-        let mid = entries.len() / 2;
-        if mid == 0 {
-            return;
-        }
-        entries.select_nth_unstable_by_key(mid, |(_, issued)| *issued);
-        for (k, _) in entries.into_iter().take(mid) {
-            self.tickets.remove(&k);
-        }
-    }
-
-    /// Redeem — and CONSUME — the ticket authorizing `source` to arbitrate
-    /// `key` in `shard`. `true` iff an unexpired ticket existed.
-    ///
-    /// Consuming is what makes a replayed arbitration frame a no-op: the
-    /// second delivery finds nothing outstanding and the caller refuses it.
-    pub fn redeem(
-        &mut self,
-        shard: u16,
-        source: NodeId,
-        key: &crate::index::TxKey,
-        now: std::time::Instant,
-    ) -> bool {
-        match self.tickets.remove(&(shard, source, *key)) {
-            Some(issued) => now.duration_since(issued) <= WEAK_VETO_TICKET_TTL,
-            None => false,
-        }
-    }
-
-    /// Whether an unexpired ticket exists, WITHOUT consuming it. Used by the
-    /// all-or-nothing pre-scan so a frame that will be refused for any reason
-    /// burns no tickets.
-    pub fn peek(
-        &self,
-        shard: u16,
-        source: NodeId,
-        key: &crate::index::TxKey,
-        now: std::time::Instant,
-    ) -> bool {
-        self.tickets
-            .get(&(shard, source, *key))
-            .is_some_and(|issued| now.duration_since(*issued) <= WEAK_VETO_TICKET_TTL)
-    }
-
-    /// Outstanding (not-yet-swept) ticket count — an observability hook and the
-    /// bound this store is tested against.
-    pub fn len(&self) -> usize {
-        self.tickets.len()
-    }
-
-    /// Whether no tickets are outstanding.
-    pub fn is_empty(&self) -> bool {
-        self.tickets.is_empty()
-    }
-
-    /// Drop every ticket older than [`WEAK_VETO_TICKET_TTL`] relative to `now`.
-    /// Returns the number removed.
-    pub fn expire(&mut self, now: std::time::Instant) -> usize {
-        let before = self.tickets.len();
-        self.tickets
-            .retain(|_, issued| now.duration_since(*issued) <= WEAK_VETO_TICKET_TTL);
-        before - self.tickets.len()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
-
-    fn ticket_key(n: u8) -> crate::index::TxKey {
-        let mut txid = [0u8; 32];
-        txid[0] = n;
-        crate::index::TxKey { txid }
-    }
-
-    /// W13 — a ticket authorizes exactly ONE arbitration of exactly one
-    /// `(shard, source, key)` triple, and redemption consumes it (the replay
-    /// defence). Every neighbouring triple is unauthorized.
-    #[test]
-    fn a_veto_ticket_authorizes_one_triple_once() {
-        let mut store = WeakVetoTicketStore::new();
-        let now = std::time::Instant::now();
-        let k = ticket_key(1);
-        store.issue(7, NodeId(2), k, now);
-        assert_eq!(store.len(), 1);
-
-        // Neighbouring triples are NOT authorized.
-        assert!(!store.peek(8, NodeId(2), &k, now), "wrong shard");
-        assert!(!store.peek(7, NodeId(3), &k, now), "wrong source");
-        assert!(!store.peek(7, NodeId(2), &ticket_key(2), now), "wrong key");
-        assert_eq!(store.len(), 1, "a peek never consumes");
-
-        assert!(
-            store.redeem(7, NodeId(2), &k, now),
-            "the exact triple redeems"
-        );
-        assert!(store.is_empty(), "redemption consumes the ticket");
-        assert!(
-            !store.redeem(7, NodeId(2), &k, now),
-            "a replayed frame finds nothing outstanding",
-        );
-    }
-
-    /// W13 — a ticket older than `WEAK_VETO_TICKET_TTL` cannot be redeemed,
-    /// and the sweep drops it. The TTL sits far inside the auth layer's
-    /// +/-5 min timestamp window, so a frame captured and replayed near that
-    /// window's edge cannot redeem even a never-used ticket.
-    #[test]
-    fn a_veto_ticket_expires_well_inside_the_auth_replay_window() {
-        let mut store = WeakVetoTicketStore::new();
-        let now = std::time::Instant::now();
-        let k = ticket_key(3);
-        let stale = now - (WEAK_VETO_TICKET_TTL + Duration::from_secs(1));
-        store.issue(1, NodeId(5), k, stale);
-        assert!(
-            !store.peek(1, NodeId(5), &k, now),
-            "expired: not redeemable"
-        );
-        assert!(!store.redeem(1, NodeId(5), &k, now));
-        assert!(
-            store.is_empty(),
-            "a refused redeem still removes the dead entry",
-        );
-
-        // The background sweep reclaims one that was never redeemed at all.
-        store.issue(1, NodeId(5), k, stale);
-        assert_eq!(store.expire(now), 1, "the sweep drops it");
-        assert!(store.is_empty());
-
-        // A fresh one within the TTL still redeems.
-        let fresh = now - (WEAK_VETO_TICKET_TTL - Duration::from_secs(1));
-        store.issue(1, NodeId(5), k, fresh);
-        assert!(store.redeem(1, NodeId(5), &k, now));
-        assert!(
-            WEAK_VETO_TICKET_TTL < Duration::from_secs(5 * 60),
-            "the TTL must stay inside the auth layer's replay window",
-        );
-    }
-
-    /// W13 — the store is bounded: a peer that drives refusals in a loop
-    /// cannot grow it without limit. Eviction is oldest-first and can only
-    /// cause a REFUSAL (the pre-W13 disposition), never a spurious honour.
-    #[test]
-    fn the_veto_ticket_store_is_bounded_and_evicts_oldest_first() {
-        let mut store = WeakVetoTicketStore::new();
-        let base = std::time::Instant::now();
-        // Age each ticket distinctly so "oldest" is well defined, all far
-        // inside the TTL so the CAP — not the expiry sweep — does the work.
-        let n = MAX_WEAK_VETO_TICKETS + 16;
-        for i in 0..n {
-            let mut txid = [0u8; 32];
-            txid[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            let age = Duration::from_micros((n - i) as u64);
-            store.issue(1, NodeId(9), crate::index::TxKey { txid }, base - age);
-        }
-        assert!(
-            store.len() <= MAX_WEAK_VETO_TICKETS,
-            "the store never exceeds its cap: {}",
-            store.len(),
-        );
-        assert!(
-            store.len() > MAX_WEAK_VETO_TICKETS / 2,
-            "…and eviction is amortized, not a full flush: {}",
-            store.len(),
-        );
-        // The very first (oldest) issue is gone; the last is still there.
-        let mut oldest = [0u8; 32];
-        oldest[..8].copy_from_slice(&0u64.to_le_bytes());
-        let mut newest = [0u8; 32];
-        newest[..8].copy_from_slice(&((n - 1) as u64).to_le_bytes());
-        assert!(
-            !store.peek(1, NodeId(9), &crate::index::TxKey { txid: oldest }, base),
-            "the oldest ticket was evicted",
-        );
-        assert!(
-            store.peek(1, NodeId(9), &crate::index::TxKey { txid: newest }, base),
-            "the newest ticket survived",
-        );
-    }
 
     #[test]
     fn shard_bitmap_set_clear_test() {

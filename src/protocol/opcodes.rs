@@ -310,9 +310,19 @@ pub const OP_MIGRATION_TRANSFER_REQUEST: u16 = 244;
 ///    (`ShardTable::holder_across_activation`);
 /// 3. TICKET — every named key redeems an outstanding VETO TICKET the target
 ///    itself minted when it refused THIS source's completion for THIS shard
-///    naming THIS key (`WeakVetoTicketStore`, 60 s TTL, consumed on
-///    redemption). This is what binds the override to a real in-flight
-///    transfer, and it is what makes a replayed frame a no-op;
+///    naming THIS key, ON THIS CONNECTION, consumed on redemption
+///    (`ConnectionState::issue_weak_veto_ticket`).
+///
+///    This does NOT prove a real in-flight transfer. The completion's
+///    `from_node` is read off its own payload under the same shared cluster
+///    secret, so a frame-capable peer can MINT a ticket on demand: send a
+///    completion naming a key it knows the target holds a weak marker for,
+///    collect the refusal, then arbitrate. What the ticket DOES give is replay
+///    defence (consume-on-redeem, and a ticket minted on one connection is
+///    unusable on another), containment of an honest-but-buggy source to
+///    exactly the keys this node refused it, and a self-limiting arbitrable set
+///    — only locally-ABSENT, WEAK-marked keys are ever named in a refusal.
+///    Closing the mint-on-demand path needs per-peer connection identity;
 /// 4. CAUSE — each key's tombstone cause is WEAK. A `ClientDelete`/`Dah`/
 ///    unrecognised veto is NEVER arbitrable (unconditional posture unchanged),
 ///    re-checked under the tombstone shard lock at mutation time.

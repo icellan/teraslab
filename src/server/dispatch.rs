@@ -1911,8 +1911,10 @@ pub(crate) fn handle_request(
                     // condition was dropped, and a credentialed peer could
                     // override anti-resurrection markers on a live,
                     // client-serving shard in steady state.
-                    if let (Some(cluster), Some(src)) = (cluster, completion_from_node) {
-                        cluster.issue_weak_veto_tickets(shard, src, &vetoed_weak_keys);
+                    if let Some(src) = completion_from_node {
+                        for key in &vetoed_weak_keys {
+                            conn_state.issue_weak_veto_ticket(shard, src, *key);
+                        }
                     }
                     let mut msg = format!("shard {shard} {}", vetoed_named.join("; "));
                     if vetoed_overflow > 0 {
@@ -2533,10 +2535,28 @@ pub(crate) fn handle_request(
             //    `None` and the inbound bitmap is empty, so no fence was
             //    raisable at all; dropping it unreplaced let a credentialed
             //    peer clear anti-resurrection markers on a LIVE, client-serving
-            //    shard with no migration anywhere in the cluster. The veto
-            //    ticket restores that context binding in a form a replica fill
-            //    can satisfy: the arbitration must reference a refusal THIS
-            //    NODE ITSELF issued, moments ago, to THIS source.
+            //    shard with no migration anywhere in the cluster.
+            //
+            //    The veto ticket does NOT fully restore that context binding,
+            //    and claiming it did was the round-2 review's finding. The
+            //    completion's `from_node` is read off ITS payload too
+            //    (`completion_from_node` above) under the same shared secret,
+            //    with no connection identity behind it — so the same
+            //    frame-capable peer can MINT a ticket on demand with a
+            //    two-frame sequence: send a completion naming a key it knows
+            //    this node weak-marked, collect the refusal, arbitrate. In
+            //    trusted-overlay mode "frame-capable" is any TCP client.
+            //
+            //    What the ticket DOES deliver, and what this handler relies on:
+            //    replay defence (consumed on redemption, and connection-scoped
+            //    so a ticket minted for an honest source is unusable on another
+            //    connection — the property the auth layer's replay table cites
+            //    for opcode 245); containment of an honest-but-buggy source to
+            //    exactly the keys this node refused IT; and a self-limiting
+            //    arbitrable set, since only locally-ABSENT WEAK-marked keys are
+            //    ever named in a refusal. Closing the mint-on-demand path needs
+            //    per-peer identity on the connection — the same gap as the
+            //    self-asserted `from_node` noted below.
             //
             //  * NO BLIND APPLY, AND NO LOST DECLARATION. This handler suspends
             //    a veto; it applies no record. The record arrives through the
@@ -2589,7 +2609,7 @@ pub(crate) fn handle_request(
                 // source behaving pre-W10 (retryable historical path), not
                 // terminally aborting and retiring every handoff it aims at
                 // an already-rolled-back target. Keep the two in step.
-                return error_response(
+                return refuse_weak_veto_arbitration_with(
                     request.request_id,
                     ERR_INVARIANT_VIOLATION,
                     crate::cluster::coordinator::WEAK_VETO_ARBITRATION_DISARMED_MSG,
@@ -2669,7 +2689,7 @@ pub(crate) fn handle_request(
                 let shard_table = cluster.shard_table();
                 let table = shard_table.read();
                 if migration_epoch == 0 || migration_epoch != table.version {
-                    return error_response(
+                    return refuse_weak_veto_arbitration_with(
                         request.request_id,
                         ERR_STALE_EPOCH,
                         &format!(
@@ -2713,17 +2733,17 @@ pub(crate) fn handle_request(
             // proof that THIS node itself refused THIS source's completion for
             // THIS shard naming THIS key, recently. Peeked here (not consumed)
             // so a frame refused below burns nothing.
-            let now = std::time::Instant::now();
-            if let Some(missing) =
-                cluster.first_unticketed_weak_veto_key(shard, from_node, &keys, now)
+            if let Some(missing) = keys
+                .iter()
+                .find(|key| !conn_state.has_weak_veto_ticket(shard, from_node, key))
             {
                 return refuse_weak_veto_arbitration(
                     request.request_id,
                     &format!(
                         "weak-veto arbitration: no outstanding veto ticket for key \
                          {missing:?} in shard {shard} from node {} at epoch \
-                         {migration_epoch} — this node did not refuse that key to \
-                         that source",
+                         {migration_epoch} — this connection carries no refusal of \
+                         that key to that source",
                         from_node.0
                     ),
                 );
@@ -2754,7 +2774,21 @@ pub(crate) fn handle_request(
             // already went away (the repair landed between the refusal and
             // this frame).
             for key in &keys {
-                cluster.redeem_weak_veto_ticket(shard, from_node, key, now);
+                // The pre-scan above proved the ticket outstanding and this
+                // connection is handled serially by one thread, so redemption
+                // cannot fail here — but check rather than discard, so the
+                // "consumed on redemption" property the auth replay table
+                // depends on is enforced rather than assumed.
+                if !conn_state.redeem_weak_veto_ticket(shard, from_node, key) {
+                    return refuse_weak_veto_arbitration(
+                        request.request_id,
+                        &format!(
+                            "weak-veto arbitration: veto ticket for key {key:?} in \
+                             shard {shard} vanished between the pre-scan and \
+                             redemption",
+                        ),
+                    );
+                }
                 match engine.arbitrate_suspend_weak_veto(key) {
                     crate::ops::tombstone::WeakTombstoneClear::Suspended => {
                         if let Some(m) = crate::metrics::migration_metrics() {
@@ -13730,9 +13764,16 @@ fn error_response(request_id: u64, code: u16, msg: &str) -> ResponseFrame {
 ///    `AtomicShardBitmap::test` indexes `[AtomicU64; NUM_SHARDS / 64]`. An
 ///    unchecked shard therefore panicked the connection thread on a malformed
 ///    frame from any credentialed peer, giving a repeatable connection-churn
-///    DoS with no `catch_unwind` on the path. The containers are range-safe as
-///    of W13 too, but this is the boundary that keeps a new handler from
-///    reintroducing the class.
+///    DoS with no `catch_unwind` on the path.
+///
+/// W13 review round-2 P2-2 — of the downstream consumers, `ShardBitmap` /
+/// `AtomicShardBitmap::{set,clear,test}`, `ShardTable::is_subset_master`,
+/// `ShardTable::shard_handoff_state` and `ShardTable::holder_across_activation`
+/// are individually range-safe. `ShardTable::target_assignment` and
+/// `effective_assignment` are NOT and cannot be without inventing an assignment
+/// to borrow — they return `&ShardAssignment`. **This boundary is the only
+/// thing protecting them**, so a new migration handler that decodes a shard
+/// from the wire MUST route it through here.
 ///
 /// `op_label` prefixes the error message (e.g. `"OP_MIGRATION_COMPLETE"`).
 fn shard_from_request_id(
@@ -13792,10 +13833,22 @@ fn check_shard_in_range(request_id: u64, op_label: &str, shard: u16) -> Option<R
 /// `cluster::coordinator::weak_veto_arbitration_terminally_refused` classifies
 /// as terminal — a refusal here never changes by asking again at the same epoch.
 fn refuse_weak_veto_arbitration(request_id: u64, msg: &str) -> ResponseFrame {
+    refuse_weak_veto_arbitration_with(request_id, ERR_INVARIANT_VIOLATION, msg)
+}
+
+/// W13 review round-2 P2-3 — as [`refuse_weak_veto_arbitration`], but keeping a
+/// DIFFERENT error code.
+///
+/// Two refusals must not answer `ERR_INVARIANT_VIOLATION`: the stale-epoch one
+/// (`ERR_STALE_EPOCH`, deliberately RETRYABLE — the epoch-current re-drive is
+/// what fixes it) and the disarmed-flag one (matched by message as
+/// operator-transient). Both still belong in the target-side refusal counter,
+/// whose doc claims to cover every refusal this handler issues.
+fn refuse_weak_veto_arbitration_with(request_id: u64, code: u16, msg: &str) -> ResponseFrame {
     if let Some(m) = crate::metrics::migration_metrics() {
         m.migration_weak_veto_arbitrations_refused_target.inc();
     }
-    error_response(request_id, ERR_INVARIANT_VIOLATION, msg)
+    error_response(request_id, code, msg)
 }
 
 /// Build an error response from a [`CodecError`] returned by one of the
@@ -28824,7 +28877,7 @@ mod tests {
         // arbitration is now ticket-bound, so mint the ticket this node's own
         // completion refusal would have minted.
         cluster.set_test_weak_veto_arbitration_enabled(true);
-        cluster.issue_weak_veto_tickets(shard, crate::cluster::shards::NodeId(1), &[key_k]);
+        cs.issue_weak_veto_ticket(shard, crate::cluster::shards::NodeId(1), key_k);
         let payload = crate::cluster::coordinator::encode_weak_veto_arbitration_payload(
             shard,
             crate::cluster::shards::NodeId(1),
@@ -29014,8 +29067,8 @@ mod tests {
             flags: 0,
             payload: payload.into(),
         };
-        cluster.issue_weak_veto_tickets(shard, crate::cluster::shards::NodeId(1), &[key_k]);
         let mut cs = crate::server::ConnectionState::new();
+        cs.issue_weak_veto_ticket(shard, crate::cluster::shards::NodeId(1), key_k);
         let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
         assert_eq!(
             resp.status, STATUS_OK,
@@ -29111,7 +29164,8 @@ mod tests {
         // W13 — the arbitration is ticket-bound: mint the ticket this node's
         // own completion refusal for that source would have minted. This test
         // isolates the AUTHORITY leg; the ticket leg has its own tests.
-        cluster.issue_weak_veto_tickets(shard, crate::cluster::shards::NodeId(1), &[key_k]);
+        let mut cs = crate::server::ConnectionState::new();
+        cs.issue_weak_veto_ticket(shard, crate::cluster::shards::NodeId(1), key_k);
         let req = RequestFrame {
             request_id: shard as u64,
             op_code: OP_MIGRATION_WEAK_VETO_ARBITRATE,
@@ -29124,7 +29178,6 @@ mod tests {
             )
             .into(),
         };
-        let mut cs = crate::server::ConnectionState::new();
         let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
         assert_eq!(
             resp.status,
@@ -29237,7 +29290,8 @@ mod tests {
             &[],
             4,
         );
-        cluster.issue_weak_veto_tickets(shard, crate::cluster::shards::NodeId(1), &[key_k]);
+        let mut cs = crate::server::ConnectionState::new();
+        cs.issue_weak_veto_ticket(shard, crate::cluster::shards::NodeId(1), key_k);
         let req = RequestFrame {
             request_id: shard as u64,
             op_code: OP_MIGRATION_WEAK_VETO_ARBITRATE,
@@ -29250,7 +29304,6 @@ mod tests {
             )
             .into(),
         };
-        let mut cs = crate::server::ConnectionState::new();
         let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
         assert_eq!(
             resp.status,
@@ -29492,8 +29545,16 @@ mod tests {
         }
 
         /// Drive the REAL completion handler so it rejects naming the veto —
-        /// the refusal that mints the arbitration ticket.
-        fn reject_completion(&self, engine: &Engine) -> ResponseFrame {
+        /// the refusal that mints the arbitration ticket ON `cs`.
+        ///
+        /// W13 round-2 — the ticket is CONNECTION-scoped, so every call in one
+        /// mint/redeem sequence must share a `ConnectionState`, exactly as the
+        /// real producer shares one `TcpStream` for both frames.
+        fn reject_completion(
+            &self,
+            engine: &Engine,
+            cs: &mut crate::server::ConnectionState,
+        ) -> ResponseFrame {
             let entries = vec![(self.key, 0u32)];
             let hash = compute_manifest_for_entries(&entries);
             let payload = crate::cluster::coordinator::encode_migration_complete_payload(
@@ -29511,17 +29572,21 @@ mod tests {
                 flags: 0,
                 payload: payload.into(),
             };
-            let mut cs = crate::server::ConnectionState::new();
-            handle_request(&req, engine, 8192, Some(&self.cluster), None, &mut cs, None)
+            handle_request(&req, engine, 8192, Some(&self.cluster), None, cs, None)
         }
 
-        fn arbitrate(&self, engine: &Engine) -> ResponseFrame {
-            self.arbitrate_from(engine, self.source)
+        fn arbitrate(
+            &self,
+            engine: &Engine,
+            cs: &mut crate::server::ConnectionState,
+        ) -> ResponseFrame {
+            self.arbitrate_from(engine, cs, self.source)
         }
 
         fn arbitrate_from(
             &self,
             engine: &Engine,
+            cs: &mut crate::server::ConnectionState,
             from: crate::cluster::shards::NodeId,
         ) -> ResponseFrame {
             let req = RequestFrame {
@@ -29536,8 +29601,7 @@ mod tests {
                 )
                 .into(),
             };
-            let mut cs = crate::server::ConnectionState::new();
-            handle_request(&req, engine, 8192, Some(&self.cluster), None, &mut cs, None)
+            handle_request(&req, engine, 8192, Some(&self.cluster), None, cs, None)
         }
     }
 
@@ -29561,8 +29625,9 @@ mod tests {
             &h.engine,
             crate::ops::tombstone::TombstoneCause::PruneReplace,
         );
+        let mut cs = crate::server::ConnectionState::new();
         // No completion was ever refused here, so no ticket exists.
-        let resp = fx.arbitrate(&h.engine);
+        let resp = fx.arbitrate(&h.engine, &mut cs);
         assert_ne!(
             resp.status, STATUS_OK,
             "an unsolicited arbitration must be refused: this node never vetoed \
@@ -29588,7 +29653,8 @@ mod tests {
             &h.engine,
             crate::ops::tombstone::TombstoneCause::PruneReplace,
         );
-        let rejected = fx.reject_completion(&h.engine);
+        let mut cs = crate::server::ConnectionState::new();
+        let rejected = fx.reject_completion(&h.engine, &mut cs);
         assert_ne!(rejected.status, STATUS_OK, "the completion is vetoed");
         let err = crate::cluster::coordinator::migration_complete_rejection_error(
             rejected.status,
@@ -29598,7 +29664,7 @@ mod tests {
             err.contains("vetoed by deletion tombstone") && err.contains("PruneReplace"),
             "the refusal names the weak veto: {err}",
         );
-        let resp = fx.arbitrate(&h.engine);
+        let resp = fx.arbitrate(&h.engine, &mut cs);
         assert_eq!(
             resp.status,
             STATUS_OK,
@@ -29614,6 +29680,53 @@ mod tests {
         );
     }
 
+    /// W13 round-2 — the ticket is CONNECTION-scoped: a ticket minted by an
+    /// honest source's refusal on ITS connection cannot be redeemed on a
+    /// different connection.
+    ///
+    /// This is what makes the scoping strictly stronger than the node-wide map
+    /// it replaced, and it is sound because the real producer sends both frames
+    /// on the same `TcpStream` (`send_migration_complete` is handed
+    /// `Some(&mut stream)` on every escalation path and only dials the target
+    /// address when handed `None`, which that path never does).
+    #[test]
+    fn a_veto_ticket_cannot_be_redeemed_on_another_connection() {
+        let h = DispatchTestHarness::new();
+        let fx = ArbitrationFixture::new(
+            &h.engine,
+            crate::ops::tombstone::TombstoneCause::PruneReplace,
+        );
+        let mut honest = crate::server::ConnectionState::new();
+        assert_ne!(
+            fx.reject_completion(&h.engine, &mut honest).status,
+            STATUS_OK,
+            "the honest source's completion is vetoed, minting its ticket",
+        );
+        assert_eq!(honest.weak_veto_ticket_count(), 1);
+
+        // A second connection claiming the same source id redeems nothing.
+        let mut other = crate::server::ConnectionState::new();
+        assert_ne!(
+            fx.arbitrate(&h.engine, &mut other).status,
+            STATUS_OK,
+            "another connection cannot spend a ticket it never minted",
+        );
+        assert!(
+            h.engine.tombstone_blocks_heal_apply(&fx.key, 0),
+            "the veto still stands",
+        );
+        assert_eq!(
+            honest.weak_veto_ticket_count(),
+            1,
+            "and the honest connection's ticket is untouched",
+        );
+
+        // The connection that earned it still can.
+        assert_eq!(fx.arbitrate(&h.engine, &mut honest).status, STATUS_OK);
+        assert!(h.engine.weak_veto_suspended(&fx.key));
+        assert_eq!(honest.weak_veto_ticket_count(), 0, "consumed on redemption");
+    }
+
     /// W13 round-2 (RED) — security P2-2: a captured arbitration frame replayed
     /// inside the +/-5 min auth window must not clear a second time. The ticket
     /// is CONSUMED on redemption, so the replay finds nothing outstanding.
@@ -29624,13 +29737,14 @@ mod tests {
             &h.engine,
             crate::ops::tombstone::TombstoneCause::PruneReplace,
         );
-        assert_ne!(fx.reject_completion(&h.engine).status, STATUS_OK);
+        let mut cs = crate::server::ConnectionState::new();
+        assert_ne!(fx.reject_completion(&h.engine, &mut cs).status, STATUS_OK);
         assert_eq!(
-            fx.arbitrate(&h.engine).status,
+            fx.arbitrate(&h.engine, &mut cs).status,
             STATUS_OK,
             "first redemption"
         );
-        let replay = fx.arbitrate(&h.engine);
+        let replay = fx.arbitrate(&h.engine, &mut cs);
         assert_ne!(
             replay.status, STATUS_OK,
             "the replayed frame finds no outstanding ticket",
@@ -29660,13 +29774,14 @@ mod tests {
             &h.engine,
             crate::ops::tombstone::TombstoneCause::PruneReplace,
         );
+        let mut cs = crate::server::ConnectionState::new();
         assert_eq!(
             h.engine.weak_tombstone_keys_for_shard(fx.shard),
             vec![fx.key],
             "precondition: the marker declares the omission",
         );
-        assert_ne!(fx.reject_completion(&h.engine).status, STATUS_OK);
-        assert_eq!(fx.arbitrate(&h.engine).status, STATUS_OK);
+        assert_ne!(fx.reject_completion(&h.engine, &mut cs).status, STATUS_OK);
+        assert_eq!(fx.arbitrate(&h.engine, &mut cs).status, STATUS_OK);
 
         // The re-push never lands (source crash / stream break).
         assert!(
@@ -29692,8 +29807,9 @@ mod tests {
             &h.engine,
             crate::ops::tombstone::TombstoneCause::PruneReplace,
         );
-        assert_ne!(fx.reject_completion(&h.engine).status, STATUS_OK);
-        assert_eq!(fx.arbitrate(&h.engine).status, STATUS_OK);
+        let mut cs = crate::server::ConnectionState::new();
+        assert_ne!(fx.reject_completion(&h.engine, &mut cs).status, STATUS_OK);
+        assert_eq!(fx.arbitrate(&h.engine, &mut cs).status, STATUS_OK);
 
         let batch = ReplicaBatch {
             first_sequence: 0,
@@ -29744,9 +29860,18 @@ mod tests {
     }
 
     /// W13 round-2 (bitcoin P2-3) — the pin that matters most post-widening:
-    /// a REPLICA requester passes the authority check and holds a valid ticket,
-    /// and is STILL refused by cause. The pre-existing matrix test only ever
+    /// a REPLICA requester that passes the authority check AND holds a valid
+    /// ticket is STILL refused by cause. The pre-existing matrix test only ever
     /// drove this from the shard's MASTER.
+    ///
+    /// The ticket is minted EXPLICITLY here, and that is the whole point. A
+    /// strong-cause veto mints none of its own (only weak-cause vetoes do) and
+    /// the ticket pre-scan runs BEFORE the cause pre-scan — so driving this
+    /// through a real completion refusal would observe "no outstanding veto
+    /// ticket" and stay green even with the cause gate deleted entirely
+    /// (round-2 review P2-1). Minting first walks the request past the ticket
+    /// gate so the CAUSE gate is the one under test, and the refusal message is
+    /// asserted to prove which gate fired.
     #[test]
     fn a_ticketed_replica_requester_still_cannot_clear_a_client_delete_marker() {
         let h = DispatchTestHarness::new();
@@ -29754,13 +29879,24 @@ mod tests {
             &h.engine,
             crate::ops::tombstone::TombstoneCause::ClientDelete,
         );
-        // The completion refusal names the veto and (for a strong cause) mints
-        // no ticket; drive it anyway so the requester gets every chance.
-        assert_ne!(fx.reject_completion(&h.engine).status, STATUS_OK);
-        let resp = fx.arbitrate(&h.engine);
+        let mut cs = crate::server::ConnectionState::new();
+        cs.issue_weak_veto_ticket(fx.shard, fx.source, fx.key);
+        assert!(
+            cs.has_weak_veto_ticket(fx.shard, fx.source, &fx.key),
+            "precondition: the ticket gate will pass, so the cause gate decides",
+        );
+        let resp = fx.arbitrate(&h.engine, &mut cs);
         assert_ne!(
             resp.status, STATUS_OK,
             "a ClientDelete marker is never arbitrable, by anyone",
+        );
+        let err = crate::cluster::coordinator::migration_complete_rejection_error(
+            resp.status,
+            &resp.payload,
+        );
+        assert!(
+            err.contains("never arbitrable"),
+            "the CAUSE gate refused it, not the ticket gate: {err}",
         );
         assert_eq!(
             h.engine.tombstone_cause(&fx.key),
@@ -29939,7 +30075,7 @@ mod tests {
             &[],
             3,
         );
-        let send = || {
+        let send = |cs: &mut crate::server::ConnectionState| {
             let req = RequestFrame {
                 request_id: shard as u64,
                 op_code: OP_MIGRATION_WEAK_VETO_ARBITRATE,
@@ -29952,14 +30088,14 @@ mod tests {
                 )
                 .into(),
             };
-            let mut cs = crate::server::ConnectionState::new();
-            handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None)
+            handle_request(&req, &h.engine, 8192, Some(&cluster), None, cs, None)
         };
 
         // Unticketed, the departed node changes nothing — this is the case
         // the ticket exists to stop.
+        let mut cs = crate::server::ConnectionState::new();
         assert_ne!(
-            send().status,
+            send(&mut cs).status,
             STATUS_OK,
             "a departed holder cannot arbitrate unsolicited",
         );
@@ -29970,8 +30106,8 @@ mod tests {
 
         // Ticketed by this node's own refusal, it may — that is the armed-05
         // shape and refusing it is the wedge.
-        cluster.issue_weak_veto_tickets(shard, departed, &[key_k]);
-        let resp = send();
+        cs.issue_weak_veto_ticket(shard, departed, key_k);
+        let resp = send(&mut cs);
         assert_eq!(
             resp.status,
             STATUS_OK,
@@ -30043,8 +30179,10 @@ mod tests {
         );
         // Both ticketed, so the ONLY thing that can refuse the frame is the
         // strong cause — and it must refuse the WHOLE frame.
-        cluster.issue_weak_veto_tickets(shard, crate::cluster::shards::NodeId(1), &[weak, strong]);
-        let before = cluster.weak_veto_ticket_count();
+        let mut cs = crate::server::ConnectionState::new();
+        cs.issue_weak_veto_ticket(shard, crate::cluster::shards::NodeId(1), weak);
+        cs.issue_weak_veto_ticket(shard, crate::cluster::shards::NodeId(1), strong);
+        let before = cs.weak_veto_ticket_count();
         assert_eq!(before, 2);
 
         let req = RequestFrame {
@@ -30061,7 +30199,6 @@ mod tests {
             )
             .into(),
         };
-        let mut cs = crate::server::ConnectionState::new();
         let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
         assert_ne!(resp.status, STATUS_OK, "the whole frame is refused");
         assert!(
@@ -30077,7 +30214,7 @@ mod tests {
             Some(crate::ops::tombstone::TombstoneCause::ClientDelete),
         );
         assert_eq!(
-            cluster.weak_veto_ticket_count(),
+            cs.weak_veto_ticket_count(),
             before,
             "a refused frame burns no tickets either",
         );

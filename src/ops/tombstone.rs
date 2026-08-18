@@ -791,8 +791,8 @@ impl TombstoneLog {
     /// horizon. The claim's lifetime must be bounded by the REPAIR, not by
     /// block height, so weak causes are never expired here.
     ///
-    /// This does not strand a weak veto. Three drains clear one, and every one
-    /// of them IS the repair landing:
+    /// This does not strand a weak veto. TWO drains clear one, and both of them
+    /// ARE the repair landing:
     ///
     /// * [`Self::clear`] — Invariant TS-1: the key comes back LIVE (client
     ///   create, replica create, migration baseline apply);
