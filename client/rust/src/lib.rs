@@ -278,6 +278,13 @@ pub struct ClientConfig {
     ///
     /// Applies to every `round_trip` on a pooled connection. Lower it for
     /// latency-sensitive callers; raise it for slow links.
+    ///
+    /// **This is NOT a whole-operation deadline.** A cluster mutation that
+    /// keeps meeting a transient server code walks the bounded retry ladder,
+    /// which costs ~31 s of backoff plus up to one dial timeout per
+    /// routing refresh — on the order of 31-100 s in a partition. See
+    /// `is_retryable_error_code` for the full accounting. Callers needing a
+    /// hard ceiling must wrap the call (e.g. `tokio::time::timeout`).
     pub request_timeout: Duration,
     /// Cold-data size (in bytes) strictly above which `create_batch`
     /// pre-uploads the data to the external blob store via chunked streaming
@@ -3573,10 +3580,12 @@ fn all_errors_have_code(errors: &[BatchItemError], code: u16) -> bool {
 ///   section). The write may now be durable on master, replicas, both, or
 ///   neither; the server's compensation machinery converges the state, and
 ///   the prescribed client recovery is to re-issue the identical idempotent
-///   op. Because all TeraSlab mutations are idempotent by txid/op semantics
-///   (re-spending an already-spent output, re-mining an already-mined tx,
-///   re-creating an existing record, etc. converge to the same state), a
-///   bounded same-target retry is safe and is the documented recovery path.
+///   op. A bounded same-target retry is safe for it because re-applying the
+///   mutation converges to the same state (re-spending an already-spent
+///   output, re-mining an already-mined tx). Note the retry is
+///   OUTCOME-preserving, not silent: re-creating a record that did land
+///   answers `ERR_ALREADY_EXISTS`, which the caller must expect and treat as
+///   "the first attempt succeeded" rather than as a new failure.
 /// - [`ERR_NO_QUORUM`] — the target cannot name a master for the key
 ///   *right now*. The server emits it from three sites and calls it
 ///   retryable at every one: the `NodeId(0)` unassigned sentinel returned
@@ -3590,7 +3599,10 @@ fn all_errors_have_code(errors: &[BatchItemError], code: u16) -> bool {
 ///   which is precisely the prescribed recovery. Retrying is also safe for
 ///   the fourth shape, a genuine loss of majority (`check_quorum`): the
 ///   node simply keeps refusing and the bounded budget returns the same
-///   code to the caller.
+///   code to the caller. Retry safety here does not rest on the
+///   idempotency argument above at all — every site that emits code 15
+///   refuses BEFORE applying anything, so a re-issue cannot double-apply
+///   regardless of the operation.
 ///
 ///   W12 TAIL 1 — omitting this code cost real availability. The
 ///   all-items-failed partial arm of [`Client::send_item_batch_cluster`]
@@ -3600,6 +3612,33 @@ fn all_errors_have_code(errors: &[BatchItemError], code: u16) -> bool {
 ///   100-195 ms across the three incumbents of a 3->4 scale-up and the
 ///   workload recorded 13/347 (default) and 14/247 (armed) hard errors from
 ///   it.
+///
+/// # Worst-case latency (W12 review P2-1) — read before raising the ladder
+///
+/// A call that keeps hitting a retryable code walks the WHOLE ladder before
+/// surfacing. [`TRANSIENT_MUTATION_RETRY_DELAYS_MS`] sums to **31,385 ms**,
+/// but that is a FLOOR, not the bound: each of the 14 retries also calls
+/// `refresh_routing`, whose poll joins EVERY pool's task, so a refresh costs
+/// up to one dial timeout (`PoolConfig::dial_timeout`, 5 s by default)
+/// whenever any cached peer is unreachable — the common partition shape.
+/// Realistic worst case is therefore roughly **31 s to 100 s**, and there is
+/// no total-operation deadline: `request_timeout` bounds a single round trip
+/// only. Callers that need a hard ceiling must impose their own (e.g.
+/// `tokio::time::timeout` around the call).
+///
+/// Adding `ERR_NO_QUORUM` widened who pays that. The attempt-0 zero-delay
+/// special case for a global code 15 exists only in
+/// [`Client::send_item_batch_cluster`]; the three other loops that share this
+/// predicate (`send_txid_batch_signals_cluster`, `send_txid_batch_cluster`,
+/// `spend_batch_cluster` — i.e. spend / set_mined / delete /
+/// mark_longest_chain) previously returned a global code 15 after ONE round
+/// trip and now walk the ladder. In a minority partition, or against a node
+/// permanently below the committed term with partial serving off, that is
+/// pure added latency with no chance of success.
+///
+/// The ladder also has NO jitter, so clients that fail together re-issue in
+/// lockstep. Both are known trade-offs of keeping ONE uniform policy rather
+/// than a per-code ladder; revisit together if either bites.
 pub(crate) fn is_retryable_error_code(code: u16) -> bool {
     matches!(
         code,
@@ -4071,17 +4110,24 @@ mod tests {
         let node1 = create_node_with_rf(1, tcp1, swim1, &[], 1);
         let node2 = create_node_with_rf(2, tcp2, swim2, &[swim1], 1);
 
-        tokio::time::sleep(Duration::from_secs(3)).await;
-
         // Precondition: a quorum commit has landed, so there is a committed
         // term to lag behind. Until the first commit the term is 0 and the
-        // stale-table branch is unreachable.
-        let committed = node1.cluster.local_cluster_key();
-        assert!(
-            committed >= 1,
-            "test precondition: node1 must have observed a quorum-committed \
-             term to lag behind, got {committed}"
-        );
+        // stale-table branch is unreachable. POLLED, not slept: a fixed sleep
+        // makes the precondition a timing bet that turns a slow machine into a
+        // confusing assertion failure rather than a wait.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let committed = loop {
+            let term = node1.cluster.local_cluster_key();
+            if term >= 1 {
+                break term;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test precondition: node1 never observed a quorum-committed \
+                 term to lag behind within 20s"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
 
         let original = node1.cluster.shard_table().read().clone();
         assert!(
