@@ -2424,18 +2424,46 @@ pub(crate) fn handle_request(
             //    as a node that never recorded one — the bare-node posture
             //    RULE-DS always accepted for non-deleting nodes.
             //
-            //  * AUTHORITY + FENCE + EPOCH. The request is honored only when
-            //    (a) it is stamped with this node's currently-activated
-            //    epoch, (b) `from_node` is that epoch's authoritative holder
-            //    (committed target master or still-authoritative effective
-            //    master — the same predicate as the #29 prune's
-            //    `source_is_authoritative_complete`), and (c) the source's
-            //    transfer for the shard is STILL OPEN here (an active
-            //    uncompleted inbound entry from `from_node`, i.e. the write
-            //    fence that accompanied the rejected completion is still
-            //    held and the shard is not client-serving). A superseded or
-            //    never-streamed source fails (a)/(b)/(c) and changes
-            //    nothing.
+            //  * AUTHORITY + EPOCH. The request is honored only when (a) it is
+            //    stamped with this node's currently-activated epoch, and (b)
+            //    THIS node's own shard table names `from_node` as a HOLDER of
+            //    the shard across the in-flight activation — master or replica
+            //    of the target assignment, the effective assignment, or the
+            //    assignment this activation superseded
+            //    (`ShardTable::holder_across_activation`). A node named
+            //    nowhere for the shard, or one stamped with a superseded
+            //    epoch, changes nothing.
+            //
+            //    W13 — (b) used to require `from_node` to be the shard's
+            //    MASTER (target or effective), and a third condition (c)
+            //    required an OPEN inbound transfer entry from it. Both were
+            //    unsatisfiable for most legitimate arbitrations, which turned
+            //    the one drain a weak tombstone has into a permanent refusal:
+            //
+            //      - `ShardTable::replica_migration_plan` emits `is_master:
+            //        false` fills whose source is an old HOLDER, routinely a
+            //        replica. In the armed CI run at 0e00822 ALL 107
+            //        terminally-aborted handoffs on scenario 05 were replica
+            //        fills, every one refused with `code=33 … is not shard
+            //        N's authoritative holder`.
+            //      - `ShardTable::begin_handoff_with` enters `Copying` only
+            //        when a shard's master changed AND the local node already
+            //        holds data for it, so on a target with no local copy
+            //        `effective_assignment` reports the NEW assignment and the
+            //        streaming old master is invisible. Default scenario 09
+            //        refused both sources of shard 1845 that way while
+            //        accepting the same source for 2199/2523 in the same
+            //        second — those shards had local data, so their handoff
+            //        really was `Copying`.
+            //      - the inbound entry (c) tested for is only recorded when
+            //        the shard is already inbound-expected or in `Copying`
+            //        (`OP_REPLICA_BATCH` above), so a replica fill never
+            //        raises one at all. (c) was therefore not an authority
+            //        property — it was a second, independent way for the same
+            //        wedge to fire, and it is gone. What it stood in for is
+            //        carried by (b) plus the cause gating above, which no
+            //        requester of any kind can get past for a
+            //        ClientDelete/Dah/unknown marker.
             //
             //  * NO BLIND APPLY. This handler clears a marker; it applies no
             //    record. The record arrives through the normal replica-create
@@ -2482,6 +2510,17 @@ pub(crate) fn handle_request(
                     "weak-veto arbitration: truncated header",
                 );
             };
+            // The wire carries a full u16 but only 0..NUM_SHARDS exist, and
+            // every shard-table accessor below indexes a NUM_SHARDS-long Vec:
+            // reject an out-of-range shard here rather than letting a
+            // malformed frame index off the end.
+            if shard as usize >= crate::cluster::shards::NUM_SHARDS {
+                return error_response(
+                    request.request_id,
+                    ERR_PAYLOAD_MALFORMED,
+                    &format!("weak-veto arbitration: shard {shard} is out of range"),
+                );
+            }
             let key_count = key_count as usize;
             // The vetoed set a completion rejection names is bounded (512 per
             // round); anything past the full-manifest scale is malformed.
@@ -2518,8 +2557,11 @@ pub(crate) fn handle_request(
             let from_node = NodeId(from_node);
             // (a) EPOCH-CURRENT: stamped with the currently-activated table
             // version (a legacy epoch-0 frame cannot be proven current).
-            // (b) AUTHORITATIVE: from_node is the committed target master or
-            // the still-authoritative effective master for the shard.
+            // (b) HOLDER: THIS node's table names from_node as a holder of the
+            // shard across the in-flight activation (target / effective /
+            // superseded assignment, master or replica). See the W13 note in
+            // the handler doc for why the pre-W13 master-only + open-inbound
+            // pair was unsatisfiable for most legitimate arbitrations.
             {
                 let shard_table = cluster.shard_table();
                 let table = shard_table.read();
@@ -2534,9 +2576,7 @@ pub(crate) fn handle_request(
                         ),
                     );
                 }
-                let authoritative = table.target_assignment(shard).master == from_node
-                    || table.effective_assignment(shard).master == from_node;
-                if !authoritative {
+                if !table.holder_across_activation(shard, from_node) {
                     return error_response(
                         request.request_id,
                         ERR_INVARIANT_VIOLATION,
@@ -2547,19 +2587,6 @@ pub(crate) fn handle_request(
                         ),
                     );
                 }
-            }
-            // (c) FENCE HELD: the source's transfer for this shard is still
-            // open here.
-            if !cluster.has_pending_inbound_from_source(shard, from_node) {
-                return error_response(
-                    request.request_id,
-                    ERR_INVARIANT_VIOLATION,
-                    &format!(
-                        "weak-veto arbitration: no active inbound transfer for shard \
-                         {shard} from node {}",
-                        from_node.0
-                    ),
-                );
             }
             // Clear each key's WEAK tombstone; refuse the frame on the first
             // strong-cause key (already-cleared keys stay cleared — clearing
@@ -28646,13 +28673,30 @@ mod tests {
         assert!(h.engine.tombstone_blocks_heal_apply(&key_k, u32::MAX));
     }
 
-    /// W10 FIX 2 — without an OPEN inbound transfer from the source (no fence
-    /// proof), an otherwise well-formed arbitration is refused and the weak
-    /// tombstone is untouched. Separate test (not folded into the matrix
+    /// W13 (RED→GREEN) — the inbound-fence "proof" is NOT required from a node
+    /// the target's own table names as a holder of the shard.
+    ///
+    /// This test previously asserted the opposite (`weak_veto_arbitration_
+    /// refused_without_open_inbound_transfer`). That requirement was the
+    /// second half of the W13 wedge: the target only records an inbound source
+    /// when the shard is ALREADY inbound-expected or sits in `Copying` handoff
+    /// (`OP_REPLICA_BATCH`'s `already_expected || should_track_handoff`), and
+    /// `ShardTable::begin_handoff_with` marks `Copying` only when a shard's
+    /// MASTER changed AND the local node already has data for it. A replica
+    /// fill (master unchanged) therefore NEVER raises the fence, and a master
+    /// handoff into a target holding no local data for the shard does not
+    /// either — so demanding the fence made the arbitration structurally
+    /// unsatisfiable for exactly the handoffs it exists to unstrand.
+    ///
+    /// What the fence was standing in for is carried by the authority check
+    /// itself (the requester must be a named holder of the shard at the
+    /// currently-activated epoch) plus `TombstoneLog::clear_weak`, which
+    /// refuses a `ClientDelete` / `Dah` / unknown-cause marker under the shard
+    /// lock no matter who asks. Separate test (not folded into the matrix
     /// above): `DispatchTestHarness` holds the global metrics test lock for
     /// its lifetime, so a second harness in the same test self-deadlocks.
     #[test]
-    fn weak_veto_arbitration_refused_without_open_inbound_transfer() {
+    fn weak_veto_arbitration_needs_no_inbound_fence_from_a_current_holder() {
         let h = DispatchTestHarness::new();
         let epoch = 49u64;
         let members = vec![
@@ -28708,14 +28752,400 @@ mod tests {
         };
         let mut cs = crate::server::ConnectionState::new();
         let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "the shard's own master may arbitrate without an inbound fence entry",
+        );
+        assert_eq!(
+            h.engine.tombstone_cause(&key_k),
+            None,
+            "the weak tombstone is cleared for a named current holder",
+        );
+    }
+
+    /// W13 (RED) — the shape that wedged CI scenarios 05/08/09: a REPLICA-FILL
+    /// source arbitrating a weak veto on its fill target.
+    ///
+    /// `ShardTable::replica_migration_plan` emits `is_master: false` tasks
+    /// whose source is an OLD holder of the shard — routinely a replica, never
+    /// necessarily the master. The pre-W13 authority gate accepted only
+    /// `target_assignment(shard).master` / `effective_assignment(shard).master`,
+    /// so a replica-fill source could NEVER satisfy it: in the armed
+    /// scenario-05 run at 0e00822 all 107 terminally-aborted handoffs across
+    /// node1 and node3 were `is_master: false`, each one refused with
+    /// `code=33 … is not shard N's authoritative holder`. With the source's
+    /// only drain unsatisfiable and weak tombstones deliberately exempt from
+    /// retention GC, the `PruneReplace` gen-0 marker vetoed every re-push
+    /// forever.
+    ///
+    /// Here node 1 is a REPLICA (not the master) of the shard in the target's
+    /// own current-epoch table, and there is no inbound fence entry (a replica
+    /// fill never raises one). The clear must be accepted.
+    #[test]
+    fn weak_veto_arbitration_accepts_a_replica_set_member_source() {
+        let h = DispatchTestHarness::new();
+        let epoch = 51u64;
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+            crate::cluster::shards::NodeId(3),
+        ];
+        // RF=3 over 3 members: every shard is held by all three, so node 1 is
+        // a replica of every shard it does not master.
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 3, epoch, 1);
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|s| {
+                let a = table.target_assignment(*s);
+                a.master != crate::cluster::shards::NodeId(1)
+                    && a.replicas.contains(&crate::cluster::shards::NodeId(1))
+                    && (a.master == crate::cluster::shards::NodeId(2)
+                        || a.replicas.contains(&crate::cluster::shards::NodeId(2)))
+            })
+            .expect("some shard has node 1 as a replica and node 2 as a holder");
+        assert_ne!(
+            table.target_assignment(shard).master,
+            crate::cluster::shards::NodeId(1),
+            "fixture: the requester must NOT be the shard's master",
+        );
+        let key_k = TxKey {
+            txid: txid_for_shard(shard, 11),
+        };
+        let tomb_log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/w13-arbitration-replica.tombstones"),
+            h.engine.index_seed(),
+            h.engine.index_shard_count(),
+            10_000,
+        );
+        tomb_log.record(
+            &key_k,
+            0,
+            900,
+            crate::ops::tombstone::TombstoneCause::PruneReplace,
+        );
+        h.engine.set_tombstone_log(tomb_log);
+        assert!(
+            h.engine.tombstone_blocks_heal_apply(&key_k, 0),
+            "precondition: the gen-0 weak marker vetoes the gen-0 re-push",
+        );
+
+        // NOTE: deliberately no `register_inbound_source` — a replica-only
+        // fill never puts the shard in `Copying`, so the target never records
+        // an inbound source for it.
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(2),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4772".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_WEAK_VETO_ARBITRATE,
+            flags: 0,
+            payload: crate::cluster::coordinator::encode_weak_veto_arbitration_payload(
+                shard,
+                crate::cluster::shards::NodeId(1),
+                epoch,
+                &[key_k],
+            )
+            .into(),
+        };
+        let mut cs = crate::server::ConnectionState::new();
+        let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
+        assert_eq!(
+            resp.status,
+            STATUS_OK,
+            "a replica-set member of the shard may arbitrate its weak veto: {}",
+            crate::cluster::coordinator::migration_complete_rejection_error(
+                resp.status,
+                &resp.payload
+            ),
+        );
+        assert_eq!(
+            h.engine.tombstone_cause(&key_k),
+            None,
+            "the weak marker is cleared so the fill's re-push can land",
+        );
+        assert!(
+            !h.engine.tombstone_blocks_heal_apply(&key_k, 0),
+            "the gen-0 re-push is no longer vetoed",
+        );
+    }
+
+    /// W13 (RED) — the second wedged shape: the holder the CURRENT activation
+    /// superseded.
+    ///
+    /// `begin_handoff_with` puts a shard in `Copying` only when its master
+    /// changed AND the local node already has data for it. On a target with no
+    /// local copy of the shard the state goes straight to `ServingNew`, so
+    /// `effective_assignment` stops returning the PREVIOUS assignment and the
+    /// old master — the node actually streaming the shard in — is named by
+    /// neither assignment. That is why default scenario 09 refused BOTH
+    /// sources of shard 1845 (`code=33 … node {2,3} is not shard 1845's
+    /// authoritative holder at epoch 6`) while accepting node 2's arbitration
+    /// for shards 2199/2523 in the same second: those shards had local data,
+    /// so their handoff really was `Copying`.
+    ///
+    /// The superseded assignment is still the target's own table, so its
+    /// holders remain arbitrable.
+    #[test]
+    fn weak_veto_arbitration_accepts_the_holder_the_activation_superseded() {
+        let h = DispatchTestHarness::new();
+        let old_members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+            crate::cluster::shards::NodeId(3),
+        ];
+        let new_members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+            crate::cluster::shards::NodeId(3),
+            crate::cluster::shards::NodeId(4),
+        ];
+        let old = crate::cluster::shards::ShardTable::compute_with_epoch(&old_members, 1, 5, 1);
+        let new = crate::cluster::shards::ShardTable::compute_with_epoch(&new_members, 1, 6, 1);
+        let epoch = new.version;
+        // The wedged shard: mastered by node 1 before the activation, by
+        // someone else after it, and NOT held by node 1 afterwards (RF=1).
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|s| {
+                old.target_assignment(*s).master == crate::cluster::shards::NodeId(1)
+                    && new.target_assignment(*s).master != crate::cluster::shards::NodeId(1)
+                    && new.target_assignment(*s).master != crate::cluster::shards::NodeId(2)
+            })
+            .expect("some shard's master moves off node 1 and does not land on node 2");
+        // A DIFFERENT shard keeps `prev_assignments` alive: `begin_handoff_with`
+        // drops it entirely when every shard goes straight to `ServingNew`.
+        let data_shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|s| {
+                *s != shard && old.target_assignment(*s).master != new.target_assignment(*s).master
+            })
+            .expect("some other shard also changes master");
+        let mut table = old.clone();
+        table.begin_handoff_with(&new, |s| s == data_shard);
+        assert_eq!(
+            table.shard_handoff_state(shard),
+            crate::cluster::shards::ShardHandoff::ServingNew,
+            "fixture: a shard with no local data skips Copying — the whole point",
+        );
+        assert_ne!(
+            table.effective_assignment(shard).master,
+            crate::cluster::shards::NodeId(1),
+            "fixture: the departing master is invisible to effective_assignment",
+        );
+
+        let key_k = TxKey {
+            txid: txid_for_shard(shard, 13),
+        };
+        let tomb_log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/w13-arbitration-prev.tombstones"),
+            h.engine.index_seed(),
+            h.engine.index_shard_count(),
+            10_000,
+        );
+        tomb_log.record(
+            &key_k,
+            0,
+            900,
+            crate::ops::tombstone::TombstoneCause::PruneReplace,
+        );
+        h.engine.set_tombstone_log(tomb_log);
+
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(2),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4774".parse().unwrap(),
+            )],
+            &new_members,
+            &[],
+            &[],
+            &[],
+            4,
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_WEAK_VETO_ARBITRATE,
+            flags: 0,
+            payload: crate::cluster::coordinator::encode_weak_veto_arbitration_payload(
+                shard,
+                crate::cluster::shards::NodeId(1),
+                epoch,
+                &[key_k],
+            )
+            .into(),
+        };
+        let mut cs = crate::server::ConnectionState::new();
+        let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
+        assert_eq!(
+            resp.status,
+            STATUS_OK,
+            "the holder this activation superseded may still arbitrate: {}",
+            crate::cluster::coordinator::migration_complete_rejection_error(
+                resp.status,
+                &resp.payload
+            ),
+        );
+        assert_eq!(
+            h.engine.tombstone_cause(&key_k),
+            None,
+            "the weak marker is cleared for the streaming old master",
+        );
+    }
+
+    /// W13 (pre-existing panic, fixed in passing) — the arbitration frame
+    /// carries a full `u16` shard, but only `0..NUM_SHARDS` exist and every
+    /// shard-table accessor indexes a `NUM_SHARDS`-long `Vec`. Before the
+    /// range check an out-of-range shard reached `target_assignment` and
+    /// panicked the connection thread on a malformed frame; it must be a
+    /// typed rejection.
+    #[test]
+    fn weak_veto_arbitration_rejects_an_out_of_range_shard_instead_of_panicking() {
+        let h = DispatchTestHarness::new();
+        let epoch = 55u64;
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+        ];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(2),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4778".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+        let out_of_range = crate::cluster::shards::NUM_SHARDS as u16;
+        let req = RequestFrame {
+            request_id: 0,
+            op_code: OP_MIGRATION_WEAK_VETO_ARBITRATE,
+            flags: 0,
+            payload: crate::cluster::coordinator::encode_weak_veto_arbitration_payload(
+                out_of_range,
+                crate::cluster::shards::NodeId(1),
+                epoch,
+                &[TxKey { txid: [0x5A; 32] }],
+            )
+            .into(),
+        };
+        let mut cs = crate::server::ConnectionState::new();
+        let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "an out-of-range shard is a malformed frame, not a panic",
+        );
+        let err = crate::cluster::coordinator::migration_complete_rejection_error(
+            resp.status,
+            &resp.payload,
+        );
+        assert!(
+            err.contains(&format!("code={ERR_PAYLOAD_MALFORMED}")) && err.contains("out of range"),
+            "the rejection names the malformed shard: {err}",
+        );
+    }
+
+    /// W13 GUARD — widening the authority gate to the shard's HOLDERS must not
+    /// widen it to everyone: a node the target's table names nowhere for this
+    /// shard is still refused, even with an open inbound transfer registered
+    /// from it (the fence entry any authenticated peer can raise by sending a
+    /// migration batch). Membership, not the fence, is the authority.
+    #[test]
+    fn weak_veto_arbitration_refuses_a_requester_that_holds_no_part_of_the_shard() {
+        let h = DispatchTestHarness::new();
+        let epoch = 53u64;
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+            crate::cluster::shards::NodeId(3),
+        ];
+        // RF=1: each shard is held by its master alone, so node 3 below holds
+        // no part of a shard mastered by node 1.
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|s| table.target_assignment(*s).master == crate::cluster::shards::NodeId(1))
+            .expect("some shard is mastered by node 1");
+        assert!(
+            table.target_assignment(shard).replicas.is_empty(),
+            "fixture: RF=1 leaves the shard with no replica holders",
+        );
+        let key_k = TxKey {
+            txid: txid_for_shard(shard, 17),
+        };
+        let tomb_log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/w13-arbitration-nonholder.tombstones"),
+            h.engine.index_seed(),
+            h.engine.index_shard_count(),
+            10_000,
+        );
+        tomb_log.record(
+            &key_k,
+            0,
+            900,
+            crate::ops::tombstone::TombstoneCause::PruneReplace,
+        );
+        h.engine.set_tombstone_log(tomb_log);
+
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(2),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(3),
+                "127.0.0.1:4776".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            3,
+        );
+        // Node 3 has an OPEN inbound transfer here and is still refused.
+        cluster.register_inbound_source(shard, crate::cluster::shards::NodeId(3));
+
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_WEAK_VETO_ARBITRATE,
+            flags: 0,
+            payload: crate::cluster::coordinator::encode_weak_veto_arbitration_payload(
+                shard,
+                crate::cluster::shards::NodeId(3),
+                epoch,
+                &[key_k],
+            )
+            .into(),
+        };
+        let mut cs = crate::server::ConnectionState::new();
+        let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
         assert_ne!(
             resp.status, STATUS_OK,
-            "no open inbound transfer from the source — the fence proof is missing",
+            "a node that holds no part of the shard may not clear its markers",
         );
         assert_eq!(
             h.engine.tombstone_cause(&key_k),
             Some(crate::ops::tombstone::TombstoneCause::PruneReplace),
-            "the weak tombstone is untouched without the fence proof",
+            "the weak marker survives a non-holder's arbitration",
+        );
+        let err = crate::cluster::coordinator::migration_complete_rejection_error(
+            resp.status,
+            &resp.payload,
+        );
+        assert!(
+            crate::cluster::coordinator::weak_veto_arbitration_terminally_refused(&format!(
+                "weak-veto arbitration rejected by target: {err}"
+            )),
+            "the refusal stays classifiable as terminal by the source: {err}",
         );
     }
 

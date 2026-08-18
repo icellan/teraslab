@@ -71,6 +71,20 @@ pub struct ShardAssignment {
     pub replicas: Vec<NodeId>,
 }
 
+impl ShardAssignment {
+    /// Whether `node` is one of this assignment's HOLDERS — its master or any
+    /// of its replicas.
+    ///
+    /// The master-vs-replica distinction decides who SERVES the shard; this
+    /// asks the weaker question of who is expected to hold its records, which
+    /// is the population every migration / repair source is drawn from
+    /// (`ShardTable::replica_migration_plan` sources a fill from an old
+    /// holder, master or replica).
+    pub fn holds(&self, node: NodeId) -> bool {
+        self.master == node || self.replicas.contains(&node)
+    }
+}
+
 /// A task describing one shard that needs to migrate between nodes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MigrationTask {
@@ -378,6 +392,52 @@ impl ShardTable {
             },
             _ => &self.assignments[shard as usize],
         }
+    }
+
+    /// The assignment this activation SUPERSEDED for `shard`, while a
+    /// two-phase activation is still in flight; `None` once every shard has
+    /// committed (or when no handoff is running).
+    ///
+    /// [`Self::effective_assignment`] exposes the previous assignment only for
+    /// a shard whose handoff is still `Copying` / `CommitReady` /
+    /// `ServingCurrent`, and [`Self::begin_handoff_with`] enters `Copying`
+    /// only when a shard's MASTER changed AND the local node already holds
+    /// data for it. So on a node with no local copy of the shard — precisely
+    /// the migration TARGET — the previous holders are invisible to
+    /// `effective_assignment` even though they are the nodes streaming the
+    /// shard in. Callers that need "who does my table say holds this shard
+    /// across the in-flight activation" must consult this too; see
+    /// [`Self::holder_across_activation`].
+    /// Returns `None` for a shard outside `0..NUM_SHARDS` rather than
+    /// panicking, so a caller decoding the shard from the wire cannot index
+    /// off the end of the table.
+    pub fn prev_assignment(&self, shard: u16) -> Option<&ShardAssignment> {
+        self.prev_assignments
+            .as_ref()
+            .and_then(|prev| prev.get(shard as usize))
+    }
+
+    /// Whether THIS table names `node` as a holder of `shard` at any point
+    /// across the in-flight activation — in the target assignment, the
+    /// effective assignment, or the assignment this activation superseded.
+    ///
+    /// This is the "is the peer entitled to act on this shard's data" question,
+    /// as opposed to the narrower "does the peer SERVE this shard" question
+    /// answered by comparing against `.master`. It is deliberately a
+    /// LOCAL-table judgement: a node named nowhere across the three
+    /// assignments is not a holder here and the caller must refuse it.
+    ///
+    /// A shard outside `0..NUM_SHARDS` holds nothing (`false`) rather than
+    /// panicking the caller's indexing — the shard reaches this from the wire.
+    pub fn holder_across_activation(&self, shard: u16, node: NodeId) -> bool {
+        if shard as usize >= NUM_SHARDS {
+            return false;
+        }
+        self.target_assignment(shard).holds(node)
+            || self.effective_assignment(shard).holds(node)
+            || self
+                .prev_assignment(shard)
+                .is_some_and(|prev| prev.holds(node))
     }
 
     /// Get the handoff state for a shard.
@@ -1977,6 +2037,86 @@ mod tests {
             );
             assert!(task.to_node == NodeId(1) || task.to_node == NodeId(3));
         }
+    }
+
+    /// W13 — pins the degeneration that made the weak-veto arbitration's
+    /// master-only authority check unsatisfiable, and the accessor that
+    /// repairs it.
+    ///
+    /// `begin_handoff_with` enters `Copying` only for a shard whose MASTER
+    /// changed AND that has local data, so on a node with no copy of the shard
+    /// — the migration TARGET — `effective_assignment` reports the NEW
+    /// assignment and the OLD master (the node actually streaming the shard
+    /// in) is named by neither assignment. `holder_across_activation` still
+    /// names it, via `prev_assignment`.
+    #[test]
+    fn holder_across_activation_sees_the_source_effective_assignment_hides() {
+        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 1, 5, 1);
+        let new = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4]), 1, 6, 1);
+        // A shard whose master moves, plus a second one to keep the handoff
+        // (and therefore `prev_assignments`) alive.
+        let moved: Vec<u16> = (0..NUM_SHARDS as u16)
+            .filter(|s| old.target_assignment(*s).master != new.target_assignment(*s).master)
+            .take(2)
+            .collect();
+        assert_eq!(moved.len(), 2, "fixture: at least two shards change master");
+        let (dry, wet) = (moved[0], moved[1]);
+        let old_master = old.target_assignment(dry).master;
+        let new_master = new.target_assignment(dry).master;
+
+        let mut table = old.clone();
+        table.begin_handoff_with(&new, |s| s == wet);
+
+        assert_eq!(
+            table.shard_handoff_state(dry),
+            ShardHandoff::ServingNew,
+            "a master change with no local data skips Copying",
+        );
+        assert_eq!(
+            table.effective_assignment(dry).master,
+            new_master,
+            "so effective_assignment reports the NEW master, not the streaming old one",
+        );
+        assert!(
+            !table.effective_assignment(dry).holds(old_master),
+            "the old master is invisible to the effective assignment",
+        );
+        assert!(
+            table.holder_across_activation(dry, old_master),
+            "but the superseded assignment still names it a holder",
+        );
+        assert!(
+            table.holder_across_activation(dry, new_master),
+            "the incoming master is a holder too",
+        );
+        // The shard that DID keep Copying resolves through the effective
+        // assignment alone — the pre-W13 path, unchanged.
+        assert!(
+            table
+                .effective_assignment(wet)
+                .holds(old.target_assignment(wet).master),
+            "a Copying shard still exposes its previous holders effectively",
+        );
+        // A node named nowhere for the shard is not a holder.
+        let stranger = NodeId(99);
+        assert!(!table.holder_across_activation(dry, stranger));
+        assert!(!table.holder_across_activation(wet, stranger));
+    }
+
+    /// W13 — `ShardAssignment::holds` is the master-OR-replica question the
+    /// arbitration authority check needs; `.master ==` (the pre-W13 predicate)
+    /// answers a strictly narrower one and misses every replica-fill source.
+    #[test]
+    fn shard_assignment_holds_covers_replicas_not_just_the_master() {
+        let table = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 3, 7, 1);
+        let a = table.target_assignment(0);
+        assert_eq!(a.replicas.len(), 2, "fixture: RF=3 over 3 members");
+        assert!(a.holds(a.master));
+        for r in &a.replicas {
+            assert!(a.holds(*r), "a replica holds the shard");
+            assert_ne!(a.master, *r, "…and is not the master");
+        }
+        assert!(!a.holds(NodeId(99)), "a non-member holds nothing");
     }
 
     #[test]
