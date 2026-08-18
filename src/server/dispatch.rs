@@ -2601,9 +2601,8 @@ pub(crate) fn handle_request(
                 le_u64_at(&request.payload, 10),
                 le_u32_at(&request.payload, 18),
             ) else {
-                return error_response(
+                return refuse_weak_veto_arbitration(
                     request.request_id,
-                    ERR_PAYLOAD_MALFORMED,
                     "weak-veto arbitration: truncated header",
                 );
             };
@@ -2611,18 +2610,29 @@ pub(crate) fn handle_request(
             // every shard-table accessor below indexes a NUM_SHARDS-long Vec.
             // Same class as `shard_from_request_id`, decoded from the payload
             // rather than `request_id`.
-            if let Some(resp) =
-                check_shard_in_range(request.request_id, "weak-veto arbitration", shard)
-            {
-                return resp;
+            //
+            // W13 review P3-1 — refused through `refuse_weak_veto_arbitration`
+            // (ERR_INVARIANT_VIOLATION), not `ERR_PAYLOAD_MALFORMED`, so the
+            // source's `weak_veto_arbitration_terminally_refused` classifies it
+            // as TERMINAL. Every malformed-frame refusal in this handler is
+            // structural — re-sending the identical frame can never succeed —
+            // and the only refusal that must stay RETRYABLE is the stale-epoch
+            // one below, which keeps its own code.
+            if shard as usize >= crate::cluster::shards::NUM_SHARDS {
+                return refuse_weak_veto_arbitration(
+                    request.request_id,
+                    &format!(
+                        "weak-veto arbitration: shard {shard} is out of range (0..{})",
+                        crate::cluster::shards::NUM_SHARDS
+                    ),
+                );
             }
             let key_count = key_count as usize;
             // The vetoed set a completion rejection names is bounded (512 per
             // round); anything past the full-manifest scale is malformed.
             if key_count == 0 || key_count > 65_536 {
-                return error_response(
+                return refuse_weak_veto_arbitration(
                     request.request_id,
-                    ERR_PAYLOAD_MALFORMED,
                     &format!("weak-veto arbitration: key count {key_count} out of range"),
                 );
             }
@@ -2632,17 +2642,15 @@ pub(crate) fn handle_request(
             {
                 Some(n) => n,
                 None => {
-                    return error_response(
+                    return refuse_weak_veto_arbitration(
                         request.request_id,
-                        ERR_PAYLOAD_MALFORMED,
                         "weak-veto arbitration: key count overflow",
                     );
                 }
             };
             if request.payload.len() < needed {
-                return error_response(
+                return refuse_weak_veto_arbitration(
                     request.request_id,
-                    ERR_PAYLOAD_MALFORMED,
                     &format!(
                         "weak-veto arbitration: need {needed} bytes, got {}",
                         request.payload.len()
@@ -29311,8 +29319,15 @@ mod tests {
             &resp.payload,
         );
         assert!(
-            err.contains(&format!("code={ERR_PAYLOAD_MALFORMED}")) && err.contains("out of range"),
+            err.contains("out of range"),
             "the rejection names the malformed shard: {err}",
+        );
+        assert!(
+            crate::cluster::coordinator::weak_veto_arbitration_terminally_refused(&format!(
+                "weak-veto arbitration rejected by target: {err}"
+            )),
+            "…and the source classifies it as terminal rather than re-driving \
+             the identical frame forever (review P3-1): {err}",
         );
     }
 
