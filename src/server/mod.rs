@@ -216,6 +216,28 @@ pub(crate) struct ConnectionState {
     /// `false` (external client / test double) so the flag is ignored unless the
     /// connection loop explicitly grants it.
     pub(crate) local_read_authorized: bool,
+    /// W13 — weak-veto arbitration tickets minted on THIS connection.
+    ///
+    /// `OP_MIGRATION_COMPLETE` inserts `(shard, source, key)` here when it
+    /// refuses a completion naming a WEAK-cause tombstone veto;
+    /// `OP_MIGRATION_WEAK_VETO_ARBITRATE` honours only keys with an entry, and
+    /// REMOVES it on redemption. See
+    /// [`Self::issue_weak_veto_ticket`] for the full rationale and — importantly
+    /// — for what this does NOT prove.
+    ///
+    /// Connection-scoped rather than node-wide because the real producer sends
+    /// both frames on the SAME `TcpStream`
+    /// (`coordinator::migrate_shards_to_target` passes `Some(&mut stream)` to
+    /// `send_migration_complete` and the same `&mut stream` to
+    /// `send_weak_veto_arbitration`; `send_migration_complete` only dials
+    /// `target_addr` when handed `None`, which the escalation path never does).
+    /// Scoping it here is strictly stronger than a node-wide map — a ticket
+    /// minted for one peer's connection cannot be redeemed on another's — and
+    /// it removes the need for a TTL, a global cap, an eviction policy, and any
+    /// cross-thread serialisation of mint-vs-redeem, because one connection is
+    /// handled serially by one thread.
+    pub(crate) weak_veto_tickets:
+        std::collections::HashSet<(u16, crate::cluster::shards::NodeId, crate::index::TxKey)>,
 }
 
 /// An in-progress streaming blob upload for a single txid.
@@ -230,6 +252,13 @@ pub(crate) struct ActiveStream {
 }
 
 impl ConnectionState {
+    /// W13 — cap on tickets held for one connection. One completion refusal
+    /// names at most `MAX_VETOED_KEYS_NAMED` (512) keys, and a connection
+    /// completes many shards, so this allows a healthy migration run's worth
+    /// of outstanding refusals while bounding a peer that loops refusals to
+    /// grow the set.
+    pub(crate) const MAX_WEAK_VETO_TICKETS: usize = 8192;
+
     pub(crate) fn new() -> Self {
         Self {
             streams: HashMap::new(),
@@ -239,7 +268,88 @@ impl ConnectionState {
                 ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
             )),
             local_read_authorized: false,
+            weak_veto_tickets: std::collections::HashSet::new(),
         }
+    }
+
+    /// W13 — record that this node refused `source`'s `OP_MIGRATION_COMPLETE`
+    /// for `shard` naming `key` with a WEAK-cause tombstone veto, authorizing
+    /// ONE subsequent `OP_MIGRATION_WEAK_VETO_ARBITRATE` of that key ON THIS
+    /// CONNECTION.
+    ///
+    /// # What this proves, and what it does not
+    ///
+    /// It does NOT prove a real in-flight transfer, and the round-2 review was
+    /// right to reject that claim. The completion's `from_node` is read off the
+    /// payload (`server::dispatch`'s `completion_from_node`) under the same
+    /// shared-secret HMAC every other inter-node frame uses, with no connection
+    /// identity behind it — so a frame-capable peer can MINT a ticket on
+    /// demand with a two-frame sequence: send a completion naming a key it
+    /// knows this node holds a weak marker for, collect the refusal, then
+    /// arbitrate. In trusted-overlay mode (no `cluster_secret`) "frame-capable"
+    /// means any TCP client. Closing that needs per-peer identity on the
+    /// connection, which is tracked separately.
+    ///
+    /// What it DOES deliver, and what the arbitration handler may rely on:
+    ///
+    /// * **Replay defence.** The ticket is consumed on redemption, so a
+    ///   captured arbitration frame re-delivered on the same connection finds
+    ///   nothing outstanding, and one delivered on a different connection never
+    ///   had a ticket at all. This is the property the auth layer's replay
+    ///   contract table cites for opcode 245.
+    /// * **Containment of an honest-but-buggy source.** A source can only
+    ///   arbitrate keys THIS node actually refused it, on the connection it was
+    ///   refused on — never a blind key list, and never a key from a shard it
+    ///   was not completing.
+    /// * **A bounded, self-limiting arbitrable set.** Only keys that are
+    ///   locally ABSENT and carry a WEAK marker are ever named in a refusal, so
+    ///   the ticket set is a subset of exactly the keys arbitration is for.
+    ///   Nothing else can enter it.
+    ///
+    /// Bounded by [`Self::MAX_WEAK_VETO_TICKETS`]; at the cap the set is
+    /// cleared, which can only cause a later arbitration to be REFUSED (the
+    /// pre-W13 disposition — safe), never honoured spuriously.
+    pub(crate) fn issue_weak_veto_ticket(
+        &mut self,
+        shard: u16,
+        source: crate::cluster::shards::NodeId,
+        key: crate::index::TxKey,
+    ) {
+        if self.weak_veto_tickets.len() >= Self::MAX_WEAK_VETO_TICKETS {
+            self.weak_veto_tickets.clear();
+        }
+        self.weak_veto_tickets.insert((shard, source, key));
+    }
+
+    /// W13 — is there an outstanding ticket for `(shard, source, key)` on this
+    /// connection? A PEEK: the arbitration handler's all-or-nothing pre-scan
+    /// must not consume tickets for a frame it is about to refuse.
+    pub(crate) fn has_weak_veto_ticket(
+        &self,
+        shard: u16,
+        source: crate::cluster::shards::NodeId,
+        key: &crate::index::TxKey,
+    ) -> bool {
+        self.weak_veto_tickets.contains(&(shard, source, *key))
+    }
+
+    /// W13 — redeem (and CONSUME) the ticket for `(shard, source, key)`.
+    /// `true` iff one was outstanding.
+    pub(crate) fn redeem_weak_veto_ticket(
+        &mut self,
+        shard: u16,
+        source: crate::cluster::shards::NodeId,
+        key: &crate::index::TxKey,
+    ) -> bool {
+        self.weak_veto_tickets.remove(&(shard, source, *key))
+    }
+
+    /// Outstanding ticket count on this connection. Test-only observability —
+    /// the production signal for this mechanism is the target-side
+    /// honored/refused counter pair on `/metrics`, not a per-connection depth.
+    #[cfg(test)]
+    pub(crate) fn weak_veto_ticket_count(&self) -> usize {
+        self.weak_veto_tickets.len()
     }
 
     pub(crate) fn with_max_stream_total_bytes(mut self, max_stream_total_bytes: u64) -> Self {

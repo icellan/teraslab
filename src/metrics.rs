@@ -1432,6 +1432,37 @@ pub struct MigrationMetrics {
     /// consensus-relevant override of a local anti-resurrection marker, so it
     /// stays operator-visible.
     pub migration_weak_veto_arbitrations: PaddedCounter,
+    /// W13 review P2-3 — weak-veto arbitrations this node HONORED as the
+    /// TARGET: one per marker whose RULE-DS veto was suspended for a ticketed
+    /// holder.
+    ///
+    /// The two counters above/below it are SOURCE-side, so before W13 a node
+    /// whose anti-resurrection markers were being overridden incremented
+    /// nothing and looked healthy on `/metrics`. This is the override rate
+    /// measured where the override happens; pair it with
+    /// [`Self::migration_weak_veto_arbitrations_refused_target`].
+    ///
+    /// PAIR IT WITH THE WEAK GAUGE (round-2 review P2-5). Since W13 an
+    /// arbitration SUSPENDS a marker instead of removing it, so
+    /// `teraslab_tombstone_weak_entries` no longer falls when one is honored —
+    /// it falls only when the repair actually lands and clears the marker
+    /// through the TS-1 path. That makes the gauge alone a poor "is anything
+    /// wrong" signal, and this counter the missing half:
+    ///
+    /// * rising honored + FALLING weak gauge = overrides followed by repairs —
+    ///   healthy;
+    /// * rising honored + FLAT weak gauge = markers are being overridden and
+    ///   the re-pushes are NOT landing — the shard is not converging;
+    /// * flat honored + rising weak gauge = prune/rollback damage accumulating
+    ///   with no arbitration reaching it at all (the pre-W13 wedge shape).
+    pub migration_weak_veto_arbitrations_honored: PaddedCounter,
+    /// W13 review P2-3 — EVERY arbitration frame this node REFUSED as the
+    /// TARGET: mechanism disarmed, malformed frame, unknown/stale epoch,
+    /// requester is not a named holder, no outstanding veto ticket on this
+    /// connection, key outside the named shard, or a strong-cause marker.
+    /// Sustained non-zero without a matching source-side counter is the
+    /// signature of unsolicited or replayed arbitration.
+    pub migration_weak_veto_arbitrations_refused_target: PaddedCounter,
     /// W12 TAIL 3 — weak-veto arbitrations the TARGET refused on AUTHORITY
     /// grounds (`ERR_INVARIANT_VIOLATION`), which terminally abort the
     /// handoff instead of re-driving it. Counted per refused round at the
@@ -1638,6 +1669,8 @@ impl MigrationMetrics {
             replica_abort_forced_resyncs: PaddedCounter::new(),
             migration_completion_manifest_reduced_vetoed: PaddedCounter::new(),
             migration_weak_veto_arbitrations: PaddedCounter::new(),
+            migration_weak_veto_arbitrations_honored: PaddedCounter::new(),
+            migration_weak_veto_arbitrations_refused_target: PaddedCounter::new(),
             migration_weak_veto_arbitration_refused: PaddedCounter::new(),
             migration_prune_weak_declared_retained: PaddedCounter::new(),
             migration_prune_skipped_cutoff_gate: PaddedCounter::new(),

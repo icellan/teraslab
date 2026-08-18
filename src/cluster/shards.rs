@@ -71,6 +71,20 @@ pub struct ShardAssignment {
     pub replicas: Vec<NodeId>,
 }
 
+impl ShardAssignment {
+    /// Whether `node` is one of this assignment's HOLDERS — its master or any
+    /// of its replicas.
+    ///
+    /// The master-vs-replica distinction decides who SERVES the shard; this
+    /// asks the weaker question of who is expected to hold its records, which
+    /// is the population every migration / repair source is drawn from
+    /// (`ShardTable::replica_migration_plan` sources a fill from an old
+    /// holder, master or replica).
+    pub fn holds(&self, node: NodeId) -> bool {
+        self.master == node || self.replicas.contains(&node)
+    }
+}
+
 /// A task describing one shard that needs to migrate between nodes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MigrationTask {
@@ -380,10 +394,91 @@ impl ShardTable {
         }
     }
 
+    /// The assignment this activation SUPERSEDED for `shard`, while a
+    /// two-phase activation is still in flight; `None` once every shard has
+    /// committed (or when no handoff is running).
+    ///
+    /// [`Self::effective_assignment`] exposes the previous assignment only for
+    /// a shard whose handoff is still `Copying` / `CommitReady` /
+    /// `ServingCurrent`, and [`Self::begin_handoff_with`] enters `Copying`
+    /// only when a shard's MASTER changed AND the local node already holds
+    /// data for it. So on a node with no local copy of the shard — precisely
+    /// the migration TARGET — the previous holders are invisible to
+    /// `effective_assignment` even though they are the nodes streaming the
+    /// shard in. Callers that need "who does my table say holds this shard
+    /// across the in-flight activation" must consult this too; see
+    /// [`Self::holder_across_activation`].
+    /// Returns `None` for a shard outside `0..NUM_SHARDS` rather than
+    /// panicking, so a caller decoding the shard from the wire cannot index
+    /// off the end of the table.
+    pub fn prev_assignment(&self, shard: u16) -> Option<&ShardAssignment> {
+        self.prev_assignments
+            .as_ref()
+            .and_then(|prev| prev.get(shard as usize))
+    }
+
+    /// Whether THIS table names `node` as a holder of `shard` at any point
+    /// across the in-flight activation — in the target assignment, the
+    /// effective assignment, or (only while this shard's own mastership is
+    /// still in transition) the assignment this activation superseded.
+    ///
+    /// This is the "is the peer entitled to act on this shard's data" question,
+    /// as opposed to the narrower "does the peer SERVE this shard" question
+    /// answered by comparing against `.master`. It is deliberately a
+    /// LOCAL-table judgement: a node named nowhere across those assignments is
+    /// not a holder here and the caller must refuse it.
+    ///
+    /// # W13 review — why the superseded leg is gated PER SHARD
+    ///
+    /// [`Self::prev_assignment`] is a table-wide `Option`: it is `Some` for
+    /// EVERY shard while ANY shard's handoff is outstanding, and
+    /// [`Self::commit_shard`] drops it only once EVERY shard reaches
+    /// `ServingNew`. Since a stuck handoff is exactly the condition this
+    /// mechanism services, an ungated superseded leg would keep the previous
+    /// epoch's holders — including a node voted out this epoch — entitled
+    /// across all 4096 shards for as long as one shard stayed stuck, long after
+    /// their own shards had committed and moved on.
+    ///
+    /// [`Self::is_subset_master`] is the per-shard discriminator: `master_subset`
+    /// is set for a shard whose master CHANGED in this activation
+    /// (independently of `shard_has_data`, so it survives the skip-`Copying`
+    /// case this predicate exists to cover) and is cleared per shard by
+    /// `commit_shard`. Restricting the superseded leg to those shards keeps the
+    /// grant to the shards actually mid-transition here.
+    ///
+    /// RESIDUAL: a shard that skipped `Copying` may never be explicitly
+    /// committed, so its flag can persist for the activation's lifetime. That
+    /// is strictly narrower than table-wide and is the direction the wedge
+    /// needs; the ticket binding on the consumer bounds it further in time.
+    ///
+    /// A shard outside `0..NUM_SHARDS` holds nothing (`false`) rather than
+    /// panicking the caller's indexing — the shard reaches this from the wire.
+    pub fn holder_across_activation(&self, shard: u16, node: NodeId) -> bool {
+        if shard as usize >= NUM_SHARDS {
+            return false;
+        }
+        self.target_assignment(shard).holds(node)
+            || self.effective_assignment(shard).holds(node)
+            || (self.is_subset_master(shard)
+                && self
+                    .prev_assignment(shard)
+                    .is_some_and(|prev| prev.holds(node)))
+    }
+
     /// Get the handoff state for a shard.
+    ///
+    /// A shard outside `0..NUM_SHARDS` reports `ServingNew` (the no-handoff
+    /// answer) rather than panicking the caller's indexing — the shard reaches
+    /// this from the wire. NOTE that [`Self::target_assignment`] and
+    /// [`Self::effective_assignment`] cannot be made range-safe the same way
+    /// (they return a reference), so a wire-decoded shard must still be
+    /// range-checked at the handler boundary.
     pub fn shard_handoff_state(&self, shard: u16) -> ShardHandoff {
         match &self.handoff_state {
-            Some(hs) => hs[shard as usize],
+            Some(hs) => hs
+                .get(shard as usize)
+                .copied()
+                .unwrap_or(ShardHandoff::ServingNew),
             None => ShardHandoff::ServingNew,
         }
     }
@@ -478,8 +573,14 @@ impl ShardTable {
     /// A subset master must not serve requests as authoritative until it
     /// receives all migration data. `is_master()` in the coordinator
     /// returns `Transitioning` for subset masters so callers retry.
+    /// A shard outside `0..NUM_SHARDS` is never a subset master (`false`)
+    /// rather than panicking the caller's indexing — the shard can reach this
+    /// from the wire.
     pub fn is_subset_master(&self, shard: u16) -> bool {
-        self.master_subset[shard as usize]
+        self.master_subset
+            .get(shard as usize)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Compute a shard table with a hash-based version (legacy).
@@ -1976,6 +2077,163 @@ mod tests {
                 "removed node 2 must never remain a replica migration source"
             );
             assert!(task.to_node == NodeId(1) || task.to_node == NodeId(3));
+        }
+    }
+
+    /// W13 — pins the degeneration that made the weak-veto arbitration's
+    /// master-only authority check unsatisfiable, and the accessor that
+    /// repairs it.
+    ///
+    /// `begin_handoff_with` enters `Copying` only for a shard whose MASTER
+    /// changed AND that has local data, so on a node with no copy of the shard
+    /// — the migration TARGET — `effective_assignment` reports the NEW
+    /// assignment and the OLD master (the node actually streaming the shard
+    /// in) is named by neither assignment. `holder_across_activation` still
+    /// names it, via `prev_assignment`.
+    #[test]
+    fn holder_across_activation_sees_the_source_effective_assignment_hides() {
+        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 1, 5, 1);
+        let new = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4]), 1, 6, 1);
+        // A shard whose master moves, plus a second one to keep the handoff
+        // (and therefore `prev_assignments`) alive.
+        let moved: Vec<u16> = (0..NUM_SHARDS as u16)
+            .filter(|s| old.target_assignment(*s).master != new.target_assignment(*s).master)
+            .take(2)
+            .collect();
+        assert_eq!(moved.len(), 2, "fixture: at least two shards change master");
+        let (dry, wet) = (moved[0], moved[1]);
+        let old_master = old.target_assignment(dry).master;
+        let new_master = new.target_assignment(dry).master;
+
+        let mut table = old.clone();
+        table.begin_handoff_with(&new, |s| s == wet);
+
+        assert_eq!(
+            table.shard_handoff_state(dry),
+            ShardHandoff::ServingNew,
+            "a master change with no local data skips Copying",
+        );
+        assert_eq!(
+            table.effective_assignment(dry).master,
+            new_master,
+            "so effective_assignment reports the NEW master, not the streaming old one",
+        );
+        assert!(
+            !table.effective_assignment(dry).holds(old_master),
+            "the old master is invisible to the effective assignment",
+        );
+        assert!(
+            table.holder_across_activation(dry, old_master),
+            "but the superseded assignment still names it a holder",
+        );
+        assert!(
+            table.holder_across_activation(dry, new_master),
+            "the incoming master is a holder too",
+        );
+        // The shard that DID keep Copying resolves through the effective
+        // assignment alone — the pre-W13 path, unchanged.
+        assert!(
+            table
+                .effective_assignment(wet)
+                .holds(old.target_assignment(wet).master),
+            "a Copying shard still exposes its previous holders effectively",
+        );
+        // A node named nowhere for the shard is not a holder.
+        let stranger = NodeId(99);
+        assert!(!table.holder_across_activation(dry, stranger));
+        assert!(!table.holder_across_activation(wet, stranger));
+    }
+
+    /// W13 review (bitcoin P1-1 / security P2-4) — the superseded-holder grant
+    /// must expire PER SHARD when that shard commits, not table-wide when the
+    /// last shard does.
+    ///
+    /// `prev_assignments` is a table-wide `Option` that `commit_shard` drops
+    /// only once EVERY shard reaches `ServingNew`. Since one stuck handoff is
+    /// exactly what this mechanism services, an ungated `prev` leg kept the
+    /// previous epoch's holders — including a node voted out this epoch —
+    /// entitled across all 4096 shards for as long as one shard stayed stuck.
+    /// `is_subset_master` is the per-shard discriminator.
+    #[test]
+    fn the_superseded_holder_grant_expires_when_that_shard_commits() {
+        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 1, 5, 1);
+        let new = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4]), 1, 6, 1);
+        let moved: Vec<u16> = (0..NUM_SHARDS as u16)
+            .filter(|s| old.target_assignment(*s).master != new.target_assignment(*s).master)
+            .take(2)
+            .collect();
+        assert_eq!(moved.len(), 2, "fixture: at least two shards change master");
+        let (commits, stuck) = (moved[0], moved[1]);
+        let departed = old.target_assignment(commits).master;
+
+        let mut table = old.clone();
+        table.begin_handoff_with(&new, |s| s == stuck);
+        assert!(
+            table.holder_across_activation(commits, departed),
+            "precondition: the superseded holder may arbitrate while its own \
+             shard is mid-transition",
+        );
+
+        // Its shard commits. The OTHER shard is still stuck, so the table-wide
+        // `prev_assignments` survives — which is precisely the window the
+        // ungated predicate left open.
+        table.commit_shard(commits);
+        assert!(
+            table.prev_assignment(commits).is_some(),
+            "fixture: prev_assignments is still alive table-wide (one shard is \
+             stuck), so the grant must be revoked per-shard or not at all",
+        );
+        assert!(
+            !table.is_subset_master(commits),
+            "commit_shard cleared this shard's transition flag",
+        );
+        assert!(
+            !table.holder_across_activation(commits, departed),
+            "…so the superseded holder's grant for THAT shard is gone",
+        );
+        // The still-stuck shard keeps its grant — that is the wedge this
+        // mechanism exists for.
+        let stuck_departed = old.target_assignment(stuck).master;
+        assert!(
+            table.holder_across_activation(stuck, stuck_departed),
+            "the shard that is actually stuck keeps its superseded holder",
+        );
+    }
+
+    /// W13 — a replica-only change never enters `Copying` and never sets
+    /// `master_subset`, so the superseded leg is inert for it. That is correct
+    /// and worth pinning: for such a shard the old holder set IS the new one
+    /// (only the replica membership moved), so the current-assignment leg is
+    /// what carries a legitimate source and the `prev` grant adds nothing.
+    #[test]
+    fn a_replica_only_change_grants_no_superseded_authority() {
+        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 5, 1);
+        let new = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4]), 2, 6, 1);
+        let replica_only = (0..NUM_SHARDS as u16).find(|s| {
+            old.target_assignment(*s).master == new.target_assignment(*s).master
+                && old.target_assignment(*s).replicas != new.target_assignment(*s).replicas
+        });
+        let shard =
+            replica_only.expect("this member step must produce a replica-only change to assert on");
+        let master_changed = (0..NUM_SHARDS as u16)
+            .find(|s| old.target_assignment(*s).master != new.target_assignment(*s).master)
+            .expect("some shard changes master");
+        let mut table = old.clone();
+        table.begin_handoff_with(&new, |s| s == master_changed);
+        assert!(
+            !table.is_subset_master(shard),
+            "a replica-only change is not a master transition",
+        );
+        for dropped in old.target_assignment(shard).replicas.iter() {
+            if !table.target_assignment(shard).holds(*dropped)
+                && !table.effective_assignment(shard).holds(*dropped)
+            {
+                assert!(
+                    !table.holder_across_activation(shard, *dropped),
+                    "a replica dropped by a replica-only change gets no \
+                     superseded grant",
+                );
+            }
         }
     }
 

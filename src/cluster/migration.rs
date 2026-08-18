@@ -59,22 +59,25 @@ impl ShardBitmap {
         }
     }
 
-    /// Set the bit for `shard`.
+    /// Set the bit for `shard`. A shard outside `0..NUM_SHARDS` is a no-op
+    /// (see [`Self::pos`]).
     pub fn set(&mut self, shard: u16) {
-        let (w, b) = Self::pos(shard);
-        self.words[w] |= 1u64 << b;
+        if let Some((w, b)) = Self::pos(shard) {
+            self.words[w] |= 1u64 << b;
+        }
     }
 
-    /// Clear the bit for `shard`.
+    /// Clear the bit for `shard`. A shard outside `0..NUM_SHARDS` is a no-op.
     pub fn clear(&mut self, shard: u16) {
-        let (w, b) = Self::pos(shard);
-        self.words[w] &= !(1u64 << b);
+        if let Some((w, b)) = Self::pos(shard) {
+            self.words[w] &= !(1u64 << b);
+        }
     }
 
-    /// Test whether `shard` is set.
+    /// Test whether `shard` is set. A shard outside `0..NUM_SHARDS` is never
+    /// set.
     pub fn test(&self, shard: u16) -> bool {
-        let (w, b) = Self::pos(shard);
-        (self.words[w] >> b) & 1 == 1
+        Self::pos(shard).is_some_and(|(w, b)| (self.words[w] >> b) & 1 == 1)
     }
 
     /// Clear all bits.
@@ -87,8 +90,15 @@ impl ShardBitmap {
         self.words.iter().map(|w| w.count_ones() as usize).sum()
     }
 
-    fn pos(shard: u16) -> (usize, u32) {
-        ((shard as usize) / 64, (shard as u32) % 64)
+    /// W13 — `None` for a shard outside `0..NUM_SHARDS`. The shard reaches
+    /// these bitmaps from the wire (`request_id`-encoded shard ids on the
+    /// migration opcodes) and `words` is a fixed `NUM_SHARDS / 64` array, so an
+    /// unchecked index panicked the connection thread on a malformed frame.
+    fn pos(shard: u16) -> Option<(usize, u32)> {
+        if shard as usize >= NUM_SHARDS {
+            return None;
+        }
+        Some(((shard as usize) / 64, (shard as u32) % 64))
     }
 }
 
@@ -125,22 +135,26 @@ impl AtomicShardBitmap {
         }
     }
 
-    /// Set the bit for `shard` (lock-free).
+    /// Set the bit for `shard` (lock-free). Out-of-range: no-op.
     pub fn set(&self, shard: u16) {
-        let (w, b) = Self::pos(shard);
-        self.words[w].fetch_or(1u64 << b, std::sync::atomic::Ordering::Release);
+        if let Some((w, b)) = Self::pos(shard) {
+            self.words[w].fetch_or(1u64 << b, std::sync::atomic::Ordering::Release);
+        }
     }
 
-    /// Clear the bit for `shard` (lock-free).
+    /// Clear the bit for `shard` (lock-free). Out-of-range: no-op.
     pub fn clear(&self, shard: u16) {
-        let (w, b) = Self::pos(shard);
-        self.words[w].fetch_and(!(1u64 << b), std::sync::atomic::Ordering::Release);
+        if let Some((w, b)) = Self::pos(shard) {
+            self.words[w].fetch_and(!(1u64 << b), std::sync::atomic::Ordering::Release);
+        }
     }
 
-    /// Test whether `shard` is set (lock-free, no contention).
+    /// Test whether `shard` is set (lock-free, no contention). A shard outside
+    /// `0..NUM_SHARDS` is never set.
     pub fn test(&self, shard: u16) -> bool {
-        let (w, b) = Self::pos(shard);
-        (self.words[w].load(std::sync::atomic::Ordering::Acquire) >> b) & 1 == 1
+        Self::pos(shard).is_some_and(|(w, b)| {
+            (self.words[w].load(std::sync::atomic::Ordering::Acquire) >> b) & 1 == 1
+        })
     }
 
     /// Clear all bits.
@@ -160,8 +174,15 @@ impl AtomicShardBitmap {
         }
     }
 
-    fn pos(shard: u16) -> (usize, u32) {
-        ((shard as usize) / 64, (shard as u32) % 64)
+    /// W13 — `None` outside `0..NUM_SHARDS`; see [`ShardBitmap::pos`]. This is
+    /// the one the `OP_REPLICA_BATCH` migration path reached with an unchecked
+    /// wire shard (`inbound_bitmap().test(shard)`), panicking on
+    /// `words: [AtomicU64; 64]` for any shard >= 4096.
+    fn pos(shard: u16) -> Option<(usize, u32)> {
+        if shard as usize >= NUM_SHARDS {
+            return None;
+        }
+        Some(((shard as usize) / 64, (shard as u32) % 64))
     }
 }
 

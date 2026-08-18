@@ -16036,11 +16036,22 @@ pub(crate) fn completion_rejection_manifest_mismatch(err: &str) -> bool {
 /// never overcome?
 ///
 /// The arbitration handler answers `ERR_INVARIANT_VIOLATION` for exactly the
-/// structural refusals: the requester is not the shard's target-or-effective
-/// master in the target's table; the target has no open inbound transfer from
-/// the requester; the key carries a ClientDelete/Dah tombstone (never
-/// arbitrable); arbitration is disarmed on the target; or the key is not in
-/// the named shard. None of those change by asking again at the same epoch.
+/// structural refusals: the target's own table does not name the requester a
+/// HOLDER of the shard across the in-flight activation; no outstanding VETO
+/// TICKET covers a named key (this node never refused that key to that source,
+/// or the ticket has expired or already been redeemed — W13); the key carries a
+/// ClientDelete/Dah tombstone (never arbitrable); arbitration is disarmed on
+/// the target; or the key is not in the named shard. None of those change by
+/// asking again at the same epoch with the same frame.
+///
+/// W13 — the pre-W13 wording named the removed conditions ("is not the shard's
+/// target-or-effective MASTER", "no open inbound transfer"). Both are gone; the
+/// classification is unchanged because every replacement refusal uses the same
+/// code, which is what this parser matches on.
+///
+/// The ticket refusal is deliberately terminal for THIS frame and not for the
+/// task: the source's next escalation round re-drives a completion, which mints
+/// a fresh ticket if the veto is still standing.
 ///
 /// Deliberately NOT matched:
 /// * `ERR_STALE_EPOCH` — the two sides are on different activated versions
@@ -21711,10 +21722,6 @@ impl RunningCluster {
             .has_pending_heal_from_source(shard, from_node)
     }
 
-    /// W10 FIX 2 — the weak-veto arbitration's "fence still held" check: does
-    /// this node hold ANY active (uncompleted) inbound entry for `shard`
-    /// sourced from `from_node` (forward migration or reverse-heal)? See
-    /// [`crate::cluster::migration::MigrationManager::has_pending_inbound_from_source`].
     /// W10 review P2-6 — is weak-veto arbitration armed on this node? The
     /// `OP_MIGRATION_WEAK_VETO_ARBITRATE` handler consults it so a disabled
     /// node neither initiates NOR honours an arbitration (a complete local
@@ -21723,6 +21730,16 @@ impl RunningCluster {
         self.migration.lock().weak_veto_arbitration_enabled()
     }
 
+    /// Does this node hold ANY active (uncompleted) inbound entry for `shard`
+    /// sourced from `from_node` (forward migration or reverse-heal)? See
+    /// [`crate::cluster::migration::MigrationManager::has_pending_inbound_from_source`].
+    ///
+    /// W13 — this was the arbitration handler's "fence still held" condition
+    /// until the W13 review; it is unsatisfiable for a replica fill (the target
+    /// only records an inbound source while the shard is inbound-expected or in
+    /// `Copying`), so the arbitration is bound to a connection-scoped veto
+    /// TICKET instead (`server::ConnectionState::issue_weak_veto_ticket`).
+    /// Still used by the migration machinery for its own fencing decisions.
     pub fn has_pending_inbound_from_source(&self, shard: u16, from_node: NodeId) -> bool {
         self.migration
             .lock()
@@ -23024,9 +23041,9 @@ impl RunningCluster {
     /// a NEW-SIDE HANDOFF holder (`true`) or a repair-only Phase-H resync
     /// backfill destination (`false`).
     ///
-    /// Used by `build_replication_targets` in place of
-    /// `Self::dual_write_targets_for_shard` (not a doc link: that accessor is
-    /// `#[cfg(test)]`, so it does not exist in a docs build) so one migration-lock
+    /// Used by `build_replication_targets` in place of the ORIGIN-BLIND
+    /// `dual_write_targets_for_shard` (`#[cfg(test)]`, so not linkable from a
+    /// doc build) so one migration-lock
     /// acquisition yields both the fan-out set and the handoff-ACK gating
     /// (W10 composition P1-2). See
     /// [`MigrationManager::dual_write_targets_with_origin_for_shard`].

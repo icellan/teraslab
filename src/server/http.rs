@@ -1495,6 +1495,19 @@ pub(crate) fn render_metrics_text(
             "teraslab_migration_weak_veto_arbitration_refused_total",
             mm.migration_weak_veto_arbitration_refused.get(),
         );
+        // W13 review P2-3 — the TARGET-side pair: the two counters above are
+        // incremented by the SOURCE, so a node whose markers are being
+        // overridden moved nothing on /metrics before these existed.
+        prom_counter(
+            &mut out,
+            "teraslab_migration_weak_veto_arbitrations_honored_total",
+            mm.migration_weak_veto_arbitrations_honored.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_migration_weak_veto_arbitrations_refused_target_total",
+            mm.migration_weak_veto_arbitrations_refused_target.get(),
+        );
         prom_counter(
             &mut out,
             "teraslab_migration_prune_weak_declared_retained_total",

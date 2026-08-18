@@ -2330,23 +2330,37 @@ impl Engine {
             .is_some_and(|log| log.blocks_heal_apply(key, incoming_generation))
     }
 
-    /// W10 FIX 2 — weak-veto arbitration clear (the target half of the
-    /// `OP_MIGRATION_WEAK_VETO_ARBITRATE` handshake): drop `key`'s tombstone
-    /// via the TS-1 clear path ONLY when its cause is WEAK (`PruneReplace` /
-    /// `CompensatedCreate`). A strong cause (`ClientDelete` / `Dah` /
-    /// unrecognized) is refused; an absent tombstone (or a disabled tombstone
-    /// subsystem) reports `Absent` so retried rounds are idempotent. Cause
-    /// check and removal are atomic under the tombstone shard lock — see
-    /// [`crate::ops::tombstone::TombstoneLog::clear_weak`] for the full
-    /// safety argument.
-    pub fn arbitrate_clear_weak_tombstone(
+    /// W10 FIX 2 / W13 — weak-veto arbitration (the target half of the
+    /// `OP_MIGRATION_WEAK_VETO_ARBITRATE` handshake): SUSPEND `key`'s RULE-DS
+    /// veto ONLY when its cause is WEAK (`PruneReplace` / `CompensatedCreate`).
+    /// A strong cause (`ClientDelete` / `Dah` / unrecognized) is refused; an
+    /// absent tombstone (or a disabled tombstone subsystem) reports `Absent`
+    /// so retried rounds are idempotent.
+    ///
+    /// The marker is NOT removed: it survives to keep declaring the omission
+    /// to peers, because the arbitration's re-push is not atomic with the
+    /// clear and a marker dropped without the repair landing lets a peer's #29
+    /// prune delete the key's last live copy. Cause check and mutation are
+    /// atomic under the tombstone shard lock — see
+    /// [`crate::ops::tombstone::TombstoneLog::suspend_weak_veto`] for the full
+    /// safety argument and its known limit.
+    pub fn arbitrate_suspend_weak_veto(
         &self,
         key: &TxKey,
     ) -> crate::ops::tombstone::WeakTombstoneClear {
         match self.tombstone_log.get() {
-            Some(log) => log.clear_weak(key),
+            Some(log) => log.suspend_weak_veto(key),
             None => crate::ops::tombstone::WeakTombstoneClear::Absent,
         }
+    }
+
+    /// Whether `key` carries a weak marker whose veto an arbitration has
+    /// suspended. Diagnostic companion to [`Self::arbitrate_suspend_weak_veto`];
+    /// `false` when the tombstone subsystem is disabled.
+    pub fn weak_veto_suspended(&self, key: &TxKey) -> bool {
+        self.tombstone_log
+            .get()
+            .is_some_and(|log| log.weak_veto_suspended(key))
     }
 
     /// W10 FIX 3 — the keys of CLUSTER shard `shard` this node holds
