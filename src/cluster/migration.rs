@@ -754,6 +754,13 @@ pub struct MigrationManager {
     /// Set once at coordinator construction; gates both the source-side
     /// escalation and the target-side handler. Never persisted.
     weak_veto_arbitration_enabled: bool,
+    /// W13 containment — whether the PROOF-OF-ELSEWHERE orphan reclaim is
+    /// armed on this node (see `Config` `orphan_cleanup_proof_reclaim_enabled`
+    /// for the data-loss rationale; default OFF). Set once at coordinator
+    /// construction; carried here so `run_orphan_cleanup` (a free fn with no
+    /// config access) reads it lock-local, mirroring
+    /// [`Self::vetoed_reduction_enabled`]. Never persisted.
+    orphan_cleanup_proof_reclaim_enabled: bool,
     /// GAP 1 (armed scenario 06) — per-shard streak of CONSECUTIVE code-22
     /// "manifest hash mismatch (count matched)" completion rejections, keyed
     /// by the rejected manifest's hash. Lives on the manager (not the batch
@@ -787,6 +794,7 @@ impl MigrationManager {
             failed_retry_hold: false,
             vetoed_reduction_enabled: false,
             weak_veto_arbitration_enabled: true,
+            orphan_cleanup_proof_reclaim_enabled: false,
             manifest_mismatch_streaks: std::collections::HashMap::new(),
         }
     }
@@ -874,6 +882,25 @@ impl MigrationManager {
     /// ([`Self::set_weak_veto_arbitration_enabled`]).
     pub fn weak_veto_arbitration_enabled(&self) -> bool {
         self.weak_veto_arbitration_enabled
+    }
+
+    /// W13 containment — arm/disarm the proof-of-elsewhere orphan reclaim on
+    /// this node (default OFF; set once at coordinator construction from
+    /// `orphan_cleanup_proof_reclaim_enabled`).
+    ///
+    /// DISARMED, `run_orphan_cleanup` never probes a holder and never deletes
+    /// on the strength of a probe: a non-owned shard without committed-handoff
+    /// evidence is retained, which is the fail-closed task-#28 posture. See
+    /// `Config::orphan_cleanup_proof_reclaim_enabled` for why that is the
+    /// shipped default.
+    pub fn set_orphan_cleanup_proof_reclaim_enabled(&mut self, enabled: bool) {
+        self.orphan_cleanup_proof_reclaim_enabled = enabled;
+    }
+
+    /// W13 containment — whether the proof-of-elsewhere orphan reclaim is
+    /// armed ([`Self::set_orphan_cleanup_proof_reclaim_enabled`]).
+    pub fn orphan_cleanup_proof_reclaim_enabled(&self) -> bool {
+        self.orphan_cleanup_proof_reclaim_enabled
     }
 
     /// W8 — record that a migration batch finished with failed tasks at a
@@ -3381,6 +3408,29 @@ impl Default for MigrationManager {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// W13 CONTAINMENT — a freshly constructed manager carries the
+    /// proof-of-elsewhere orphan reclaim DISARMED, so every code path that
+    /// builds its own manager (tests, tools, future call sites) inherits the
+    /// fail-closed #28 posture unless it explicitly opts in.
+    #[test]
+    fn orphan_cleanup_proof_reclaim_defaults_disarmed() {
+        let mut mgr = MigrationManager::new();
+        assert!(
+            !mgr.orphan_cleanup_proof_reclaim_enabled(),
+            "a new MigrationManager must leave the proof reclaim disarmed",
+        );
+        mgr.set_orphan_cleanup_proof_reclaim_enabled(true);
+        assert!(
+            mgr.orphan_cleanup_proof_reclaim_enabled(),
+            "the setter must arm the reclaim (the operator opt-in path)",
+        );
+        mgr.set_orphan_cleanup_proof_reclaim_enabled(false);
+        assert!(
+            !mgr.orphan_cleanup_proof_reclaim_enabled(),
+            "disarming must be a complete local rollback",
+        );
+    }
 
     #[test]
     fn shard_bitmap_set_clear_test() {

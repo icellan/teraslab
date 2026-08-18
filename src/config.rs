@@ -1596,6 +1596,45 @@ pub struct ServerConfig {
     /// Watch `teraslab_tombstone_weak_entries`.
     pub migration_weak_veto_arbitration_enabled: bool,
 
+    /// W13 containment — allow the orphan-cleanup pass to reclaim a non-owned
+    /// shard on PROOF-OF-ELSEWHERE: every current committed holder confirms,
+    /// over a verify-only superset probe, that it already holds a superset of
+    /// this node's copy.
+    ///
+    /// Default OFF (ship-inert), and it must stay off until the retention
+    /// protocol below exists. The path DELETED FOUR ACKED RECORDS in CI:
+    ///
+    /// 1. A confirming holder can be draining the same copy through the
+    ///    LEGACY committed-handoff path (`cleanup_orphaned_shard_if_settled`).
+    ///    The two paths are mutually blind. The probe attests VISIBILITY at an
+    ///    instant; there is no lease and no retention commitment, so a
+    ///    confirmer's own reclaim does not invalidate the confirmation it just
+    ///    issued. Observed: a holder legacy-reclaimed its copies within
+    ///    ~100 ms of confirming them, and unanimity over two such holders left
+    ///    the asker as the last durable holder of records it then deleted.
+    /// 2. A refusal that EVAPORATES re-opens the shard as a reclaim candidate.
+    ///    The issue-#46 guard parks a shard ("refusing completion … parking
+    ///    for re-drive; source keeps authority"), but that refusal lives only
+    ///    as a `Failed` entry in `active_migrations()`. The pass skips
+    ///    unsettled tasks — so once the failed task is RETIRED the proof phase
+    ///    sees a plain non-owned shard and deletes exactly what the guard had
+    ///    just refused to hand over (observed: census `unsettled_task: 8` →
+    ///    `0` in 300 ms, then 4 shards reclaimed).
+    ///
+    /// OFF, the pass is byte-for-byte the fail-closed task-#28 posture: a
+    /// non-owned shard with no committed-handoff evidence is RETAINED, no
+    /// holder is probed and nothing is deleted. The cost is bounded
+    /// OVER-replication (a third copy under RF=2), visible as
+    /// `teraslab_orphan_cleanup_retained_no_evidence` — the disposition that
+    /// ran for the entire history before this path and lost no data.
+    ///
+    /// ON, the reclaim is armed and every reclaimed shard is logged at INFO
+    /// with its record count and confirming holders, and counted in
+    /// `teraslab_orphan_cleanup_proof_reclaimed_total`. Arm it only in a
+    /// cluster where you accept that a unanimous instant-in-time confirmation
+    /// may be voided by a concurrent drain on the confirming holders.
+    pub orphan_cleanup_proof_reclaim_enabled: bool,
+
     /// SWIM probe interval in milliseconds.
     pub swim_probe_interval_ms: u64,
 
@@ -1913,6 +1952,7 @@ impl Default for ServerConfig {
             replica_abort_forced_resync_enabled: true,
             migration_vetoed_reduction_enabled: false,
             migration_weak_veto_arbitration_enabled: true,
+            orphan_cleanup_proof_reclaim_enabled: false,
             swim_probe_interval_ms: 200,
             swim_suspicion_timeout_ms: 5000,
             topology_propose_timeout_ms: 0,
@@ -4307,6 +4347,33 @@ otlp_endpoint = "http://set-via-toml:4317"
         let cfg = ServerConfig::default();
         cfg.validate_safe_defaults()
             .expect("default config must pass safe-defaults validation");
+    }
+
+    /// W13 CONTAINMENT — the proof-of-elsewhere orphan reclaim ships INERT.
+    ///
+    /// The path deleted four ACKED records in CI (see
+    /// [`ServerConfig::orphan_cleanup_proof_reclaim_enabled`]), so a node that
+    /// does not name the key MUST run with it off; only an explicit
+    /// `= true` in the operator's config arms it.
+    #[test]
+    fn orphan_cleanup_proof_reclaim_defaults_off() {
+        assert!(
+            !ServerConfig::default().orphan_cleanup_proof_reclaim_enabled,
+            "the proof-of-elsewhere orphan reclaim must default OFF",
+        );
+
+        let omitted: ServerConfig = toml::from_str("node_id = 1\n").unwrap();
+        assert!(
+            !omitted.orphan_cleanup_proof_reclaim_enabled,
+            "a config that omits the key must leave the reclaim disarmed",
+        );
+
+        let armed: ServerConfig =
+            toml::from_str("node_id = 1\norphan_cleanup_proof_reclaim_enabled = true\n").unwrap();
+        assert!(
+            armed.orphan_cleanup_proof_reclaim_enabled,
+            "an explicit opt-in must still arm the reclaim",
+        );
     }
 
     #[test]

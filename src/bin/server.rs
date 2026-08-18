@@ -1851,6 +1851,7 @@ fn main() {
             replica_abort_forced_resync_enabled: config.replica_abort_forced_resync_enabled,
             migration_vetoed_reduction_enabled: config.migration_vetoed_reduction_enabled,
             migration_weak_veto_arbitration_enabled: config.migration_weak_veto_arbitration_enabled,
+            orphan_cleanup_proof_reclaim_enabled: config.orphan_cleanup_proof_reclaim_enabled,
             probe_interval,
             suspicion_timeout: std::time::Duration::from_millis(config.swim_suspicion_timeout_ms),
             cluster_secret: config

@@ -2959,6 +2959,14 @@ pub struct ClusterConfig {
     /// `Config::migration_weak_veto_arbitration_enabled` for the rationale
     /// and the never-arbitrable ClientDelete/Dah carve-out).
     pub migration_weak_veto_arbitration_enabled: bool,
+
+    /// W13 containment — arm the PROOF-OF-ELSEWHERE orphan reclaim (see
+    /// `Config::orphan_cleanup_proof_reclaim_enabled` for the data-loss
+    /// evidence). Default OFF (ship-inert): disarmed, `run_orphan_cleanup`
+    /// probes nothing and deletes nothing without committed-handoff evidence.
+    /// Carried on the shared `MigrationManager` so the pass (a free fn with
+    /// no config access) reads it lock-local.
+    pub orphan_cleanup_proof_reclaim_enabled: bool,
     pub probe_interval: Duration,
     pub suspicion_timeout: Duration,
     /// Shared secret for HMAC authentication of SWIM and inter-node traffic.
@@ -3233,6 +3241,11 @@ impl ClusterCoordinator {
                 // forced-resync arming (read at the terminal-abort site).
                 mgr.set_replica_abort_forced_resync_enabled(
                     config.replica_abort_forced_resync_enabled,
+                );
+                // W13 — same carrier pattern for the proof-of-elsewhere
+                // orphan reclaim (read at the `run_orphan_cleanup` gate).
+                mgr.set_orphan_cleanup_proof_reclaim_enabled(
+                    config.orphan_cleanup_proof_reclaim_enabled,
                 );
                 Arc::new(Mutex::new(mgr))
             },
@@ -15033,9 +15046,20 @@ fn run_orphan_cleanup(
     // PROBED without them (below): a network round-trip inside the shard-table
     // read guard would stall every topology change behind an unreachable peer.
     let mut unproven: Vec<(u16, Vec<NodeId>)> = Vec::new();
+    // W13 CONTAINMENT — the single choke point for the proof-of-elsewhere
+    // reclaim. A proof handed to this pass is INERT unless the node's
+    // committed `orphan_cleanup_proof_reclaim_enabled` arms it (default OFF —
+    // see `Config::orphan_cleanup_proof_reclaim_enabled` for the four acked
+    // records this path destroyed). Disarmed, no candidate is queued, so no
+    // manifest is folded, no holder is probed and nothing is deleted without
+    // committed-handoff evidence: exactly the pre-W12 fail-closed #28 pass.
+    // Gating HERE rather than at the two `PeerSupersetProof` construction
+    // sites means a future call site cannot re-arm the path by accident.
+    let proof_armed: bool;
     {
         let table = shard_table.read();
         let mgr = migration.lock();
+        proof_armed = proof.is_some() && mgr.orphan_cleanup_proof_reclaim_enabled();
         // Scenario 17 — the task gate is PER-SHARD, not global: a shard with
         // ANY unresolved (active or failed) outbound task is skipped, and
         // every other shard is judged solely by the real per-shard safety
@@ -15090,7 +15114,9 @@ fn run_orphan_cleanup(
                 // the shard for the proof-of-elsewhere phase together with the
                 // holder set the table currently commits it to; `self` is
                 // excluded because we already know this node is not one of them.
-                if proof.is_some() {
+                // W13 — only when the reclaim is ARMED: disarmed, the shard is
+                // simply retained and never becomes a probe candidate.
+                if proof_armed {
                     let mut holders: Vec<NodeId> =
                         Vec::with_capacity(1 + assignment.replicas.len());
                     for holder in std::iter::once(assignment.master)
@@ -15146,7 +15172,11 @@ fn run_orphan_cleanup(
     // counters flat, which reads exactly like "the pass never ran" (the
     // ambiguity W11 FIX 4(b) forbids in this function).
     let mut proof_oversized = 0u32;
-    if let Some(proof) = proof
+    // W13 — `proof_armed` is re-tested here, not just at the queueing site: the
+    // phase below is the code that DELETES, so its own guard must state the
+    // arming condition rather than inherit it from an empty candidate list.
+    if proof_armed
+        && let Some(proof) = proof
         && !unproven.is_empty()
     {
         let started = std::time::Instant::now();
@@ -15360,6 +15390,24 @@ fn run_orphan_cleanup(
             debug_shard_log(
                 shard,
                 format!("orphan_cleanup RECLAIM (proof-of-elsewhere) deleted={deleted}"),
+            );
+            // W13 — a path that DELETES must never be silent. This was
+            // `debug_shard_log` only: DEBUG level and shard-gated, so the CI
+            // run in which this reclaim destroyed four acked records produced
+            // NO log line for the deletion — it could only be inferred from
+            // freed-space arithmetic against the census gauge. One line per
+            // reclaimed shard (never per record), naming the holders whose
+            // confirmations authorised it, so the decision is auditable from
+            // the log alone.
+            tracing::info!(
+                shard,
+                records_deleted = deleted,
+                confirmed_by = ?holders.iter().map(|n| n.0).collect::<Vec<_>>(),
+                topology_epoch,
+                "cluster: orphan cleanup DELETED this node's copy of a \
+                 non-owned shard on proof-of-elsewhere — every listed holder \
+                 confirmed it already holds a superset \
+                 (orphan_cleanup_proof_reclaim_enabled=true)",
             );
         }
         // A pass that walked the whole candidate list owes the next one no
@@ -27823,6 +27871,10 @@ mod tests {
     /// census rounds; default-17: 192/2000). Pass-after: the proof reclaims it.
     #[test]
     fn run_orphan_cleanup_reclaims_without_handoff_when_every_holder_proves_superset() {
+        // Serialised against the other tests that read/bump the
+        // PROCESS-GLOBAL proof counters (this pass increments
+        // `orphan_cleanup_proof_reclaimed`).
+        let _guard = migration_metrics_test_guard();
         let old_table =
             ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
         let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
@@ -27836,6 +27888,12 @@ mod tests {
         // that no future event can ever repair.
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
         let proof = ScriptedProof::new(&[NodeId(2), NodeId(3)]);
+        // W13 — the proof-of-elsewhere reclaim is DISARMED by default
+        // (`orphan_cleanup_proof_reclaim_enabled`); this test is about the
+        // armed behaviour, so arm it explicitly.
+        migration
+            .lock()
+            .set_orphan_cleanup_proof_reclaim_enabled(true);
 
         run_orphan_cleanup(
             NodeId(1),
@@ -27863,6 +27921,213 @@ mod tests {
             expected,
             "every committed holder must be asked — a single holder's word is \
              not enough to drop to RF-1",
+        );
+    }
+
+    /// W13 CONTAINMENT — the proof-of-elsewhere reclaim ships INERT.
+    ///
+    /// The W12 pass destroyed four ACKED records in CI: unanimity is not
+    /// sufficient, because a confirming holder can be draining the very copy
+    /// it just attested through the legacy committed-handoff path (the two
+    /// paths are mutually blind — the probe attests presence at an INSTANT,
+    /// with no lease and no retention commitment), and because the issue-#46
+    /// "parking for re-drive" refusal lives only as a `Failed` entry, so
+    /// retiring it re-opens the shard as a plain reclaim candidate. Until a
+    /// retention protocol exists, the path must be reachable only by explicit
+    /// operator arming (`orphan_cleanup_proof_reclaim_enabled`).
+    ///
+    /// Disarmed — the shipped default — the pass must be byte-for-byte the
+    /// fail-closed #28 posture: RETAIN, probe NOTHING, delete NOTHING, even
+    /// when every committed holder would confirm.
+    #[test]
+    fn run_orphan_cleanup_proof_reclaim_is_disarmed_by_default() {
+        let _guard = migration_metrics_test_guard();
+        let metrics = install_test_migration_metrics();
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let shard = shard_node1_lost(&old_table, &new_table);
+        let engine = Arc::new(test_engine());
+        let key = tx_key_for_shard(shard, 67);
+        create_test_record(&engine, key);
+        assert_eq!(engine.shard_record_count(shard), 1, "the copy under test");
+        let generation_before = engine
+            .read_metadata(&key)
+            .expect("the copy under test must exist before the pass")
+            .generation;
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        // A DEFAULT manager: no committed handoff (the state #28 retains) and
+        // nothing arms the proof reclaim.
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        // Every committed holder would confirm — the exact CI state in which
+        // four acked records were deleted.
+        let proof = ScriptedProof::new(&[NodeId(2), NodeId(3)]);
+        let reclaimed_before = metrics.orphan_cleanup_proof_reclaimed.get();
+
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+            Some(&proof),
+        );
+
+        assert_eq!(
+            engine.shard_record_count(shard),
+            1,
+            "the disarmed pass must retain the copy exactly as #28 does",
+        );
+        let generation_after = engine
+            .read_metadata(&key)
+            .expect("the local copy must still read back after a disarmed pass")
+            .generation;
+        assert_eq!(
+            generation_after, generation_before,
+            "the disarmed pass must leave the record untouched",
+        );
+        assert!(
+            proof.asked.lock().is_empty(),
+            "a disarmed pass must not probe at all: it is the pre-W12 pass, \
+             not a probe-but-do-not-delete variant",
+        );
+        assert_eq!(
+            metrics.orphan_cleanup_proof_reclaimed.get(),
+            reclaimed_before,
+            "teraslab_orphan_cleanup_proof_reclaimed_total must not move while \
+             the reclaim is disarmed",
+        );
+    }
+
+    /// W13 — an ARMED reclaim must announce every deletion at INFO.
+    ///
+    /// The decision was logged only through `debug_shard_log`: DEBUG level AND
+    /// shard-gated, so in the CI run where this path destroyed four acked
+    /// records there was NO log line for the deletion — it could only be
+    /// inferred from freed-space arithmetic against the census gauge. A path
+    /// that deletes data must never be silent, and the line must carry enough
+    /// to audit the decision: the shard, how many records went, and WHICH
+    /// holders' confirmations authorised it.
+    ///
+    /// Fail-before: nothing at INFO names the reclaim. One line per reclaimed
+    /// shard — never one per record.
+    #[test]
+    fn run_orphan_cleanup_proof_reclaim_logs_the_deletion_at_info() {
+        use std::sync::Mutex as StdMutex;
+        use tracing::Event;
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::Context;
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::registry::LookupSpan;
+
+        /// Flattens every INFO event into one `message field=value ...` line.
+        #[derive(Default)]
+        struct InfoVisitor {
+            rendered: String,
+        }
+
+        impl Visit for InfoVisitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.rendered.insert_str(0, &format!("{value:?} "));
+                } else {
+                    self.rendered
+                        .push_str(&format!("{}={value:?} ", field.name()));
+                }
+            }
+        }
+
+        struct CaptureLayer {
+            lines: Arc<StdMutex<Vec<String>>>,
+        }
+
+        impl<S> Layer<S> for CaptureLayer
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                if event.metadata().level() != &tracing::Level::INFO {
+                    return;
+                }
+                let mut visitor = InfoVisitor::default();
+                event.record(&mut visitor);
+                self.lines
+                    .lock()
+                    .expect("capture lock")
+                    .push(visitor.rendered);
+            }
+        }
+
+        let _guard = migration_metrics_test_guard();
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let shard = shard_node1_lost(&old_table, &new_table);
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(shard, 68));
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration
+            .lock()
+            .set_orphan_cleanup_proof_reclaim_enabled(true);
+        let proof = ScriptedProof::new(&[NodeId(2), NodeId(3)]);
+
+        let lines = Arc::new(StdMutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("info"))
+            .with(CaptureLayer {
+                lines: lines.clone(),
+            });
+        tracing::subscriber::with_default(subscriber, || {
+            run_orphan_cleanup(
+                NodeId(1),
+                &engine,
+                &shard_table,
+                &migration,
+                new_table.version,
+                Some(&proof),
+            );
+        });
+
+        assert_eq!(
+            engine.shard_record_count(shard),
+            0,
+            "the fixture must actually reclaim, or the log assertion is vacuous",
+        );
+
+        let assignment = new_table.effective_assignment(shard);
+        let mut holders: Vec<u64> = std::iter::once(assignment.master)
+            .chain(assignment.replicas.iter().copied())
+            .filter(|n| *n != NodeId(1))
+            .map(|n| n.0)
+            .collect();
+        holders.dedup();
+        let captured = lines.lock().expect("capture lock").clone();
+        let reclaim_lines: Vec<&String> = captured
+            .iter()
+            .filter(|l| l.contains("orphan cleanup DELETED"))
+            .collect();
+        assert_eq!(
+            reclaim_lines.len(),
+            1,
+            "exactly ONE INFO line per reclaimed shard (never per record); \
+             captured INFO events: {captured:?}",
+        );
+        let line = reclaim_lines[0];
+        assert!(
+            line.contains(&format!("shard={shard}")),
+            "the deletion line must name the shard: {line}",
+        );
+        assert!(
+            line.contains("records_deleted=1"),
+            "the deletion line must state how many records went: {line}",
+        );
+        assert!(
+            line.contains(&format!("confirmed_by={holders:?}")),
+            "the deletion line must name the confirming holders {holders:?}: {line}",
         );
     }
 
@@ -28146,6 +28411,12 @@ mod tests {
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
         // Nobody confirms — every holder "fails" on its first ask.
         let proof = ScriptedProof::new(&[]);
+        // W13 — the proof-of-elsewhere reclaim is DISARMED by default
+        // (`orphan_cleanup_proof_reclaim_enabled`); this test is about the
+        // armed behaviour, so arm it explicitly.
+        migration
+            .lock()
+            .set_orphan_cleanup_proof_reclaim_enabled(true);
 
         run_orphan_cleanup(
             NodeId(1),
@@ -28231,6 +28502,10 @@ mod tests {
     /// probed and reclaimed mid-pull.
     #[test]
     fn run_orphan_cleanup_proof_never_probes_a_shard_with_a_pending_inbound() {
+        // Serialised against the other tests that read/bump the
+        // PROCESS-GLOBAL proof counters (this pass increments
+        // `orphan_cleanup_proof_reclaimed`).
+        let _guard = migration_metrics_test_guard();
         let old_table =
             ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 20, 1);
         let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 21, 1);
@@ -28256,6 +28531,12 @@ mod tests {
 
         // A proof that would confirm anything it is asked about.
         let proof = ScriptedProof::new(&[NodeId(1), NodeId(2), NodeId(3)]);
+        // W13 — the proof-of-elsewhere reclaim is DISARMED by default
+        // (`orphan_cleanup_proof_reclaim_enabled`); this test is about the
+        // armed behaviour, so arm it explicitly.
+        migration
+            .lock()
+            .set_orphan_cleanup_proof_reclaim_enabled(true);
 
         run_orphan_cleanup(
             NodeId(1),
@@ -28300,6 +28581,12 @@ mod tests {
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
         // Only node2 confirms; node3 (the other committed holder) does not.
         let proof = ScriptedProof::new(&[NodeId(2)]);
+        // W13 — the proof-of-elsewhere reclaim is DISARMED by default
+        // (`orphan_cleanup_proof_reclaim_enabled`); this test is about the
+        // armed behaviour, so arm it explicitly.
+        migration
+            .lock()
+            .set_orphan_cleanup_proof_reclaim_enabled(true);
 
         run_orphan_cleanup(
             NodeId(1),
@@ -28334,6 +28621,12 @@ mod tests {
         let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
         let proof = ScriptedProof::new(&[]);
+        // W13 — the proof-of-elsewhere reclaim is DISARMED by default
+        // (`orphan_cleanup_proof_reclaim_enabled`); this test is about the
+        // armed behaviour, so arm it explicitly.
+        migration
+            .lock()
+            .set_orphan_cleanup_proof_reclaim_enabled(true);
 
         run_orphan_cleanup(
             NodeId(1),
@@ -28374,6 +28667,12 @@ mod tests {
 
         let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        // W13 — the proof-of-elsewhere reclaim is DISARMED by default
+        // (`orphan_cleanup_proof_reclaim_enabled`); this test is about the
+        // armed behaviour, so arm it explicitly.
+        migration
+            .lock()
+            .set_orphan_cleanup_proof_reclaim_enabled(true);
 
         // The mutation lands WHILE the probe is in flight — after the manifest
         // was folded, before the delete loop runs.

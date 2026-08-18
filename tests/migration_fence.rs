@@ -134,6 +134,7 @@ fn create_node(node_id: u64, seed_swim_ports: &[u16], rf: u8) -> TestNode {
         replica_abort_forced_resync_enabled: true,
         migration_vetoed_reduction_enabled: false,
         migration_weak_veto_arbitration_enabled: true,
+        orphan_cleanup_proof_reclaim_enabled: false,
     };
 
     let coordinator = ClusterCoordinator::new(cluster_config, 1);

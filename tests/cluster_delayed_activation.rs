@@ -117,6 +117,7 @@ fn create_node(node_id: u64, seed_swim_ports: &[u16], hold_activation: bool) -> 
         replica_abort_forced_resync_enabled: true,
         migration_vetoed_reduction_enabled: false,
         migration_weak_veto_arbitration_enabled: true,
+        orphan_cleanup_proof_reclaim_enabled: false,
         probe_interval: Duration::from_millis(100),
         suspicion_timeout: Duration::from_secs(5),
         cluster_secret: None,
