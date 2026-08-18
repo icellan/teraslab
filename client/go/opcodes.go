@@ -175,11 +175,30 @@ const (
 // stale-epoch are same-target transients; replication-failed is an ambiguous
 // outcome that is only safe to retry for idempotent operations.
 //
-// ErrCodeNoQuorum is intentionally NOT included here — it is handled by a
-// partition-map refresh + single retry, not same-target backoff.
+// W12 TAIL 1 — ErrCodeNoQuorum belongs here too. It was excluded on the
+// grounds that a partition-map refresh handles it, but that only ever covered
+// the GLOBAL shape: a PER-ITEM code 15 (a 1-item create batch during a
+// scale-up) reached classifyRetry's PartialError branch and terminated with
+// ZERO retries, and the global shape got maxRefreshRetries refreshes with NO
+// backoff — re-issuing inside the very window it was meant to ride out.
+//
+// The server emits code 15 from three sites and calls it retryable at every
+// one: the NodeId(0) unassigned sentinel returned for EVERY shard while a
+// node's activated shard table lags the quorum-committed term (narrowed only
+// by the operator opt-in stale_table_partial_serving, default OFF), and the
+// read/write paths that turn a redirect with an unknown master address into
+// "retryable ERR_NO_QUORUM instead of empty redirect". Those windows close by
+// WAITING. CI @ fc5e5f7 measured them at 100ms (node2/node3) to 195ms (node1)
+// across a 3->4 scale-up, in which the workload recorded 13/347 and 14/247
+// hard errors, every sampled one NO_QUORUM(15).
+//
+// Retry safety: every site that emits code 15 refuses BEFORE applying
+// anything, so a re-issue cannot double-apply regardless of the operation.
+// classifyRetry still prefers one immediate routing refresh for the global
+// shape before falling back to this ladder.
 func isRetryableErrorCode(code uint16) bool {
 	switch code {
-	case ErrCodeMigrationInProgress, ErrCodeStaleEpoch, ErrCodeReplicationFailed:
+	case ErrCodeMigrationInProgress, ErrCodeStaleEpoch, ErrCodeReplicationFailed, ErrCodeNoQuorum:
 		return true
 	default:
 		return false

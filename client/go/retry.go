@@ -28,11 +28,24 @@ const (
 )
 
 // classifyRetry decides how (if at all) an error from a cluster operation
-// should be retried.
-func classifyRetry(err error) retryAction {
+// should be retried. refreshesLeft reports whether the operation still has
+// partition-map refresh budget (see maxRefreshRetries).
+//
+// W12 TAIL 1 — ErrCodeNoQuorum is a same-target transient, not merely a
+// routing signal. The server emits it from three sites and documents a
+// back-off-and-retry recovery at every one, and the two windows behind it —
+// a node whose activated shard table lags the quorum-committed term (the
+// NodeId(0) unassigned sentinel, returned for EVERY shard unless the operator
+// opts into stale_table_partial_serving), and a redirect whose master address
+// is not yet known — close by WAITING, not by re-routing. A GLOBAL no-quorum
+// still spends its immediate refresh budget first, because the master may
+// simply have moved and a refresh is free; once that is spent it falls back
+// to the backed-off ladder rather than surfacing. A PER-ITEM no-quorum (the
+// 1-item-batch shape a scale-up produces) goes straight to backoff.
+func classifyRetry(err error, refreshesLeft bool) retryAction {
 	switch e := err.(type) {
 	case *ServerError:
-		if e.Code == ErrCodeNoQuorum {
+		if e.Code == ErrCodeNoQuorum && refreshesLeft {
 			return retryRefresh
 		}
 		if isRetryableErrorCode(e.Code) {
@@ -40,7 +53,12 @@ func classifyRetry(err error) retryAction {
 		}
 		return retryNone
 	case *StaleRedirectError:
-		return retryRefresh
+		// A pure routing signal: nothing to wait for, so it never falls back
+		// to the backoff ladder.
+		if refreshesLeft {
+			return retryRefresh
+		}
+		return retryNone
 	case *PartialError:
 		// Only retry when the entire sub-batch was transiently rejected: every
 		// item failed with a retryable code and none succeeded. Re-sending then
@@ -73,11 +91,8 @@ func withTransientRetry[R any](ctx context.Context, c *Client, op func() (R, err
 	attempt := 0
 	refreshRetries := 0
 	for {
-		switch classifyRetry(err) {
+		switch classifyRetry(err, refreshRetries < maxRefreshRetries) {
 		case retryRefresh:
-			if refreshRetries >= maxRefreshRetries {
-				return res, err
-			}
 			refreshRetries++
 			c.cluster.tryRefresh()
 		case retryBackoff:
