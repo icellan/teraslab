@@ -23025,7 +23025,8 @@ impl RunningCluster {
     /// backfill destination (`false`).
     ///
     /// Used by `build_replication_targets` in place of
-    /// [`Self::dual_write_targets_for_shard`] so one migration-lock
+    /// `Self::dual_write_targets_for_shard` (not a doc link: that accessor is
+    /// `#[cfg(test)]`, so it does not exist in a docs build) so one migration-lock
     /// acquisition yields both the fan-out set and the handoff-ACK gating
     /// (W10 composition P1-2). See
     /// [`MigrationManager::dual_write_targets_with_origin_for_shard`].

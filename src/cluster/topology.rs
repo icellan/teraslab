@@ -1150,7 +1150,8 @@ impl PersistedTopologyState {
 /// # Why this is a correctness gate, not tidiness
 ///
 /// [`TopologyTerm::compute_digest`] hashes `members` **in the order received**,
-/// while [`ShardTable::compute_with_epoch`] sorts a local copy before assigning
+/// while [`crate::cluster::shards::ShardTable::compute_with_epoch`] sorts a
+/// local copy before assigning
 /// shards. Those two disagree the moment a member list arrives unsorted: every
 /// voter recomputes the same digest and votes yes, and then two conforming
 /// implementations derive DIFFERENT shard tables from one agreed commit. That
@@ -2000,8 +2001,9 @@ impl TopologyAuthority {
     /// ACQUIRE, paired with the RELEASE store in `apply_commit_locked` (W11
     /// NIT): a reader that observes term T is guaranteed to observe the
     /// member/placement/assignment view published before it, which the
-    /// stale-table gate ([`crate::cluster::coordinator::stale_table_may_serve_shard`])
-    /// depends on for a serving decision.
+    /// stale-table gate (`cluster::coordinator::stale_table_may_serve_shard` —
+    /// not a doc link: it is a private free fn) depends on for a serving
+    /// decision.
     pub fn committed_term(&self) -> u64 {
         self.committed_term.load(Ordering::Acquire)
     }

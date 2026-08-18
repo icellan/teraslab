@@ -370,9 +370,9 @@ fn run_one_catchup_pass(
 static CLUSTER_AUTH_METRICS: ClusterAuthMetrics = ClusterAuthMetrics::new();
 
 /// Project the operator's [`ServerConfig`] onto the coordinator's
-/// [`ClusterConfig`], the FIRST of the two wiring hops every cluster policy
-/// flag travels (the second is `ClusterConfig` -> `MigrationManager`, wired in
-/// `ClusterCoordinator::new`).
+/// [`teraslab::cluster::coordinator::ClusterConfig`], the FIRST of the two
+/// wiring hops every cluster policy flag travels (the second is
+/// `ClusterConfig` -> `MigrationManager`, wired in `ClusterCoordinator::new`).
 ///
 /// Extracted from `main` deliberately (W13 review): this projection is a wall
 /// of near-identical `field: config.field` lines, several of which default to

@@ -1422,7 +1422,7 @@ impl MigrationManager {
     ///
     /// Rewrites the uncompleted `heal_pending` `NodeId(0)`-sentinel entry for
     /// `shard` to name `from_node` IN PLACE (mirroring the forward-migration
-    /// sentinel replacement in [`Self::register_migrations`]) — never adding a
+    /// sentinel replacement in [`Self::start_outbound`]) — never adding a
     /// second entry, because the completion handshake
     /// ([`Self::mark_inbound_complete_from_source`]) completes ONE entry and a
     /// leftover sibling sentinel would hold the fence bit forever. Clears any
@@ -1996,7 +1996,7 @@ impl MigrationManager {
         }
     }
 
-    /// W9 nit — exact-task variant of [`mark_failed`]: resolves the entry
+    /// W9 nit — exact-task variant of [`Self::mark_failed`]: resolves the entry
     /// by the FULL task identity INCLUDING `is_master`, where
     /// `mark_failed`'s (shard, from, to) lookup can hit the twin entry
     /// when a master and a replica task share the same endpoints. Used by
@@ -2004,7 +2004,7 @@ impl MigrationManager {
     /// (`cancel_deferred_plan_launch`), which iterates the held plan's
     /// task list and must fail exactly the tasks it names — a twin left
     /// active would be preservable as a workerless task. Fence-lift,
-    /// dual-write close, and metrics bookkeeping match [`mark_failed`].
+    /// dual-write close, and metrics bookkeeping match [`Self::mark_failed`].
     pub fn mark_failed_exact(&mut self, task: &MigrationTask) {
         let Some(idx) = self.active.iter().position(|p| {
             p.shard == task.shard
