@@ -1519,6 +1519,16 @@ pub struct MigrationMetrics {
     /// climbing value means the shard is taking writes faster than a pass can
     /// prove-and-delete it — the copies are safe, just never drained.
     pub orphan_cleanup_proof_stale_no_delete: PaddedCounter,
+    /// W12 P2 — shards the proof phase RETAINED without asking anyone, because
+    /// their key count exceeds the per-probe manifest cap. Neither refused (no
+    /// holder was consulted) nor reclaimed, so without this the census stays
+    /// pinned with BOTH proof counters flat — indistinguishable from "the pass
+    /// never ran", which is exactly the diagnostic ambiguity W11 FIX 4(b)
+    /// forbids in this function. At the 2 B-record design target this is the
+    /// STEADY STATE for a full shard, not an edge case: a non-zero value means
+    /// space reclamation for those shards needs a mechanism other than a
+    /// whole-shard manifest probe.
+    pub orphan_cleanup_proof_oversized: PaddedCounter,
     /// W10 composition review P1 — completed LIVE-RECENCY CONFIRM rounds
     /// (`confirm_self_behind_with_live_recency`). Each round costs one
     /// filtered primary-index walk plus the device reads for the shards it
@@ -1621,6 +1631,7 @@ impl MigrationMetrics {
             orphan_cleanup_proof_reclaimed: PaddedCounter::new(),
             orphan_cleanup_proof_refused: PaddedCounter::new(),
             orphan_cleanup_proof_stale_no_delete: PaddedCounter::new(),
+            orphan_cleanup_proof_oversized: PaddedCounter::new(),
             reheal_live_confirm_rounds: PaddedCounter::new(),
             reheal_live_confirm_shards: PaddedCounter::new(),
             reheal_live_confirm_deferred: PaddedCounter::new(),

@@ -14597,6 +14597,13 @@ fn event_orphan_cleanup_fire(
 /// One pass may face hundreds of unproven shards (default-17: 135 on one
 /// node), so this per-holder budget multiplies by the shard count; that is why
 /// [`ORPHAN_RECLAIM_PROBE_BUDGET`] also bounds the pass as a whole.
+/// COST NOTE (W12 nit 3) — each attempt now makes the RESPONDER issue a full
+/// durability barrier (redo fsync + one sync per data device) before it
+/// attests, so a slow-but-connectable holder can be made to pay that barrier
+/// up to `retry_delays_ms.len()` times for one shard. It is bounded and small
+/// at the observed backlog, but if it ever bites the fix is to barrier once
+/// per connection, or to compare a durable watermark carried in the response
+/// instead of forcing a barrier per probe.
 const ORPHAN_RECLAIM_SUPERSET_PROBE: SupersetProbeProfile = SupersetProbeProfile {
     retry_delays_ms: &[50, 150, 300],
     connect_timeout: Duration::from_millis(500),
@@ -14675,6 +14682,13 @@ fn rotate_unproven_to_cursor(unproven: &mut [(u16, Vec<NodeId>)], cursor: u16) {
 /// probe is self-contained. The responder refuses any probe whose
 /// `migration_epoch` exceeds its own shard-table version
 /// (`ERR_MIGRATION_TARGET_NOT_READY`, `server::dispatch`). So:
+///
+/// The asker ENFORCES this itself — the responder echoes its own shard-table
+/// version and [`SupersetConfirmation::attests`] requires
+/// `responder_epoch >= topology_epoch` — so the invariant no longer depends on
+/// the peer's gate being reached. The peer-side reasoning below is still what
+/// makes the ordering MEANINGFUL, and is recorded here because a reader
+/// standing at the deletion site must be able to find it:
 ///
 /// * A reclaiming shard S at epoch `Va` implies every holder B confirmed,
 ///   hence `Vb >= Va`.
@@ -15019,6 +15033,12 @@ fn run_orphan_cleanup(
     // refusal (the holders agreed) nor a reclaim (the third copy is still
     // there), so it needs its own counter rather than inflating either.
     let mut proof_stale_no_delete = 0u32;
+    // W12 P2 — shards retained WITHOUT asking anyone because their manifest
+    // would exceed the per-probe cap. Neither refused nor reclaimed, so it
+    // needs its own counter: otherwise the census stays pinned with both proof
+    // counters flat, which reads exactly like "the pass never ran" (the
+    // ambiguity W11 FIX 4(b) forbids in this function).
+    let mut proof_oversized = 0u32;
     if let Some(proof) = proof
         && !unproven.is_empty()
     {
@@ -15087,12 +15107,18 @@ fn run_orphan_cleanup(
             // and could never be confirmed anyway, so building it is pure
             // waste repeated every pass.
             if keys.len() > ORPHAN_RECLAIM_MAX_MANIFEST_ENTRIES {
+                proof_oversized = proof_oversized.saturating_add(1);
+                debug_shard_log(
+                    shard,
+                    "orphan_cleanup RETAIN (manifest over the per-probe cap)",
+                );
                 tracing::debug!(
                     shard,
                     keys = keys.len(),
                     cap = ORPHAN_RECLAIM_MAX_MANIFEST_ENTRIES,
                     "cluster: orphan-reclaim proof skipped — shard exceeds the \
-                     manifest cap; retained",
+                     manifest cap; retained (gauged as \
+                     teraslab_orphan_cleanup_proof_oversized_total)",
                 );
                 continue;
             }
@@ -15254,6 +15280,7 @@ fn run_orphan_cleanup(
         m.orphan_cleanup_proof_refused.add(proof_refused as u64);
         m.orphan_cleanup_proof_stale_no_delete
             .add(proof_stale_no_delete as u64);
+        m.orphan_cleanup_proof_oversized.add(proof_oversized as u64);
     }
     if retained_no_evidence > 0 {
         tracing::warn!(
@@ -17225,10 +17252,15 @@ pub(crate) fn migration_complete_rejection_error(status: u8, payload: &[u8]) -> 
 /// Split in two because the two callers need different strengths of evidence,
 /// and collapsing them hid a real hole:
 ///
-/// * the DRAIN path (`transfer-then-relinquish`) asks exactly ONE node — the
-///   rightful master, at a known address — and relinquishes only its own
-///   phantom copy. `STATUS_OK` is sufficient there, and that contract is
+/// * the DRAIN path (`transfer-then-relinquish`) STREAMED ITS RECORDS TO THE
+///   ADDRESS IT THEN ASKS. So even under an address collision the answer comes
+///   from the node that received the stream — the collision is
+///   SELF-CONSISTENT, and `STATUS_OK` is sufficient. That contract is
 ///   unchanged.
+///
+///   That reasoning can never hold for unanimity over a holder set the
+///   manifest was never shipped to, which is precisely why one caller needs
+///   `binding` and the other does not. Do not "harmonise" them.
 /// * the ORPHAN-RECLAIM path asks SEVERAL nodes and requires unanimity, so an
 ///   answer that cannot be attributed to a specific node is worthless to it
 ///   (W12 P2-5). It requires `binding`.

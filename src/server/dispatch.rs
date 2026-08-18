@@ -1396,13 +1396,21 @@ pub(crate) fn handle_request(
                 // records can be live in the index yet unflushed, while the
                 // asker's reclaim emits an fsynced FreeRegion. A crash inside
                 // that window loses records the asker durably deleted on the
-                // strength of this answer. Make the proof mean what the caller
-                // needs it to mean before saying yes.
-                if let Err(err) = engine.flush_all_redo() {
+                // strength of this answer.
+                //
+                // It must be the FULL barrier, not `flush_all_redo` alone: a
+                // buffered create's redo entry is the index-only
+                // `RedoOp::CreateV2`, which carries no record bytes, so
+                // recovery's `replay_create_v2` reads them back from the DATA
+                // device. Flushing only the redo logs leaves exactly the
+                // Skip-then-lose window `ensure_local_write_durable` documents
+                // (G3) — the attestation would be well-formed and still not
+                // durable.
+                if let Err(err) = ensure_local_write_durable(engine) {
                     return error_response(
                         request.request_id,
                         ERR_MIGRATION_IN_PROGRESS,
-                        &format!("shard {shard} superset probe: durability flush failed: {err}",),
+                        &format!("shard {shard} superset probe: durability barrier failed: {err}",),
                     );
                 }
                 // W12 P2-5 — BIND the answer. An empty OK body is attributable
@@ -29816,6 +29824,85 @@ mod tests {
         let err_code = u16::from_le_bytes(resp.payload[..2].try_into().unwrap());
         assert_eq!(err_code, ERR_MIGRATION_IN_PROGRESS);
         assert_eq!(cluster.inbound_pending_count(), 1);
+    }
+
+    /// W12 P2-1 — a superset confirmation must be backed by a FULL durability
+    /// barrier, not just a redo flush.
+    ///
+    /// The probe's whole purpose is to license the asker's fsynced reclaim, so
+    /// "I hold these records" has to mean "…durably". Under buffered
+    /// durability (the default, and the premise of this finding) a create's
+    /// redo entry is the INDEX-ONLY `CreateV2`, which carries no record bytes:
+    /// recovery's `replay_create_v2` reads them back FROM THE DATA DEVICE. So
+    /// flushing only the redo logs leaves this window open — holder confirms,
+    /// asker durably reclaims, holder is SIGKILLed, replay reads back a device
+    /// region that was never fsynced, SKIPS, and the records are gone from the
+    /// holder that vouched for them AND the asker that deleted on that vouch.
+    ///
+    /// Fail-before: `flush_all_redo()` alone issues ZERO data-device syncs and
+    /// the probe still attests. Pass-after: the arm issues a real barrier
+    /// (`ensure_local_write_durable`) before returning `STATUS_OK`.
+    #[test]
+    fn migration_complete_superset_probe_syncs_the_data_device_before_attesting() {
+        let (dev, syncs) = crate::device::SyncCountingDevice::new(Arc::new(
+            MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap(),
+        ));
+        let h = DispatchTestHarness::with_device(dev);
+        let shard = 53u16;
+        let txid = txid_for_shard(shard, 25);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+        let key = TxKey { txid };
+        let meta = h.engine.read_metadata(&key).unwrap();
+        let entries = vec![(key, meta.generation)];
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 62, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4722".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+
+        // Count only the syncs the PROBE issues, not the create's.
+        let before = syncs.load(std::sync::atomic::Ordering::SeqCst);
+
+        let probe = build_migration_complete_payload(
+            1,
+            0,
+            0,
+            None,
+            Some(&entries),
+            Some(crate::cluster::shards::NodeId(2)),
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: FLAG_MIGRATION_VERIFY_ONLY | FLAG_MIGRATION_SUPERSET_OK,
+            payload: probe.into(),
+        };
+        let mut cs = crate::server::ConnectionState::new();
+        let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "the target holds the record, so the probe must confirm"
+        );
+
+        let after = syncs.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            after > before,
+            "a superset confirmation must issue a DATA-DEVICE sync before \
+             attesting — a buffered CreateV2's record bytes live only on the \
+             data device, so a redo-only flush attests to something that is \
+             not durable (syncs before={before}, after={after})",
+        );
     }
 
     /// sc09/sc05 drain convergence (transfer-then-relinquish) — the SUPERSET

@@ -1557,6 +1557,11 @@ pub(crate) fn render_metrics_text(
             "teraslab_orphan_cleanup_proof_stale_no_delete_total",
             mm.orphan_cleanup_proof_stale_no_delete.get(),
         );
+        prom_counter(
+            &mut out,
+            "teraslab_orphan_cleanup_proof_oversized_total",
+            mm.orphan_cleanup_proof_oversized.get(),
+        );
         // W10 composition review P1 — the reverse-heal live-recency confirm
         // runs synchronously on the coordinator event loop and pays one
         // filtered index walk per round, so its rate, admitted volume,
