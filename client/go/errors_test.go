@@ -116,14 +116,23 @@ func TestErrorCodeStringAll(t *testing.T) {
 }
 
 func TestIsRetryableErrorCode(t *testing.T) {
-	retryable := []uint16{ErrCodeMigrationInProgress, ErrCodeStaleEpoch, ErrCodeReplicationFailed}
+	// W12 TAIL 1 — ErrCodeNoQuorum moved into the retryable set: the server
+	// documents a back-off-and-retry recovery at every site that emits it, and
+	// the windows behind it (a shard table lagging the committed term; a
+	// redirect whose master address is not yet known) close by WAITING.
+	// Pinning it as NOT retryable made CI assert the opposite of the server
+	// contract while a scale-up turned a ~100-195ms window into hard errors.
+	retryable := []uint16{
+		ErrCodeMigrationInProgress, ErrCodeStaleEpoch, ErrCodeReplicationFailed,
+		ErrCodeNoQuorum,
+	}
 	for _, code := range retryable {
 		if !isRetryableErrorCode(code) {
 			t.Errorf("isRetryableErrorCode(%s) = false, want true", ErrorCodeString(code))
 		}
 	}
 	notRetryable := []uint16{
-		ErrCodeOK, ErrCodeTxNotFound, ErrCodeRedirect, ErrCodeNoQuorum,
+		ErrCodeOK, ErrCodeTxNotFound, ErrCodeRedirect,
 		ErrCodeConflicting, ErrCodeClusterNotReady, ErrCodeInternal,
 	}
 	for _, code := range notRetryable {

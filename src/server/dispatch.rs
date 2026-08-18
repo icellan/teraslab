@@ -2457,11 +2457,17 @@ pub(crate) fn handle_request(
             // initiates NOR honours it, so disabling the flag is a complete
             // local rollback of the mechanism (its tombstones keep vetoing).
             if !cluster.weak_veto_arbitration_enabled() {
+                // W12 review P2-5 — this message is matched verbatim by
+                // `weak_veto_arbitration_disarmed_refusal` so the source
+                // treats it as OPERATOR-TRANSIENT rather than structural: a
+                // rolling rollback of the flag must leave a still-armed
+                // source behaving pre-W10 (retryable historical path), not
+                // terminally aborting and retiring every handoff it aims at
+                // an already-rolled-back target. Keep the two in step.
                 return error_response(
                     request.request_id,
                     ERR_INVARIANT_VIOLATION,
-                    "weak-veto arbitration is disabled on this node \
-                     (migration_weak_veto_arbitration_enabled=false)",
+                    crate::cluster::coordinator::WEAK_VETO_ARBITRATION_DISARMED_MSG,
                 );
             }
             let (Some(shard), Some(from_node), Some(migration_epoch), Some(key_count)) = (
@@ -28710,6 +28716,138 @@ mod tests {
             h.engine.tombstone_cause(&key_k),
             Some(crate::ops::tombstone::TombstoneCause::PruneReplace),
             "the weak tombstone is untouched without the fence proof",
+        );
+    }
+
+    /// W12 TAIL 3 cross-module contract — the REAL arbitration refusal, sent
+    /// through the REAL error envelope, must be recognised as TERMINAL by
+    /// `weak_veto_arbitration_terminally_refused`, while a STALE-EPOCH
+    /// refusal from the same handler must NOT be.
+    ///
+    /// The source-side escalation decides whether to terminally abort a
+    /// handoff on the strength of this string. Armed scenario 09 @ fc5e5f7
+    /// re-drove the same doomed handshake for shards 1563/3957 every ~12 s
+    /// because nothing classified the refusal at all; pinning the producer,
+    /// the envelope and the parser together here is what keeps that
+    /// classification from silently drifting back to "unrecognised".
+    #[test]
+    fn weak_veto_authority_refusal_is_recognised_by_the_terminal_parser() {
+        use crate::cluster::coordinator::{
+            encode_weak_veto_arbitration_payload, weak_veto_arbitration_rejection_error,
+            weak_veto_arbitration_terminally_refused,
+        };
+
+        let h = DispatchTestHarness::new();
+        let epoch = 61u64;
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+        ];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|s| table.target_assignment(*s).master == crate::cluster::shards::NodeId(1))
+            .expect("some shard is mastered by node 1");
+        let key_k = TxKey {
+            txid: txid_for_shard(shard, 7),
+        };
+        let tomb_log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/w12-arbitration-authority.tombstones"),
+            h.engine.index_seed(),
+            h.engine.index_shard_count(),
+            10_000,
+        );
+        tomb_log.record(
+            &key_k,
+            0,
+            900,
+            crate::ops::tombstone::TombstoneCause::PruneReplace,
+        );
+        h.engine.set_tombstone_log(tomb_log);
+
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(2),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4762".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            2,
+        );
+        // Fence proof present, so the refusal below is the AUTHORITY gate.
+        cluster.register_inbound_source(shard, crate::cluster::shards::NodeId(2));
+
+        let send = |from: u64, ep: u64| {
+            let req = RequestFrame {
+                request_id: shard as u64,
+                op_code: OP_MIGRATION_WEAK_VETO_ARBITRATE,
+                flags: 0,
+                payload: encode_weak_veto_arbitration_payload(
+                    shard,
+                    crate::cluster::shards::NodeId(from),
+                    ep,
+                    &[key_k],
+                )
+                .into(),
+            };
+            let mut cs = crate::server::ConnectionState::new();
+            handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None)
+        };
+        // W12 review P2-6 — the REAL producer `send_weak_veto_arbitration`
+        // applies to every non-OK response, not a hand-composed equivalent.
+        let as_source_sees_it = |resp: &ResponseFrame| {
+            weak_veto_arbitration_rejection_error(resp.status, &resp.payload)
+        };
+
+        // Node 2 is NOT the shard's master: the authority gate refuses. This
+        // is the armed-09 phantom-source shape.
+        let refused = send(2, epoch);
+        assert_ne!(refused.status, STATUS_OK);
+        let seen = as_source_sees_it(&refused);
+        assert!(
+            seen.contains("is not shard") && seen.contains("authoritative holder"),
+            "the real handler must still emit the authority-refusal wording: {seen}",
+        );
+        assert!(
+            weak_veto_arbitration_terminally_refused(&seen),
+            "the source's escalation must classify this as terminal, or the \
+             handoff re-drives the identical doomed handshake forever: {seen}",
+        );
+
+        // A stale epoch is a DIFFERENT class: the epoch-current re-drive
+        // resolves it, so it must stay retryable.
+        let stale = send(1, epoch + 1);
+        assert_ne!(stale.status, STATUS_OK);
+        let stale_seen = as_source_sees_it(&stale);
+        assert!(
+            !weak_veto_arbitration_terminally_refused(&stale_seen),
+            "a stale-epoch refusal must NOT terminally abort the handoff: {stale_seen}",
+        );
+
+        // W12 review P2-5 — the DISARMED refusal carries the same code-33
+        // envelope but is an operator toggle, so it must also stay retryable.
+        // Driven through the real handler so the message this depends on
+        // cannot drift away from the classifier.
+        cluster.set_test_weak_veto_arbitration_enabled(false);
+        let disarmed = send(1, epoch);
+        assert_ne!(disarmed.status, STATUS_OK);
+        let disarmed_seen = as_source_sees_it(&disarmed);
+        assert!(
+            disarmed_seen.contains("migration_weak_veto_arbitration_enabled=false"),
+            "the real handler must still emit the disarmed wording: {disarmed_seen}",
+        );
+        assert!(
+            !weak_veto_arbitration_terminally_refused(&disarmed_seen),
+            "a rolling rollback of the flag must not shed handoffs terminally: {disarmed_seen}",
+        );
+
+        assert_eq!(
+            h.engine.tombstone_cause(&key_k),
+            Some(crate::ops::tombstone::TombstoneCause::PruneReplace),
+            "no refused attempt may clear the weak tombstone",
         );
     }
 

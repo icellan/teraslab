@@ -74,6 +74,7 @@ func TestClassifyRetry(t *testing.T) {
 		{"stale epoch backoff", &ServerError{Code: ErrCodeStaleEpoch}, retryBackoff},
 		{"replication backoff", &ServerError{Code: ErrCodeReplicationFailed}, retryBackoff},
 		{"no quorum refresh", &ServerError{Code: ErrCodeNoQuorum}, retryRefresh},
+		{"partial no quorum backoff", &PartialError{Errors: []BatchItemError{{Code: ErrCodeNoQuorum}}}, retryBackoff},
 		{"conflicting none", &ServerError{Code: ErrCodeConflicting}, retryNone},
 		{"stale redirect refresh", &StaleRedirectError{Addr: "x"}, retryRefresh},
 		{
@@ -98,7 +99,8 @@ func TestClassifyRetry(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := classifyRetry(tc.err); got != tc.want {
+			// refreshesLeft = true: these cases assert the first-response verdict.
+			if got := classifyRetry(tc.err, true); got != tc.want {
 				t.Fatalf("classifyRetry = %d, want %d", got, tc.want)
 			}
 		})

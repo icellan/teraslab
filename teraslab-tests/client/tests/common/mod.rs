@@ -496,6 +496,38 @@ pub async fn wait_specific_nodes_alive(
     }
 }
 
+/// W12 TAIL 2 — the entries a node's `/admin/migration_status` reports as
+/// TERMINALLY REFUSED by their own source and retained only as a fail-closed
+/// fence over local orphan records.
+///
+/// Zero for a server that predates the field, which is the fail-closed
+/// reading: an answer that cannot express the distinction is treated as
+/// "everything is potentially in flight".
+pub fn refused_retained_inbound(json: &serde_json::Value) -> u64 {
+    json["inbound_refused_retained"].as_u64().unwrap_or(0)
+}
+
+/// W12 TAIL 2 — the inbound entries that can still make progress.
+///
+/// `inbound_pending` counts two opposite things. A plain pending entry is
+/// waiting on data that a source is sending. A `refused_by_source` entry has
+/// been answered `ERR_MIGRATION_NO_TASKS` by the only node that could ever
+/// satisfy it and was RETAINED by `inbound_entry_must_be_kept` because the
+/// shard still has local records — records only the committed-handoff-gated
+/// orphan cleanup may reclaim. The second kind is a fixpoint: re-polling it
+/// for 300 s produces the identical answer 300 s later (armed scenario 08 @
+/// fc5e5f7: `dropped:0, kept:2` on all 29 refusal rounds).
+///
+/// A convergence gate asks "is a migration still running?", so it must use
+/// this. It must NOT be read as "the condition is fine" — the count is
+/// reported in the per-node detail and in the timeout message, and the
+/// server publishes it as the `teraslab_migration_inbound_refused_retained`
+/// gauge.
+pub fn in_flight_inbound_pending(json: &serde_json::Value) -> u64 {
+    let pending = json["inbound_pending"].as_u64().unwrap_or(0);
+    pending.saturating_sub(refused_retained_inbound(json))
+}
+
 /// Wait until migrations complete on specific nodes (by node number).
 pub async fn wait_specific_migrations_complete(
     docker: &DockerHelpers,
@@ -516,8 +548,14 @@ pub async fn wait_specific_migrations_complete(
             let mut active_count = None;
             let mut inbound_pending = 0u64;
             if let Ok(json) = poll_json(&url).await {
-                inbound_pending = json["inbound_pending"].as_u64().unwrap_or(0);
+                // W12 TAIL 2 — only entries that can still progress hold the
+                // gate; terminally-refused ones are reported below.
+                inbound_pending = in_flight_inbound_pending(&json);
+                let refused = refused_retained_inbound(&json);
                 total_inbound_pending += inbound_pending;
+                if refused > 0 {
+                    status_details.push(format!("node{n}:inbound-refused-retained={refused}"));
+                }
                 if let Some(count) = json["active_count"].as_u64() {
                     active_count = Some(count);
                     if count > 0 {
@@ -874,7 +912,12 @@ pub async fn wait_migrations_complete(
             let port = docker.http_port(i);
             let url = format!("http://127.0.0.1:{port}/admin/migration_status");
             if let Ok(json) = poll_json(&url).await {
-                let inbound_pending = json["inbound_pending"].as_u64().unwrap_or(0);
+                // W12 TAIL 2 — an entry whose source terminally refused it is
+                // a fixpoint, not migration work: it is discounted from the
+                // gate and reported separately (see
+                // `in_flight_inbound_pending`).
+                let inbound_pending = in_flight_inbound_pending(&json);
+                let refused = refused_retained_inbound(&json);
                 total_inbound_pending += inbound_pending;
                 if let Some(count) = json["active_count"].as_u64()
                     && count > 0
@@ -884,6 +927,9 @@ pub async fn wait_migrations_complete(
                 }
                 if inbound_pending > 0 {
                     node_details.push(format!("node{i}:inbound={inbound_pending}"));
+                }
+                if refused > 0 {
+                    node_details.push(format!("node{i}:inbound-refused-retained={refused}"));
                 }
             } else {
                 node_details.push(format!("node{i}:migration-status-unavailable"));
@@ -3388,6 +3434,80 @@ async fn wait_ports_free(first_http_port: u16, _scenario_id: u16, node_count: u3
 #[cfg(test)]
 mod migration_gate_tests {
     use super::*;
+
+    /// W12 TAIL 2 — an inbound entry whose SOURCE has terminally refused it
+    /// is not migration work, and must not hold the convergence gate.
+    ///
+    /// The two shapes are indistinguishable in `inbound_pending` alone but
+    /// they are opposites. A plain entry is waiting for data that is on its
+    /// way. A `refused_by_source` entry has been answered
+    /// `ERR_MIGRATION_NO_TASKS` by the only node that could satisfy it and
+    /// was retained purely as a fail-closed fence over local orphan records
+    /// (`inbound_entry_must_be_kept`) — records that only the
+    /// committed-handoff-gated orphan cleanup may reclaim. Nothing about it
+    /// changes with time.
+    ///
+    /// Armed scenario 08 @ fc5e5f7 proves the cost of conflating them: node1
+    /// held two, re-sent the transfer request 29 times on the 10 s cadence,
+    /// was refused all 29 times, and the gate burned its full 300 s budget
+    /// even though `masters=4096/4096, handoffs=0, activation=ok` on the
+    /// first poll. This is NOT a licence to ignore them — the count is still
+    /// reported in the per-node detail and in the timeout message, and the
+    /// server gauges it as `teraslab_migration_inbound_refused_retained`.
+    #[test]
+    fn a_terminally_refused_inbound_entry_does_not_hold_the_gate() {
+        let refused = serde_json::json!({
+            "active_count": 0,
+            "failed_count": 0,
+            "fenced_shards": 0,
+            "inbound_pending": 2,
+            "inbound_refused_retained": 2,
+        });
+        assert_eq!(
+            in_flight_inbound_pending(&refused),
+            0,
+            "two entries their source terminally refused are a fixpoint, not \
+             migration work in flight",
+        );
+        assert_eq!(
+            refused_retained_inbound(&refused),
+            2,
+            "the condition must still be reported, not silently dropped",
+        );
+
+        // A genuinely in-flight transfer still holds the gate.
+        let live = serde_json::json!({
+            "inbound_pending": 3,
+            "inbound_refused_retained": 0,
+        });
+        assert_eq!(in_flight_inbound_pending(&live), 3);
+
+        // Mixed: only the refused subset is discounted.
+        let mixed = serde_json::json!({
+            "inbound_pending": 5,
+            "inbound_refused_retained": 2,
+        });
+        assert_eq!(in_flight_inbound_pending(&mixed), 3);
+
+        // A pre-W12 server omits the field entirely: fall back to the
+        // fail-closed reading (every entry counts), never to zero.
+        let legacy = serde_json::json!({ "inbound_pending": 4 });
+        assert_eq!(
+            in_flight_inbound_pending(&legacy),
+            4,
+            "a server that cannot report the distinction must keep holding \
+             the gate on every entry",
+        );
+        assert_eq!(refused_retained_inbound(&legacy), 0);
+
+        // A nonsense payload (refused > pending) must not underflow into a
+        // huge number and it must not report negative progress.
+        let inconsistent = serde_json::json!({
+            "inbound_pending": 1,
+            "inbound_refused_retained": 9,
+        });
+        assert_eq!(in_flight_inbound_pending(&inconsistent), 0);
+    }
 
     /// Task #75 — a degraded `/status` payload renders the wedge
     /// fingerprint, and its missing shard fields keep parsing exactly like

@@ -278,6 +278,13 @@ pub struct ClientConfig {
     ///
     /// Applies to every `round_trip` on a pooled connection. Lower it for
     /// latency-sensitive callers; raise it for slow links.
+    ///
+    /// **This is NOT a whole-operation deadline.** A cluster mutation that
+    /// keeps meeting a transient server code walks the bounded retry ladder,
+    /// which costs ~31 s of backoff plus up to one dial timeout per
+    /// routing refresh — on the order of 31-100 s in a partition. See
+    /// `is_retryable_error_code` for the full accounting. Callers needing a
+    /// hard ceiling must wrap the call (e.g. `tokio::time::timeout`).
     pub request_timeout: Duration,
     /// Cold-data size (in bytes) strictly above which `create_batch`
     /// pre-uploads the data to the external blob store via chunked streaming
@@ -1625,10 +1632,14 @@ impl Client {
                     let _ = self.refresh_routing().await;
                     continue;
                 }
-                // Retryable-transient arm. Every per-item error must be
-                // a transient code (ERR_MIGRATION_IN_PROGRESS or
-                // ERR_STALE_EPOCH) — both are same-target retryable;
-                // ERR_REDIRECT is handled by the dedicated arm below.
+                // Retryable-transient arm. Every per-item error must be a
+                // transient code per `is_retryable_error_code` — all of
+                // them same-target retryable; ERR_REDIRECT is handled by
+                // the dedicated arm below. This arm (not the attempt-0
+                // catch-all further down) is what gives a transient batch
+                // a BACKED-OFF retry: the catch-all re-issues with zero
+                // delay, which cannot outlast a window measured in tens or
+                // hundreds of milliseconds.
                 Err(ClientError::Partial(pe))
                     if pe.errors.len() == items.len()
                         && all_errors_are_retryable(&pe.errors)
@@ -3569,14 +3580,69 @@ fn all_errors_have_code(errors: &[BatchItemError], code: u16) -> bool {
 ///   section). The write may now be durable on master, replicas, both, or
 ///   neither; the server's compensation machinery converges the state, and
 ///   the prescribed client recovery is to re-issue the identical idempotent
-///   op. Because all TeraSlab mutations are idempotent by txid/op semantics
-///   (re-spending an already-spent output, re-mining an already-mined tx,
-///   re-creating an existing record, etc. converge to the same state), a
-///   bounded same-target retry is safe and is the documented recovery path.
+///   op. A bounded same-target retry is safe for it because re-applying the
+///   mutation converges to the same state (re-spending an already-spent
+///   output, re-mining an already-mined tx). Note the retry is
+///   OUTCOME-preserving, not silent: re-creating a record that did land
+///   answers `ERR_ALREADY_EXISTS`, which the caller must expect and treat as
+///   "the first attempt succeeded" rather than as a new failure.
+/// - [`ERR_NO_QUORUM`] — the target cannot name a master for the key
+///   *right now*. The server emits it from three sites and calls it
+///   retryable at every one: the `NodeId(0)` unassigned sentinel returned
+///   for every shard while the local table lags the committed term (W11
+///   FIX 3, narrowed only by the operator opt-in
+///   `stale_table_partial_serving`), and the read/write F-4 paths that turn
+///   a redirect with an unknown master address into "retryable
+///   ERR_NO_QUORUM instead of empty redirect". Both windows are closed by
+///   waiting — the table activates after the exchange phase, membership
+///   converges — and the retry loop refreshes routing between attempts,
+///   which is precisely the prescribed recovery. Retrying is also safe for
+///   the fourth shape, a genuine loss of majority (`check_quorum`): the
+///   node simply keeps refusing and the bounded budget returns the same
+///   code to the caller. Retry safety here does not rest on the
+///   idempotency argument above at all — every site that emits code 15
+///   refuses BEFORE applying anything, so a re-issue cannot double-apply
+///   regardless of the operation.
+///
+///   W12 TAIL 1 — omitting this code cost real availability. The
+///   all-items-failed partial arm of [`Client::send_item_batch_cluster`]
+///   grants exactly ONE retry with NO backoff, so a code-15 batch
+///   re-issued inside the very same activation window and then fell through
+///   to the terminal arm. CI @ fc5e5f7 scenario 06 measured that window at
+///   100-195 ms across the three incumbents of a 3->4 scale-up and the
+///   workload recorded 13/347 (default) and 14/247 (armed) hard errors from
+///   it.
+///
+/// # Worst-case latency (W12 review P2-1) — read before raising the ladder
+///
+/// A call that keeps hitting a retryable code walks the WHOLE ladder before
+/// surfacing. [`TRANSIENT_MUTATION_RETRY_DELAYS_MS`] sums to **31,385 ms**,
+/// but that is a FLOOR, not the bound: each of the 14 retries also calls
+/// `refresh_routing`, whose poll joins EVERY pool's task, so a refresh costs
+/// up to one dial timeout (`PoolConfig::dial_timeout`, 5 s by default)
+/// whenever any cached peer is unreachable — the common partition shape.
+/// Realistic worst case is therefore roughly **31 s to 100 s**, and there is
+/// no total-operation deadline: `request_timeout` bounds a single round trip
+/// only. Callers that need a hard ceiling must impose their own (e.g.
+/// `tokio::time::timeout` around the call).
+///
+/// Adding `ERR_NO_QUORUM` widened who pays that. The attempt-0 zero-delay
+/// special case for a global code 15 exists only in
+/// [`Client::send_item_batch_cluster`]; the three other loops that share this
+/// predicate (`send_txid_batch_signals_cluster`, `send_txid_batch_cluster`,
+/// `spend_batch_cluster` — i.e. spend / set_mined / delete /
+/// mark_longest_chain) previously returned a global code 15 after ONE round
+/// trip and now walk the ladder. In a minority partition, or against a node
+/// permanently below the committed term with partial serving off, that is
+/// pure added latency with no chance of success.
+///
+/// The ladder also has NO jitter, so clients that fail together re-issue in
+/// lockstep. Both are known trade-offs of keeping ONE uniform policy rather
+/// than a per-code ladder; revisit together if either bites.
 pub(crate) fn is_retryable_error_code(code: u16) -> bool {
     matches!(
         code,
-        ERR_MIGRATION_IN_PROGRESS | ERR_STALE_EPOCH | ERR_REPLICATION_FAILED
+        ERR_MIGRATION_IN_PROGRESS | ERR_STALE_EPOCH | ERR_REPLICATION_FAILED | ERR_NO_QUORUM
     )
 }
 
@@ -4014,6 +4080,125 @@ mod tests {
         shutdown_node(&node1);
     }
 
+    /// W12 TAIL 1 regression — the client must ride out the post-commit
+    /// window in which a node's activated shard table still lags the
+    /// quorum-committed term.
+    ///
+    /// In that window `RunningCluster::route` returns the `NodeId(0)`
+    /// unassigned sentinel for EVERY key (W11 FIX 3; narrowing it is the
+    /// operator opt-in `stale_table_partial_serving`, default OFF), the
+    /// dispatcher has no address for `NodeId(0)`, and every mutation comes
+    /// back as a per-item `ERR_NO_QUORUM` — a code the server documents as
+    /// "back off and retry". CI @ fc5e5f7 measured the window at 100-195 ms
+    /// on the three incumbents of a 3->4 scale-up, and the client turned it
+    /// into 13/347 (default) and 14/247 (armed) hard errors: the
+    /// all-items-failed partial arm gave it exactly ONE retry with NO
+    /// backoff, which re-issues inside the same window.
+    ///
+    /// The window is reproduced here by pushing node1's table version below
+    /// its committed term (the production shape) and restoring it after
+    /// 150 ms. Node2's map stays at the committed version, so the client's
+    /// routing refresh keeps pointing the shard at node1 and the retries
+    /// land on the node that is actually in the window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn create_batch_rides_out_a_stale_table_no_quorum_window() {
+        let tcp1 = reserve_tcp_port();
+        let tcp2 = reserve_tcp_port();
+        let swim1 = reserve_udp_port();
+        let swim2 = reserve_udp_port();
+
+        let node1 = create_node_with_rf(1, tcp1, swim1, &[], 1);
+        let node2 = create_node_with_rf(2, tcp2, swim2, &[swim1], 1);
+
+        // Precondition: a quorum commit has landed, so there is a committed
+        // term to lag behind. Until the first commit the term is 0 and the
+        // stale-table branch is unreachable. POLLED, not slept: a fixed sleep
+        // makes the precondition a timing bet that turns a slow machine into a
+        // confusing assertion failure rather than a wait.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let committed = loop {
+            let term = node1.cluster.local_cluster_key();
+            if term >= 1 {
+                break term;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test precondition: node1 never observed a quorum-committed \
+                 term to lag behind within 20s"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+
+        let original = node1.cluster.shard_table().read().clone();
+        assert!(
+            original.version >= committed,
+            "test precondition: node1's table must start caught up (version \
+             {} vs committed {committed})",
+            original.version,
+        );
+        // A shard node1 masters, so the client routes it to the node whose
+        // table we are about to stale.
+        let shard = (0..teraslab::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| original.target_assignment(s).master == NodeId(1))
+            .expect("node1 must master at least one shard");
+
+        let client = Client::new(ClientConfig {
+            seeds: vec![format!("127.0.0.1:{tcp1}"), format!("127.0.0.1:{tcp2}")],
+            cluster_refresh_interval: Duration::from_secs(3600),
+            ..Default::default()
+        })
+        .await
+        .expect("client should bootstrap from the cluster");
+
+        // Open the window: node1's table now lags its committed term, so it
+        // answers every key with the NodeId(0) sentinel -> ERR_NO_QUORUM.
+        {
+            let mut stale = original.clone();
+            stale.version = committed - 1;
+            *node1.cluster.shard_table().write() = stale;
+        }
+        let restore_table = node1.cluster.shard_table();
+        let restore_to = original.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            *restore_table.write() = restore_to;
+        });
+
+        let item = CreateItem {
+            txid: txid_for_shard(shard),
+            utxo_hashes: vec![[0x15; 32]],
+            tx_version: 1,
+            locktime: 0,
+            fee: 100,
+            size_in_bytes: 100,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1710000000000,
+            flags: 0,
+            cold_data: vec![],
+            mined_block_id: None,
+            mined_block_height: None,
+            mined_subtree_idx: None,
+            parent_txids: vec![],
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(5), client.create_batch(&[item]))
+            .await
+            .expect("create_batch should not hang");
+
+        assert!(
+            result.is_ok(),
+            "client must back off and retry ERR_NO_QUORUM until the stale-table \
+             window closes — this is the window that produced 13/347 and 14/247 \
+             scale-up errors: {result:?}"
+        );
+
+        client.close().await;
+        shutdown_node(&node1);
+        shutdown_node(&node2);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn set_mined_batch_retries_transient_until_fence_clears() {
         // Exercises the bounded transient-retry loop wrapping
@@ -4289,6 +4474,58 @@ mod tests {
              the prescribed recovery"
         );
         assert_eq!(ERR_REPLICATION_FAILED, 20, "code under contract is 20");
+    }
+
+    #[test]
+    fn no_quorum_is_retryable() {
+        // W12 TAIL 1. The server emits ERR_NO_QUORUM (15) from three sites
+        // and labels it retryable at every one of them:
+        //
+        //   * `authoritative_master_for_shard` returns the `NodeId(0)`
+        //     unassigned sentinel for EVERY shard while the local table
+        //     lags the committed term (W11 FIX 3, `stale_table_partial_
+        //     serving` default OFF), and `route` turns that into a
+        //     sentinel redirect;
+        //   * the write path (`check_shard_ownership`) and the read path
+        //     both convert a redirect whose master address is unknown into
+        //     "retryable ERR_NO_QUORUM instead of empty redirect" (F-4).
+        //
+        // Both windows close on their own in well under a second — CI @
+        // fc5e5f7 scenario 06 measured 100 ms (node2/node3) to 195 ms
+        // (node1) between `topology committed term=2` and `activating
+        // topology after exchange phase`. Omitting code 15 here left the
+        // all-items-failed partial arm of `send_item_batch_cluster` with
+        // its single ZERO-DELAY retry, which re-issues inside the same
+        // window and then falls through to the terminal arm: 13/347 and
+        // 14/247 hard client errors across a 3->4 scale-up that the server
+        // had told the client to simply back off and retry.
+        assert!(
+            is_retryable_error_code(ERR_NO_QUORUM),
+            "ERR_NO_QUORUM must be classified as retryable: every server site \
+             that emits it documents a back-off-and-retry recovery, and the \
+             retry loop refreshes routing between attempts — which is exactly \
+             the recovery for both the stale-table and unknown-master-address \
+             windows"
+        );
+        assert_eq!(ERR_NO_QUORUM, 15, "code under contract is 15");
+    }
+
+    #[test]
+    fn all_errors_are_retryable_accepts_no_quorum_batch() {
+        // The scale-up workload issues 1-item create batches, so the
+        // observed failure shape is a `Partial` whose single item carries
+        // code 15. That is the arm that must take the backed-off retry.
+        let errors = vec![BatchItemError {
+            item_index: 0,
+            code: ERR_NO_QUORUM,
+            data: vec![],
+        }];
+        assert!(
+            all_errors_are_retryable(&errors),
+            "a batch where every item failed with ERR_NO_QUORUM must be retried \
+             as a whole — this is the exact shape scenario 06 produced during \
+             the post-commit table-activation window"
+        );
     }
 
     #[test]

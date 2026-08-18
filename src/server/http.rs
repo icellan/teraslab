@@ -1492,6 +1492,11 @@ pub(crate) fn render_metrics_text(
         );
         prom_counter(
             &mut out,
+            "teraslab_migration_weak_veto_arbitration_refused_total",
+            mm.migration_weak_veto_arbitration_refused.get(),
+        );
+        prom_counter(
+            &mut out,
             "teraslab_migration_prune_weak_declared_retained_total",
             mm.migration_prune_weak_declared_retained.get(),
         );
@@ -1509,6 +1514,12 @@ pub(crate) fn render_metrics_text(
             &mut out,
             "teraslab_migration_dangling_inbound_dropped_total",
             mm.migration_dangling_inbound_dropped.get(),
+        );
+        prom_gauge(
+            &mut out,
+            "teraslab_migration_inbound_refused_retained",
+            mm.migration_inbound_refused_retained
+                .load(Ordering::Relaxed) as u64,
         );
         prom_gauge(
             &mut out,
@@ -2465,9 +2476,24 @@ async fn handle_admin_migration_status(State(state): State<Arc<HttpState>>) -> i
     match state.cluster {
         Some(ref cluster) => {
             let migrations = cluster.migration_status();
-            let inbound = cluster.inbound_pending_count();
-            let inbound_entries = cluster.pending_inbound_entries();
-            let fenced = cluster.fenced_shard_count();
+            // W12 TAIL 2 — an inbound entry whose source has TERMINALLY
+            // refused it (ERR_MIGRATION_NO_TASKS) and which the fail-closed
+            // record guard retained as an ORPHAN fence is NOT a transfer in
+            // flight; it is a fixpoint held open by records only the
+            // committed-handoff-gated orphan cleanup can reclaim. Reported
+            // separately so "is a migration still running?" and "is anything
+            // stuck?" stop being the same question — armed scenario 08 @
+            // fc5e5f7 spent 300 s waiting on two of these because the status
+            // could not tell them apart from live inbound work.
+            //
+            // W12 review NIT — ONE snapshot under a single migration lock, so
+            // the four numbers below cannot straddle a concurrent refusal and
+            // render an impossible state (refused > pending).
+            let inbound_snapshot = cluster.inbound_status_snapshot();
+            let inbound = inbound_snapshot.pending_count;
+            let inbound_entries = &inbound_snapshot.entries;
+            let refused_retained = &inbound_snapshot.refused_retained;
+            let fenced = inbound_snapshot.fenced_count;
             let active_count = migrations
                 .iter()
                 .filter(|m| {
@@ -2487,8 +2513,10 @@ async fn handle_admin_migration_status(State(state): State<Arc<HttpState>>) -> i
                     serde_json::json!({
                         "shard": shard,
                         "from_node": from_node.0,
+                        "refused_by_source": refused_retained.contains(&(*shard, *from_node)),
                     })
                 }).collect::<Vec<_>>(),
+                "inbound_refused_retained": refused_retained.len(),
                 "fenced_shards": fenced,
                 "migrations": migrations.iter().map(|m| {
                     serde_json::json!({
@@ -5552,10 +5580,12 @@ mod tests {
             "teraslab_replica_abort_forced_resyncs_total",
             "teraslab_migration_completion_manifest_reduced_vetoed_total",
             "teraslab_migration_weak_veto_arbitrations_total",
+            "teraslab_migration_weak_veto_arbitration_refused_total",
             "teraslab_migration_prune_weak_declared_retained_total",
             "teraslab_migration_prune_skipped_cutoff_gate_total",
             "teraslab_migration_transfer_request_refused_total",
             "teraslab_migration_dangling_inbound_dropped_total",
+            "teraslab_migration_inbound_refused_retained",
             "teraslab_orphan_cleanup_skipped_pending_inbound",
             "teraslab_orphan_cleanup_shard_skipped_total",
             "teraslab_topology_proposal_revalidation_emptied_total",

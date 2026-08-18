@@ -364,6 +364,27 @@ struct InboundMigration {
     /// entry as plain-pending (still fenced); the GC re-marks it lost after
     /// the next idle window — the fence is what matters and it survives.
     lost: bool,
+    /// W12 TAIL 2 — set when [`MigrationManager::drop_refused_inbound`] was
+    /// told by this entry's own `from_node` that it will NEVER satisfy the
+    /// entry (`ERR_MIGRATION_NO_TASKS`) but the fail-closed guard
+    /// (`inbound_entry_must_be_kept`) RETAINED it anyway, because the shard
+    /// still has local records that would become readable on a non-holder if
+    /// the fence came down.
+    ///
+    /// Such an entry is a fixpoint, not a transfer: the source has closed the
+    /// only channel that could complete it, and the records can only be
+    /// reclaimed by the (committed-handoff-gated) orphan cleanup. Armed
+    /// scenario 08 @ fc5e5f7 held two of them for 300 s while `inbound_pending`
+    /// reported them as live migration work. The mark exists so status,
+    /// metrics and the log can name the condition for what it is instead of
+    /// hiding it inside a count that means "data on its way".
+    ///
+    /// Cleared wherever `lost` is cleared for a RE-REGISTRATION (a fresh
+    /// expectation of a real transfer for the same shard/source). Not
+    /// serialized: like `transfer_requested_at` this is process-local, and the
+    /// refusal round that produced it re-derives it within one
+    /// `TRANSFER_REQUEST_INTERVAL` after a restart.
+    refused_by_source: bool,
     /// P0 (reverse-heal Phase 2c) — the no-serve-before-heal FENCE marker.
     ///
     /// Set when this inbound entry represents a boot reverse-heal PULL
@@ -405,6 +426,57 @@ struct InboundMigration {
     heal_started_at: Option<std::time::Instant>,
 }
 
+/// W12 TAIL 2 — WHY a pending inbound entry is (or is not) retained by the
+/// fail-closed judgement `inbound_entry_retention`.
+///
+/// The two KEEP arms were a single `bool` and that conflation is a defect:
+/// they are opposite states that happen to share a disposition.
+///
+/// * [`Self::KeepHolder`] — this node IS the shard's target holder. The
+///   inbound is LEGITIMATE, satisfiable work. A source can still refuse it
+///   spuriously: `terminally_abort_unshippable_task` rewrites the source's
+///   `assignments[shard]` WITHOUT bumping the table version, so the source
+///   judges holder-ness against a diverged table while both sides' epoch
+///   checks pass, and answers `ERR_MIGRATION_NO_TASKS`. The re-heal machinery
+///   re-plans that handoff on a later round, so the entry must keep counting
+///   as in-flight work.
+/// * [`Self::KeepOrphan`] — this node is NOT a holder but still carries
+///   records for the shard. Dropping the fence would expose those orphans to
+///   local reads (a record readable on a non-holder counts as an extra
+///   holder — the scenario-17 three-holder bug). This is the armed-08 shape:
+///   nothing will ever be sent and only the committed-handoff-gated orphan
+///   cleanup can remove what holds the fence up.
+/// * [`Self::Drop`] — a non-holder with zero local records: the
+///   stranded-forever case. Nothing will be sent and nothing is hidden.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundRetention {
+    Drop,
+    KeepHolder,
+    KeepOrphan,
+}
+
+impl InboundRetention {
+    /// Whether this judgement retains the entry (either KEEP arm).
+    pub fn keeps(self) -> bool {
+        !matches!(self, Self::Drop)
+    }
+}
+
+/// W12 TAIL 2 — what one [`MigrationManager::drop_refused_inbound`] call did,
+/// scoped to THAT refusal (source + named shards).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedInboundOutcome {
+    /// Entries retired because nothing will be sent and nothing is hidden.
+    pub dropped: usize,
+    /// Shards retained because THIS NODE IS THE TARGET HOLDER — satisfiable
+    /// work a later re-heal round can still complete. NOT marked refused.
+    pub kept_holder: Vec<u16>,
+    /// Shards retained because local orphan records would otherwise become
+    /// readable on a non-holder. Marked
+    /// [`InboundMigration::refused_by_source`].
+    pub kept_orphan: Vec<u16>,
+}
+
 impl InboundMigration {
     /// A freshly-registered, not-yet-received inbound entry (fence up, not
     /// completed, no outstanding transfer request, not lost, not heal-pending).
@@ -415,6 +487,7 @@ impl InboundMigration {
             completed: false,
             transfer_requested_at: None,
             lost: false,
+            refused_by_source: false,
             heal_pending: false,
             heal_started_at: None,
         }
@@ -1046,6 +1119,10 @@ impl MigrationManager {
                     .filter(|m| m.shard == task.shard)
                 {
                     m.lost = false;
+                    // W12 TAIL 2 — a task is being registered for the shard,
+                    // so a previously terminally-refused entry is back in
+                    // flight and must re-enter the in-flight count.
+                    m.refused_by_source = false;
                 }
                 if let Some(existing) = self
                     .inbound_migrations
@@ -1082,7 +1159,21 @@ impl MigrationManager {
     /// Since we may not know the source node at dispatch time, register
     /// with `NodeId(0)` as a sentinel if no existing entry matches.
     pub fn mark_inbound_active(&mut self, shard: u16) -> bool {
-        if self.inbound_migrations.iter().any(|m| m.shard == shard) {
+        // W12 TAIL 2 — records are arriving for this shard, so any entry
+        // previously marked as terminally refused is live again and must
+        // re-enter the in-flight count. Done BEFORE the early return: this
+        // path no-ops on an existing entry, and leaving the mark set would
+        // exclude a shard that is actually receiving.
+        let mut existed = false;
+        for m in self
+            .inbound_migrations
+            .iter_mut()
+            .filter(|m| m.shard == shard)
+        {
+            existed = true;
+            m.refused_by_source = false;
+        }
+        if existed {
             return false;
         }
         self.inbound_migrations
@@ -1121,6 +1212,10 @@ impl MigrationManager {
             // the incoming re-home completes it, rather than leaving it stuck
             // as unavailable.
             existing.lost = false;
+            // W12 TAIL 2 — a fresh registration is a fresh expectation of a
+            // real transfer, so the previous terminal refusal no longer
+            // describes this entry.
+            existing.refused_by_source = false;
             return false;
         }
         self.inbound_migrations
@@ -1147,6 +1242,12 @@ impl MigrationManager {
         {
             // Revive a prior orphaned/lost attempt as an active heal fence.
             existing.lost = false;
+            // W12 review P2-4 — a heal fence is a NEW expectation with its own
+            // source and its own deadline clock, so a previous terminal
+            // refusal no longer describes this entry. (A `heal_pending` entry
+            // can never acquire the mark afterwards: `drop_refused_inbound`
+            // skips heal entries outright.)
+            existing.refused_by_source = false;
             existing.heal_pending = true;
             // Phase 3c — (re)start the fenced-heal deadline clock on (re)raise.
             existing.heal_started_at = Some(std::time::Instant::now());
@@ -1385,6 +1486,14 @@ impl MigrationManager {
             }
             m.from_node = NodeId(0);
             m.transfer_requested_at = None;
+            // W12 review P2-4 — the mark records that THIS entry's own
+            // `from_node` terminally refused it. Re-parking replaces that
+            // source with the sentinel and (per this function's contract)
+            // makes the entry completable by whichever source streams it, so
+            // the refusal no longer applies — and leaving it set would both
+            // discount a completable entry from the in-flight count and
+            // report it as refused by node 0, which no source ever was.
+            m.refused_by_source = false;
             reparked += 1;
         }
         if reparked > 0 {
@@ -2352,6 +2461,33 @@ impl MigrationManager {
             .collect()
     }
 
+    /// W12 TAIL 2 — the pending inbound entries whose own source has
+    /// TERMINALLY refused them (`ERR_MIGRATION_NO_TASKS`) and which the
+    /// fail-closed record guard retained anyway (see
+    /// [`Self::drop_refused_inbound`]).
+    ///
+    /// These are a strict subset of [`Self::pending_inbound_entries`]: entries
+    /// their own source has terminally refused, retained ONLY because this
+    /// non-holder still carries records for the shard
+    /// ([`InboundRetention::KeepOrphan`]). Nothing is coming for them — no
+    /// source will send them, and the records keeping their fence up are
+    /// reclaimable only by the committed-handoff-gated orphan cleanup — so
+    /// callers asking "is a migration still in flight?" must subtract them and
+    /// callers asking "is anything wrong?" must report them.
+    ///
+    /// Not permanent by construction, and deliberately so: the mark clears the
+    /// moment the entry becomes live again (a re-registration, a task
+    /// registration, an inbound batch arriving, or a re-park onto the
+    /// sentinel), and a holder's inbound is never marked at all — see
+    /// [`Self::drop_refused_inbound`].
+    pub fn refused_retained_inbound_entries(&self) -> Vec<(u16, NodeId)> {
+        self.inbound_migrations
+            .iter()
+            .filter(|m| !m.completed && m.refused_by_source)
+            .map(|m| (m.shard, m.from_node))
+            .collect()
+    }
+
     /// W1.1 residual fix — stamp the listed pending inbound shards with the
     /// current instant, recording that this node has just sent an
     /// `OP_MIGRATION_TRANSFER_REQUEST` (pull-based repair) for them.
@@ -2846,13 +2982,14 @@ impl MigrationManager {
     /// untouched, so a refusal from a stale peer cannot cancel a live
     /// transfer.
     ///
-    /// `must_be_kept` is the SAME fail-closed predicate the periodic
-    /// not-held prune applies (`inbound_entry_must_be_kept`): an entry whose
-    /// shard still has local records is KEPT and stays fenced, because
-    /// dropping the fence would expose those orphans to local reads (the
-    /// scenario-17 three-holder bug). Orphan cleanup reclaims the records and
-    /// the ordinary prune then drops the entry. The refusal therefore buys
-    /// promptness for the safe case and changes nothing about the unsafe one.
+    /// `retention` is the SAME fail-closed judgement the periodic not-held
+    /// prune applies (`inbound_entry_retention`), but it must distinguish WHY
+    /// an entry is kept — see [`InboundRetention`]. An entry whose shard still
+    /// has local records is KEPT and stays fenced, because dropping the fence
+    /// would expose those orphans to local reads (the scenario-17 three-holder
+    /// bug). Orphan cleanup reclaims the records and the ordinary prune then
+    /// drops the entry. The refusal therefore buys promptness for the safe
+    /// case and changes nothing about the unsafe one.
     ///
     /// W11 review NIT — a `heal_pending` entry is never dropped either, no
     /// matter what the source says. A reverse-heal fence is designed to
@@ -2861,21 +2998,51 @@ impl MigrationManager {
     /// peer's opinion about its own outbound tasks is weaker evidence than
     /// that, and it is not what the fence is waiting for.
     ///
-    /// Returns how many entries were removed.
+    /// W12 TAIL 2 — an entry retained as [`InboundRetention::KeepOrphan`] is
+    /// marked [`InboundMigration::refused_by_source`]. It is a fixpoint, not a
+    /// transfer in flight: the only source that could complete it has said it
+    /// never will, and only orphan cleanup (gated on committed-handoff
+    /// evidence) can remove the records that hold the fence up.
+    ///
+    /// A [`InboundRetention::KeepHolder`] entry is NEVER marked, even though
+    /// it is retained by the same call. This node IS the shard's target
+    /// holder, so the inbound is legitimate work — and the refusal that
+    /// produced it can be a transient artefact of a DIVERGED source table
+    /// (`terminally_abort_unshippable_task` rewrites `assignments[shard]`
+    /// without bumping the version, so the source's holder test disagrees
+    /// with ours while both epoch checks pass). The re-heal machinery re-plans
+    /// that handoff on a later round; marking it would tell status, the gauge
+    /// and the convergence gate that a satisfiable transfer was terminal.
     pub fn drop_refused_inbound(
         &mut self,
         shards: &[u16],
         source: NodeId,
-        must_be_kept: impl Fn(u16) -> bool,
-    ) -> usize {
+        retention: impl Fn(u16) -> InboundRetention,
+    ) -> RefusedInboundOutcome {
         let refused: std::collections::HashSet<u16> = shards.iter().copied().collect();
         let before = self.inbound_migrations.len();
-        self.inbound_migrations.retain(|m| {
-            m.completed
-                || m.heal_pending
-                || m.from_node != source
-                || !refused.contains(&m.shard)
-                || must_be_kept(m.shard)
+        // Scoped to THIS refusal (P2-3): reporting the manager-global marked
+        // set here named shards kept for a different source, and from earlier
+        // rounds, in a line whose `source` field claimed otherwise.
+        let mut kept_holder: Vec<u16> = Vec::new();
+        let mut kept_orphan: Vec<u16> = Vec::new();
+        self.inbound_migrations.retain_mut(|m| {
+            if m.completed || m.heal_pending || m.from_node != source || !refused.contains(&m.shard)
+            {
+                return true;
+            }
+            match retention(m.shard) {
+                InboundRetention::Drop => false,
+                InboundRetention::KeepHolder => {
+                    kept_holder.push(m.shard);
+                    true
+                }
+                InboundRetention::KeepOrphan => {
+                    m.refused_by_source = true;
+                    kept_orphan.push(m.shard);
+                    true
+                }
+            }
         });
         let removed = before - self.inbound_migrations.len();
         if removed > 0 {
@@ -2886,7 +3053,11 @@ impl MigrationManager {
                 }
             }
         }
-        removed
+        RefusedInboundOutcome {
+            dropped: removed,
+            kept_holder,
+            kept_orphan,
+        }
     }
 
     /// Serialize active outbound migration state to bytes.
@@ -5393,9 +5564,18 @@ mod tests {
         assert!(mgr.register_inbound_source(10, other)); // same shard, live peer
 
         // Shard 11 still holds local records → fail-closed keep.
-        let dropped = mgr.drop_refused_inbound(&[10, 11], refuser, |shard| shard == 11);
+        let outcome = mgr.drop_refused_inbound(&[10, 11], refuser, |shard| {
+            if shard == 11 {
+                InboundRetention::KeepOrphan
+            } else {
+                InboundRetention::Drop
+            }
+        });
 
-        assert_eq!(dropped, 1, "only the record-free refused entry is retired");
+        assert_eq!(
+            outcome.dropped, 1,
+            "only the record-free refused entry is retired"
+        );
         assert!(
             !mgr.pending_inbound_entries().contains(&(10, refuser)),
             "the dangling entry the source will never satisfy must go",
@@ -5420,7 +5600,8 @@ mod tests {
         // topology commit, so a refusal must not retire it either.
         assert!(mgr.register_heal_source(13, refuser));
         assert_eq!(
-            mgr.drop_refused_inbound(&[13], refuser, |_| false),
+            mgr.drop_refused_inbound(&[13], refuser, |_| InboundRetention::Drop)
+                .dropped,
             0,
             "a heal_pending entry is never dropped by a source refusal",
         );
@@ -5432,10 +5613,131 @@ mod tests {
         assert!(mgr.has_pending_inbound(12));
 
         // Once the last entry for a shard goes, the fence bit goes with it.
-        assert_eq!(mgr.drop_refused_inbound(&[10], other, |_| false), 1);
+        assert_eq!(
+            mgr.drop_refused_inbound(&[10], other, |_| InboundRetention::Drop)
+                .dropped,
+            1
+        );
         assert!(
             !mgr.has_pending_inbound(10),
             "the inbound bitmap must be rebuilt from the surviving entries",
+        );
+    }
+
+    /// W12 TAIL 2 (RED→GREEN) — an entry the source TERMINALLY refused but the
+    /// fail-closed record guard RETAINED must be distinguishable from an
+    /// inbound transfer that is still in flight.
+    ///
+    /// The two are the same shape today (`{shard, from_node}`, counted in
+    /// `inbound_pending`) but they are opposites: one is waiting for data that
+    /// is on its way, the other is a fixpoint. Armed scenario 08 @ fc5e5f7
+    /// sat on two of the latter for 300 s — node1 re-sent the request 29
+    /// times on the 10 s cadence, node3 answered `ERR_MIGRATION_NO_TASKS`
+    /// every time, and the drop was vetoed every time by
+    /// `local_record_count > 0`, while the records themselves could not be
+    /// reclaimed (orphan cleanup skips shards with a pending inbound, and the
+    /// #28 committed-handoff evidence for them never existed). Nothing in the
+    /// status told an operator — or the convergence gate — that the entries
+    /// could never progress.
+    #[test]
+    fn a_refused_but_retained_inbound_entry_is_marked_as_refused() {
+        let refuser = NodeId(3);
+        let other = NodeId(4);
+
+        let mut mgr = MigrationManager::new();
+        assert!(mgr.register_inbound_source(20, refuser)); // refused, HAS records
+        assert!(mgr.register_inbound_source(21, refuser)); // refused, no records
+        assert!(mgr.register_inbound_source(22, refuser)); // not in the request
+        assert!(mgr.register_inbound_source(20, other)); // same shard, live peer
+
+        assert!(
+            mgr.refused_retained_inbound_entries().is_empty(),
+            "nothing is refused before a refusal arrives",
+        );
+
+        let outcome = mgr.drop_refused_inbound(&[20, 21], refuser, |shard| {
+            if shard == 20 {
+                InboundRetention::KeepOrphan
+            } else {
+                InboundRetention::Drop
+            }
+        });
+        assert_eq!(
+            outcome.dropped, 1,
+            "only the record-free refused entry is retired"
+        );
+
+        assert_eq!(
+            mgr.refused_retained_inbound_entries(),
+            vec![(20, refuser)],
+            "the retained-because-of-records entry — and ONLY it — carries the \
+             terminal-refusal mark: shard 22 was never named, and shard 20's \
+             entry from the OTHER source is a live transfer",
+        );
+        assert_eq!(
+            mgr.pending_inbound_entries().len(),
+            3,
+            "marking changes no fence: 20/refuser, 20/other and 22/refuser all \
+             remain pending",
+        );
+
+        // A heal fence is never dropped and never marked — a peer's opinion
+        // about its own outbound tasks does not touch the reverse-heal fence.
+        assert!(mgr.register_heal_source(23, refuser));
+        assert_eq!(
+            mgr.drop_refused_inbound(&[23], refuser, |_| InboundRetention::Drop)
+                .dropped,
+            0
+        );
+        assert_eq!(
+            mgr.refused_retained_inbound_entries(),
+            vec![(20, refuser)],
+            "a heal_pending entry a refusal could not drop is NOT a \
+             terminally-refused orphan fence",
+        );
+
+        // A fresh registration for the same (shard, source) means a real
+        // transfer is expected again: the mark must clear, exactly as `lost`
+        // does, or a revived entry would stay excluded from the in-flight
+        // count forever.
+        assert!(!mgr.register_inbound_source(20, refuser));
+        assert!(
+            mgr.refused_retained_inbound_entries().is_empty(),
+            "re-registering the source clears the terminal-refusal mark",
+        );
+    }
+
+    /// W12 TAIL 2 — data actually ARRIVING for a previously-refused shard
+    /// must clear the mark even when the batch carries no source identity.
+    ///
+    /// The receive path stamps the concrete sender when it can
+    /// (`register_inbound_source`) and falls back to `mark_inbound_active`
+    /// when the batch does not name one. That fallback early-returns on any
+    /// existing entry for the shard, so without an explicit clear a marked
+    /// entry would stay excluded from the in-flight count while records were
+    /// streaming into it — the gate would stop waiting on a live transfer.
+    #[test]
+    fn an_unstamped_inbound_batch_clears_the_refusal_mark() {
+        let refuser = NodeId(3);
+        let mut mgr = MigrationManager::new();
+        assert!(mgr.register_inbound_source(30, refuser));
+        assert_eq!(
+            mgr.drop_refused_inbound(&[30], refuser, |_| InboundRetention::KeepOrphan)
+                .dropped,
+            0
+        );
+        assert_eq!(mgr.refused_retained_inbound_entries(), vec![(30, refuser)]);
+
+        // The source-less receive path: no new entry is created (one already
+        // exists) but the shard is demonstrably receiving again.
+        assert!(!mgr.mark_inbound_active(30));
+        assert!(
+            mgr.refused_retained_inbound_entries().is_empty(),
+            "records arriving for the shard mean the entry is live again",
+        );
+        assert!(
+            mgr.has_pending_inbound(30),
+            "clearing the mark must not drop the fence",
         );
     }
 

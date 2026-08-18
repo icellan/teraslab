@@ -1432,6 +1432,15 @@ pub struct MigrationMetrics {
     /// consensus-relevant override of a local anti-resurrection marker, so it
     /// stays operator-visible.
     pub migration_weak_veto_arbitrations: PaddedCounter,
+    /// W12 TAIL 3 — weak-veto arbitrations the TARGET refused on AUTHORITY
+    /// grounds (`ERR_INVARIANT_VIOLATION`), which terminally abort the
+    /// handoff instead of re-driving it. Counted per refused round at the
+    /// source. A non-zero value means a source is trying to complete a
+    /// handoff of a shard the target's table does not credit it with — the
+    /// PHANTOM-master shape armed scenario 09 @ fc5e5f7 livelocked on — and
+    /// the shard will stay dual-mastered until the ownership disagreement is
+    /// resolved elsewhere.
+    pub migration_weak_veto_arbitration_refused: PaddedCounter,
     /// W10 review P2-2 — local keys the #29 completion prune RETAINED because
     /// the source declared them as its own WEAK-tombstone omissions (FIX 3).
     /// Each exclusion is a deliberate refusal to delete on the source's
@@ -1461,6 +1470,16 @@ pub struct MigrationMetrics {
     /// Entries whose records are still local are not counted here: they are
     /// kept fenced fail-closed until orphan cleanup reclaims the records.
     pub migration_dangling_inbound_dropped: PaddedCounter,
+    /// W12 TAIL 2 — gauge: pending inbound entries whose own source has
+    /// TERMINALLY refused them (`ERR_MIGRATION_NO_TASKS`) and which the
+    /// fail-closed record guard RETAINED, so they can never progress. The
+    /// counter above records the entries a refusal removed; this records the
+    /// ones it could not. A non-zero, non-decreasing value means this node is
+    /// sitting on orphan records for shards it does not hold, waiting on an
+    /// orphan cleanup that the #28 committed-handoff evidence gate will not
+    /// authorize. Armed scenario 08 @ fc5e5f7 sat at 2 for 300 s with no
+    /// signal anywhere.
+    pub migration_inbound_refused_retained: AtomicU32,
     /// W11 FIX 4(b) — gauge: shards the LAST orphan-cleanup pass skipped
     /// before it could even reach the #28 evidence check, because they still
     /// carry a pending inbound entry (a forward transfer, a reverse-heal
@@ -1619,10 +1638,12 @@ impl MigrationMetrics {
             replica_abort_forced_resyncs: PaddedCounter::new(),
             migration_completion_manifest_reduced_vetoed: PaddedCounter::new(),
             migration_weak_veto_arbitrations: PaddedCounter::new(),
+            migration_weak_veto_arbitration_refused: PaddedCounter::new(),
             migration_prune_weak_declared_retained: PaddedCounter::new(),
             migration_prune_skipped_cutoff_gate: PaddedCounter::new(),
             migration_transfer_request_refused: PaddedCounter::new(),
             migration_dangling_inbound_dropped: PaddedCounter::new(),
+            migration_inbound_refused_retained: AtomicU32::new(0),
             orphan_cleanup_skipped_pending_inbound: AtomicU32::new(0),
             orphan_cleanup_shard_skipped: PaddedCounter::new(),
             topology_proposal_revalidation_emptied: PaddedCounter::new(),
