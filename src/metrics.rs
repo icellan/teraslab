@@ -1498,6 +1498,37 @@ pub struct MigrationMetrics {
     /// pass (event-driven or batch-completion); a pass that reclaims (or
     /// finds no retained shard) resets it to the new census.
     pub orphan_cleanup_retained_no_evidence: AtomicU32,
+    /// W12 — shards reclaimed by the proof-of-elsewhere path: the #28
+    /// committed-handoff evidence was missing (and, in the SIGKILL /
+    /// never-handed-off case, unearnable), but every CURRENT committed holder
+    /// positively confirmed it already holds a superset of this node's copy.
+    /// This is the counter that drains the permanent over-replication
+    /// `orphan_cleanup_retained_no_evidence` used to gauge forever.
+    pub orphan_cleanup_proof_reclaimed: PaddedCounter,
+    /// W12 — shards the proof-of-elsewhere path REFUSED: at least one
+    /// committed holder did not confirm containment (it is behind on a record,
+    /// unreachable, or its address is unknown). Fail-closed and expected to be
+    /// non-zero during churn; a value that climbs while
+    /// `orphan_cleanup_proof_reclaimed` stays flat means the holders are not
+    /// converging, not that reclamation is broken.
+    pub orphan_cleanup_proof_refused: PaddedCounter,
+    /// W12 P2-4 — shards the holders DID vouch for, but which gave up no
+    /// records because every one had moved past the proven generation. Neither
+    /// a refusal (the holders agreed) nor a reclaim (the third copy remains),
+    /// so it gets its own counter instead of inflating either. A steadily
+    /// climbing value means the shard is taking writes faster than a pass can
+    /// prove-and-delete it — the copies are safe, just never drained.
+    pub orphan_cleanup_proof_stale_no_delete: PaddedCounter,
+    /// W12 P2 — shards the proof phase RETAINED without asking anyone, because
+    /// their key count exceeds the per-probe manifest cap. Neither refused (no
+    /// holder was consulted) nor reclaimed, so without this the census stays
+    /// pinned with BOTH proof counters flat — indistinguishable from "the pass
+    /// never ran", which is exactly the diagnostic ambiguity W11 FIX 4(b)
+    /// forbids in this function. At the 2 B-record design target this is the
+    /// STEADY STATE for a full shard, not an edge case: a non-zero value means
+    /// space reclamation for those shards needs a mechanism other than a
+    /// whole-shard manifest probe.
+    pub orphan_cleanup_proof_oversized: PaddedCounter,
     /// W10 composition review P1 — completed LIVE-RECENCY CONFIRM rounds
     /// (`confirm_self_behind_with_live_recency`). Each round costs one
     /// filtered primary-index walk plus the device reads for the shards it
@@ -1597,6 +1628,10 @@ impl MigrationMetrics {
             topology_proposal_revalidation_emptied: PaddedCounter::new(),
             topology_catch_up_reproposal_skipped: PaddedCounter::new(),
             orphan_cleanup_retained_no_evidence: AtomicU32::new(0),
+            orphan_cleanup_proof_reclaimed: PaddedCounter::new(),
+            orphan_cleanup_proof_refused: PaddedCounter::new(),
+            orphan_cleanup_proof_stale_no_delete: PaddedCounter::new(),
+            orphan_cleanup_proof_oversized: PaddedCounter::new(),
             reheal_live_confirm_rounds: PaddedCounter::new(),
             reheal_live_confirm_shards: PaddedCounter::new(),
             reheal_live_confirm_deferred: PaddedCounter::new(),

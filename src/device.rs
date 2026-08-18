@@ -883,6 +883,70 @@ impl BlockDevice for MemoryDevice {
     }
 }
 
+/// Test-only wrapper that COUNTS `sync()` calls reaching a [`BlockDevice`].
+///
+/// Exists so a test can assert that a code path issued a real durability
+/// BARRIER to the DATA device, not merely to the redo logs. The two are easy to
+/// confuse — `Engine::flush_all_redo` fsyncs only the redo committers, while a
+/// buffered `RedoOp::CreateV2` carries no record bytes and its replay reads
+/// them back from the data device — so "durable" needs the data-device sync
+/// too, and only a counter distinguishes the two.
+#[cfg(test)]
+pub(crate) struct SyncCountingDevice {
+    inner: std::sync::Arc<dyn BlockDevice>,
+    syncs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl SyncCountingDevice {
+    /// Wrap `inner`, returning the device and the shared sync counter.
+    pub(crate) fn new(
+        inner: std::sync::Arc<dyn BlockDevice>,
+    ) -> (
+        std::sync::Arc<Self>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let syncs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            std::sync::Arc::new(Self {
+                inner,
+                syncs: syncs.clone(),
+            }),
+            syncs,
+        )
+    }
+}
+
+#[cfg(test)]
+impl BlockDevice for SyncCountingDevice {
+    fn pread(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        self.inner.pread(buf, offset)
+    }
+
+    fn pwrite(&self, buf: &[u8], offset: u64) -> Result<usize> {
+        self.inner.pwrite(buf, offset)
+    }
+
+    fn alignment(&self) -> usize {
+        self.inner.alignment()
+    }
+
+    fn size(&self) -> u64 {
+        self.inner.size()
+    }
+
+    fn sync(&self) -> Result<()> {
+        self.syncs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.sync()
+    }
+
+    // No raw pointer: a caller that mapped the memory directly would bypass
+    // the counted `sync` path entirely.
+    fn as_raw_ptr(&self) -> Option<*mut u8> {
+        None
+    }
+}
+
 /// Test-only wrapper that injects read failures behind any [`BlockDevice`].
 ///
 /// The wrapper reports no raw pointer so callers under test cannot bypass the

@@ -9053,7 +9053,7 @@ impl Engine {
     /// blob-store I/O path and lets the sweep batch unlinks.
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
-        self.delete_inner(req, RemovalAuthority::Authoritative, None)
+        self.delete_inner(req, RemovalAuthority::Authoritative, None, None)
     }
 
     /// W9 — compensating delete: roll back a create whose replication fan-out
@@ -9085,6 +9085,7 @@ impl Engine {
             req,
             RemovalAuthority::Authoritative,
             Some(crate::ops::tombstone::TombstoneCause::CompensatedCreate),
+            None,
         )
     }
 
@@ -9111,6 +9112,7 @@ impl Engine {
             req,
             RemovalAuthority::Authoritative,
             Some(crate::ops::tombstone::TombstoneCause::PruneReplace),
+            None,
         )
     }
 
@@ -9153,7 +9155,7 @@ impl Engine {
     ///   deletion tombstone whenever a tombstone log is attached — which is the
     ///   default for RF > 1. Only [`Self::reclaim_held_copy`] skips it.
     pub fn prune_delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
-        self.delete_inner(req, RemovalAuthority::Authoritative, None)
+        self.delete_inner(req, RemovalAuthority::Authoritative, None, None)
     }
 
     /// **Held-copy reclaim**: drop the local copy of a record this node HOLDS
@@ -9212,7 +9214,36 @@ impl Engine {
     /// [`SpendError::StorageError`] on an index/device failure or when a
     /// guarded sweep delete is attempted on a write-unhealthy node.
     pub fn reclaim_held_copy(&self, req: &DeleteRequest) -> Result<(), SpendError> {
-        self.delete_inner(req, RemovalAuthority::HeldCopy, None)
+        self.delete_inner(req, RemovalAuthority::HeldCopy, None, None)
+    }
+
+    /// [`Self::reclaim_held_copy`], but only if the record is STILL at
+    /// `expected_generation` when re-read under the per-tx stripe lock.
+    ///
+    /// The orphan-reclaim proof-of-elsewhere path (`cluster::coordinator`)
+    /// deletes on the strength of every committed holder having vouched for
+    /// one exact `(txid, generation)` image. Its own re-read of that
+    /// generation happens outside the stripe lock this delete takes, so a
+    /// concurrent mutation could slip in between and the reclaim would destroy
+    /// an image no holder ever confirmed. Passing the proven generation moves
+    /// the decision inside the lock.
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`Self::reclaim_held_copy`], plus
+    /// [`SpendError::NotDue`] when the record's generation has moved on (the
+    /// record is left untouched).
+    pub fn reclaim_held_copy_at_generation(
+        &self,
+        req: &DeleteRequest,
+        expected_generation: u32,
+    ) -> Result<(), SpendError> {
+        self.delete_inner(
+            req,
+            RemovalAuthority::HeldCopy,
+            None,
+            Some(expected_generation),
+        )
     }
 
     /// Internal delete.
@@ -9239,6 +9270,16 @@ impl Engine {
         req: &DeleteRequest,
         authority: RemovalAuthority,
         cause_override: Option<crate::ops::tombstone::TombstoneCause>,
+        // W12 P2-3 (TOCTOU). When `Some(g)`, the removal is refused with
+        // [`SpendError::NotDue`] unless the record's generation is STILL `g`
+        // when re-read UNDER the stripe lock below. Callers whose authority to
+        // delete was established against one specific record image — the
+        // orphan-reclaim proof, which had every holder vouch for exactly
+        // `(txid, g)` — must pass it: their own pre-check is lock-free, so a
+        // mutation landing between that check and this call would otherwise
+        // destroy an image no holder ever confirmed. Mirrors the `due_guard`
+        // recheck directly below it.
+        expected_generation: Option<u32>,
     ) -> Result<(), SpendError> {
         // P0-11 follow-up: a write-unhealthy (poisoned) node must not PRUNE. The
         // internal DAH sweep journals no redo, so poisoning the redo log does not
@@ -9284,6 +9325,18 @@ impl Engine {
                 && !self.record_due_for_sweep(&req.tx_key, &meta, current_height)
             {
                 return Err(SpendError::NotDue);
+            }
+            // W12 P2-3 (TOCTOU): the caller's authority to delete was granted
+            // for ONE specific record image. Re-validate that image here,
+            // under the stripe lock, exactly as the `due_guard` branch above
+            // re-validates the sweep predicate — the caller's own check is
+            // necessarily lock-free, so without this a mutation landing in the
+            // gap destroys a version nobody authorised.
+            if let Some(expected) = expected_generation {
+                let actual = { meta.generation };
+                if actual != expected {
+                    return Err(SpendError::NotDue);
+                }
             }
             // Capture the AUTHORITATIVE on-device secondary-index heights for the
             // cleanup below. The cached index entry (`entry.*`) lags the device

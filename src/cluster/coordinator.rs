@@ -5533,6 +5533,22 @@ impl ClusterCoordinator {
                             let cleanup_engine = engine.clone();
                             let cleanup_st = shard_table.clone();
                             let cleanup_mig = migration.clone();
+                            // W12 — this is the STEADY-STATE cleanup driver:
+                            // the batch-completion passes only run while a
+                            // batch is in flight, so once the cluster settles
+                            // this is the only pass left, and it is where the
+                            // permanently-retained third copies must be
+                            // resolved. Give it the proof-of-elsewhere so a
+                            // shard whose #28 evidence is unearnable (SIGKILL,
+                            // or never handed off from here) can still be
+                            // proven safe and reclaimed. Address book snapshot:
+                            // no lock is held across a probe.
+                            let cleanup_proof: Arc<dyn ShardHolderProof> =
+                                Arc::new(PeerSupersetProof {
+                                    self_id,
+                                    node_addrs: node_addrs.read().clone(),
+                                    cluster_secret: cluster_secret_event.clone(),
+                                });
                             std::thread::spawn(move || {
                                 let epoch = cleanup_st.read().version;
                                 run_orphan_cleanup(
@@ -5541,6 +5557,7 @@ impl ClusterCoordinator {
                                     &cleanup_st,
                                     &cleanup_mig,
                                     epoch,
+                                    Some(cleanup_proof.as_ref()),
                                 );
                             });
                         }
@@ -8119,6 +8136,15 @@ impl ClusterCoordinator {
                 );
             }
 
+            // W12 — the proof-of-elsewhere each batch hands to the orphan
+            // sweeps it spawns, built once per group from the address snapshot
+            // taken above. Shared by Arc: probing is read-only and the
+            // per-target batches run concurrently.
+            let orphan_proof: Arc<dyn ShardHolderProof> = Arc::new(PeerSupersetProof {
+                self_id,
+                node_addrs: addrs.clone(),
+                cluster_secret: cluster_secret.clone(),
+            });
             std::thread::scope(|scope| {
                 for (target_node, target_tasks) in target_group {
                     let target_addr = addrs.get(target_node).copied();
@@ -8132,6 +8158,7 @@ impl ClusterCoordinator {
                     let inbound_bm = inbound_bm.clone();
                     let secret = cluster_secret.clone();
                     let relinquish_ctx = relinquish_ctx.clone();
+                    let orphan_proof = orphan_proof.clone();
 
                     // Collect all keys for shards going to this target.
                     let mut target_keys: Vec<TxKey> = Vec::new();
@@ -8162,6 +8189,7 @@ impl ClusterCoordinator {
                             secret,
                             relinquish_ctx.as_deref(),
                             origin,
+                            Some(orphan_proof),
                         );
                         total_completed.fetch_add(c, Ordering::Relaxed);
                         total_failed.fetch_add(f, Ordering::Relaxed);
@@ -11480,7 +11508,12 @@ fn collect_manifest_entries(
     Ok(entries)
 }
 
-fn compute_manifest_for_entries(entries: &[(TxKey, u32)]) -> [u8; 32] {
+/// The manifest fold over exact `(txid, generation)` entries.
+///
+/// `pub(crate)` so the OP_MIGRATION_COMPLETE responder computes the SAME hash
+/// it echoes back in a superset confirmation (W12 P2-5). Two definitions of
+/// this fold would let the binding silently stop matching.
+pub(crate) fn compute_manifest_for_entries(entries: &[(TxKey, u32)]) -> [u8; 32] {
     let mut manifest = ManifestHasher::new();
     for (key, generation) in entries {
         manifest.fold(&key.txid, *generation);
@@ -12539,6 +12572,10 @@ fn run_migration_batch(
         cluster_secret,
         relinquish_ctx,
         MigrationRunOrigin::Handoff,
+        // The thin wrapper has no address book to build a proof from; its
+        // callers are chaos/unit harnesses, whose sweeps keep the pre-W12
+        // evidence-only behavior.
+        None,
     )
 }
 
@@ -12590,6 +12627,10 @@ fn run_migration_batch_with_origin(
     cluster_secret: Option<Arc<Vec<u8>>>,
     relinquish_ctx: Option<&RelinquishContext>,
     origin: MigrationRunOrigin,
+    // W12 — proof-of-elsewhere for the orphan sweeps this batch spawns. `None`
+    // keeps the pre-W12 behavior (retain every shard the #28 evidence cannot
+    // vouch for). See [`ShardHolderProof`].
+    orphan_proof: Option<Arc<dyn ShardHolderProof>>,
 ) -> (u32, u32) {
     // W11 FIX 3(b) — a repair toward an already-committed holder never
     // fences the source; see `MigrationRunOrigin::Resync`.
@@ -12684,6 +12725,7 @@ fn run_migration_batch_with_origin(
             auth_secret,
             &ALREADY_SERVING_SUPERSET_PROBE,
         )
+        .confirmed
     };
     let verification = verify_already_serving_skips(
         &engine,
@@ -12998,8 +13040,9 @@ fn run_migration_batch_with_origin(
             let ce = engine.clone();
             let cs = shard_table.clone();
             let cm = migration.clone();
+            let cp = orphan_proof.clone();
             std::thread::spawn(move || {
-                run_orphan_cleanup(self_id, &ce, &cs, &cm, topology_epoch);
+                run_orphan_cleanup(self_id, &ce, &cs, &cm, topology_epoch, cp.as_deref());
             });
         }
         return (c, f);
@@ -13368,7 +13411,7 @@ fn run_migration_batch_with_origin(
                                     &probe_manifest,
                                     auth_secret,
                                     &RELINQUISH_SUPERSET_PROBE,
-                                )
+                                ).confirmed
                             };
                             if fail_or_relinquish_outbound_task(
                                 &migration,
@@ -14208,7 +14251,7 @@ fn run_migration_batch_with_origin(
                                                 &manifest_for_probe,
                                                 auth_secret,
                                                 &RELINQUISH_SUPERSET_PROBE,
-                                            )
+                                            ).confirmed
                                         };
                                         if fail_or_relinquish_outbound_task(
                                             &migration,
@@ -14375,6 +14418,7 @@ fn run_migration_batch_with_origin(
         let cleanup_engine = engine.clone();
         let cleanup_st = shard_table.clone();
         let cleanup_mig = migration.clone();
+        let cleanup_proof = orphan_proof.clone();
         std::thread::spawn(move || {
             run_orphan_cleanup(
                 self_id,
@@ -14382,6 +14426,7 @@ fn run_migration_batch_with_origin(
                 &cleanup_st,
                 &cleanup_mig,
                 topology_epoch,
+                cleanup_proof.as_deref(),
             );
         });
     }
@@ -14543,6 +14588,280 @@ fn event_orphan_cleanup_fire(
     true
 }
 
+/// The orphan-reclaim proof-of-elsewhere profile: ≤ ~5 s per holder worst
+/// case (3 × (0.5 s + 1 s) + 0.5 s of backoff).
+///
+/// Short by design, and the shortest of the three. A false negative here costs
+/// NOTHING but a deferral — the shard stays retained (exactly today's
+/// behavior) and the next pass re-asks — so there is no reason to wait long.
+/// One pass may face hundreds of unproven shards (default-17: 135 on one
+/// node), so this per-holder budget multiplies by the shard count; that is why
+/// [`ORPHAN_RECLAIM_PROBE_BUDGET`] also bounds the pass as a whole.
+/// COST NOTE (W12 nit 3) — each attempt now makes the RESPONDER issue a full
+/// durability barrier (redo fsync + one sync per data device) before it
+/// attests, so a slow-but-connectable holder can be made to pay that barrier
+/// up to `retry_delays_ms.len()` times for one shard. It is bounded and small
+/// at the observed backlog, but if it ever bites the fix is to barrier once
+/// per connection, or to compare a durable watermark carried in the response
+/// instead of forcing a barrier per probe.
+const ORPHAN_RECLAIM_SUPERSET_PROBE: SupersetProbeProfile = SupersetProbeProfile {
+    retry_delays_ms: &[50, 150, 300],
+    connect_timeout: Duration::from_millis(500),
+    io_timeout: Duration::from_secs(1),
+};
+
+/// Whole-pass wall-clock budget for the proof-of-elsewhere probes in
+/// [`run_orphan_cleanup`].
+///
+/// The probe phase runs with NO locks held, but it does run on the thread the
+/// pass was spawned on, and an unreachable holder costs a full
+/// [`ORPHAN_RECLAIM_SUPERSET_PROBE`] budget per shard. Capping the phase keeps
+/// a partitioned peer from turning one pass into an unbounded stall: shards not
+/// reached this pass are simply retained and re-offered to the next one.
+const ORPHAN_RECLAIM_PROBE_BUDGET: Duration = Duration::from_secs(5);
+
+/// P1-2 — hard cap on the manifest one orphan-reclaim probe will build/ship.
+///
+/// The probe frame is `68 + 36 × entries` bytes and must fit
+/// `MAX_FRAME_SIZE` (16 MiB), which alone allows ~466k entries — but building
+/// one costs a `read_metadata` per key, so an unbounded manifest is also an
+/// unbounded device read burst repeated every pass. At the 2 B-record target
+/// (~500k records/shard) such a probe could never succeed while still paying
+/// the full cost, forever. A shard over this cap is RETAINED without building
+/// the frame: reclaiming it is a space optimisation, and refusing costs only
+/// disk.
+const ORPHAN_RECLAIM_MAX_MANIFEST_ENTRIES: usize = 50_000;
+
+/// P1-1 — where the next orphan-reclaim proof pass starts scanning.
+///
+/// `unproven` is rebuilt in ascending shard order every pass, so a pass that
+/// exhausts [`ORPHAN_RECLAIM_PROBE_BUDGET`] early always does so at the same
+/// low shard ids and the high ones are never probed at all. Persisting the
+/// stopping point across passes turns that permanent starvation into a
+/// rotation. Process-wide (mirrors `shards::LOST_SHARDS_TOTAL`): it is a
+/// fairness hint, so a torn read merely re-covers ground.
+static ORPHAN_PROBE_CURSOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Rotate `unproven` (ascending by shard) so the pass starts at the first
+/// shard `>= cursor`, wrapping the earlier shards to the end.
+///
+/// Never drops or duplicates a candidate — a cursor past every entry wraps to
+/// the start rather than emptying the pass, which matters because the
+/// candidate set shrinks as shards are reclaimed.
+fn rotate_unproven_to_cursor(unproven: &mut [(u16, Vec<NodeId>)], cursor: u16) {
+    let split = unproven.partition_point(|(shard, _)| *shard < cursor);
+    if split < unproven.len() {
+        unproven.rotate_left(split);
+    }
+}
+
+/// Positive proof that another node durably holds a shard's records.
+///
+/// The #28 data-loss guard refuses to reclaim a non-owned shard unless THIS
+/// node recorded a committed handoff of it
+/// ([`MigrationManager::has_committed_handoff`]). That evidence is IN-MEMORY
+/// and epoch-EXACT, so there are two common states in which it can never be
+/// earned: a SIGKILLed node loses the map on restart, and a node that never
+/// performed the handoff at all (it acquired its copy as a migration TARGET,
+/// or an epoch bump invalidated the entry) never had one to lose. Either way
+/// the local copy is retained FOREVER — 100% over-replication, zero data loss,
+/// never reclaimed (default-15: 45/295 records at 3 holders, the per-node
+/// retained census flat at 9/17/17 shards across every pass; default-17:
+/// 192/2000, node2's census flat at 135 shards over a 91 s window).
+///
+/// Relaxing #28 is NOT the answer — it exists because reclaiming on the
+/// strength of the current table alone deleted acked UTXOs in an earlier wave.
+/// The answer is to let the pass EARN the proof it lacks: ask the shard's
+/// CURRENT committed holders whether they already hold every record this node
+/// would drop.
+///
+/// # Why unanimity is sufficient — the version-ordering asymmetry
+///
+/// Unanimity is safe because of a VERSION-ORDERING ASYMMETRY, and the ASKER
+/// enforces it here rather than trusting the peer to: the responder echoes its
+/// own shard-table version, and [`SupersetConfirmation::attests`] requires
+/// `responder_epoch >= topology_epoch` before a confirmation counts. So the
+/// invariant is checked at the deletion site and cannot be lost by a refactor
+/// of the peer's own gate (the responder does also refuse a probe whose
+/// `migration_epoch` exceeds its version — `ERR_MIGRATION_TARGET_NOT_READY`,
+/// `server::dispatch` — but that is now defence in depth, not the load-bearing
+/// check).
+///
+/// What that ordering BUYS is the argument below, recorded here because a
+/// reader standing at the deletion site must be able to find it:
+///
+/// * A reclaiming shard S at epoch `Va` implies every holder B confirmed,
+///   hence `Vb >= Va`.
+/// * If B were simultaneously reclaiming S from A, symmetrically `Va >= Vb`.
+/// * Therefore `Va == Vb` — both nodes read the SAME table — and at one table
+///   a shard's holder set is one set. A asked B only because A's table names B
+///   a holder; at the same version B's own `owned` test then names B a holder
+///   too, so S was never an orphan candidate on B. Contradiction.
+///
+/// Mutual reclaim is impossible, and the same telescoping argument closes any
+/// longer cycle (`Va <= Vb <= Vc <= Va`). Two consequences the implementation
+/// MUST honour:
+///
+/// 1. That responder gate is nested inside `if migration_epoch > 0`, so at
+///    epoch 0 it does not run at all and the asymmetry vanishes. An epoch-0
+///    probe is therefore refused outright — see
+///    [`Self::holder_holds_superset`].
+/// 2. The responder also tolerates `+2` epochs of staleness on the OTHER side
+///    (a probe older than the responder). That slack was designed for
+///    in-flight migrations, not for authorising a deletion; it is safe here
+///    only because a stale-epoch asker is additionally re-gated under the
+///    locks (the epoch re-check after the probe) before anything is deleted.
+///
+/// # Known limitation — generation-only containment (W12 P2-2)
+///
+/// The manifest folds `txid || generation` and nothing else, so "the holder is
+/// at a generation >= mine" is the whole containment test. On the DRAIN path
+/// that primitive was justified by transfer-THEN-relinquish: the source
+/// streams its records first, so a higher generation on the target really is a
+/// SUPERSET of what the source shipped. This path removes the transfer step,
+/// so the prefix property is ASSUMED, not established.
+///
+/// The residual case is a diverged non-owner: a partitioned ex-master that
+/// applied an acked spend (gen 4→5) while the committed holders applied some
+/// other mutation (gen 4→5) reads as `5 >= 5` from both, and the reclaim
+/// destroys the only representation of that spend. Two things bound it today:
+/// a shard suspected of divergence carries a reverse-heal fence, and fenced
+/// shards are skipped ABOVE the proof phase (`has_pending_inbound`); and the
+/// reclaim writes no tombstone, so a holder that later learns of the record
+/// can still re-ship it. Neither is a proof, and content equality is not
+/// checked anywhere on this path.
+///
+/// Closing it properly means carrying a per-record content digest in the
+/// manifest, or routing this decision through the tombstone-aware
+/// manifest-diff (`FLAG_MIGRATION_MANIFEST_DIFF`) that already resolves
+/// direction per record. Until then, treat generation containment as an
+/// assumption of this path, not a guarantee it establishes.
+///
+/// A confirmed superset is NOT "strictly stronger" than a committed handoff:
+/// a handoff is an ACKED TRANSFER, while this is an unacked OBSERVATION of
+/// another node's current state. It is a different, sufficient proof — and it
+/// attests VISIBILITY on the holder, not durability there (see the
+/// `ORPHAN_RECLAIM_SUPERSET_PROBE` notes). Because the reclaim it authorises
+/// is a real, fsynced deletion, the safety argument is inductive over every
+/// deletion path in the engine: anyone adding an unguarded delete for a
+/// non-owned shard must re-derive the above, not assume it.
+///
+/// Implementations MUST be fail-closed: see [`Self::holder_holds_superset`].
+///
+/// `Send + Sync` because the cleanup passes run on spawned threads.
+trait ShardHolderProof: Send + Sync {
+    /// Does `holder` hold a SUPERSET of `entries` for `shard` at
+    /// `topology_epoch` — every entry present, at a generation no older than
+    /// the one this node holds?
+    ///
+    /// Returns `true` ONLY on a confirmed superset. Every other outcome —
+    /// rejection, timeout, unreachable holder, unknown address, malformed
+    /// answer — MUST return `false`, which retains the local copy. A false
+    /// negative defers a reclaim; a false positive drops data.
+    ///
+    /// A `topology_epoch` of 0 MUST be refused without contacting the holder:
+    /// the responder's staleness gates are skipped entirely at epoch 0, so
+    /// such a probe carries none of the version ordering the unanimity
+    /// argument above rests on.
+    fn holder_holds_superset(
+        &self,
+        shard: u16,
+        holder: NodeId,
+        topology_epoch: u64,
+        entries: &[(TxKey, u32)],
+    ) -> bool;
+}
+
+/// The production [`ShardHolderProof`]: a verify-only superset probe over the
+/// cluster's migration-completion wire op.
+///
+/// Reuses [`confirm_target_holds_superset`] unchanged — the same non-mutating
+/// `OP_MIGRATION_COMPLETE` frame the drain-convergence path already ships. The
+/// receiver's superset arm needs NO inbound entry, NO fence and NO prior
+/// handoff for `(shard, from_node)`: it reads metadata for each manifest entry
+/// and answers containment, performing no prune, no commit and no
+/// inbound-state change. That is what makes it usable from a pass that, by
+/// construction, has no migration relationship with the holder it is asking.
+/// `node_addrs` is a SNAPSHOT taken when the pass was spawned, not a live
+/// handle: a probe must never hold the address book's lock across a network
+/// round-trip, and an address that goes stale mid-pass simply fails the probe
+/// (fail-closed — the shard is retained and re-offered next pass).
+struct PeerSupersetProof {
+    self_id: NodeId,
+    node_addrs: std::collections::HashMap<NodeId, SocketAddr>,
+    cluster_secret: Option<Arc<Vec<u8>>>,
+}
+
+impl ShardHolderProof for PeerSupersetProof {
+    fn holder_holds_superset(
+        &self,
+        shard: u16,
+        holder: NodeId,
+        topology_epoch: u64,
+        entries: &[(TxKey, u32)],
+    ) -> bool {
+        // P1-3 — no version ordering exists at epoch 0 (the responder's
+        // `local_version < migration_epoch` gate is nested inside
+        // `migration_epoch > 0`, so it would answer unconditionally and the
+        // anti-mutual-reclaim argument in `ShardHolderProof` collapses).
+        // Refuse before the wire, not after it.
+        if topology_epoch == 0 {
+            tracing::debug!(
+                shard,
+                holder = holder.0,
+                "cluster: orphan-reclaim proof refused — epoch 0 carries no \
+                 version ordering",
+            );
+            return false;
+        }
+        let Some(addr) = self.node_addrs.get(&holder).copied() else {
+            // An unknown address is not a "no", but it is not a proof either.
+            // Fail closed: retain and re-ask next pass.
+            return false;
+        };
+        let manifest_hash = compute_manifest_for_entries(entries);
+        let answer = confirm_target_holds_superset(
+            addr,
+            shard,
+            self.self_id,
+            topology_epoch,
+            entries,
+            self.cluster_secret.as_deref().map(Vec::as_slice),
+            &ORPHAN_RECLAIM_SUPERSET_PROBE,
+        );
+        if !answer.confirmed {
+            return false;
+        }
+        // W12 P2-5 — unanimity over several holders needs each answer
+        // ATTRIBUTED. An unbound `STATUS_OK` is enough for the single-responder
+        // drain path but never here.
+        let Some(confirmation) = answer.binding else {
+            tracing::warn!(
+                shard,
+                expected_holder = holder.0,
+                "cluster: orphan-reclaim proof DISCARDED — responder supplied                  no attestation, so its answer cannot be attributed to a holder",
+            );
+            return false;
+        };
+        // W12 P2-5 — verify the answer is bound to the node we meant to ask,
+        // the shard we asked about, the records we shipped, and a version at
+        // least our own. Anything else is not this holder's proof.
+        if !confirmation.attests(shard, holder, topology_epoch, &manifest_hash) {
+            tracing::warn!(
+                shard,
+                expected_holder = holder.0,
+                answered_by = confirmation.responder.0,
+                responder_epoch = confirmation.responder_epoch,
+                probe_epoch = topology_epoch,
+                "cluster: orphan-reclaim proof DISCARDED — confirmation not \
+                 bound to the holder/shard/manifest/version asked about",
+            );
+            return false;
+        }
+        true
+    }
+}
+
 /// Delete records for shards this node no longer owns after migration.
 ///
 /// After outbound migrations complete, some records remain on the source
@@ -14563,6 +14882,13 @@ fn event_orphan_cleanup_fire(
 ///   incomplete handoff, so without a committed handoff this node may be the
 ///   last holder. Retain-until-verified: genuinely orphaned bytes may linger
 ///   until a real handoff completes, but the last durable copy is never dropped.
+/// - Proof-of-elsewhere (W12): a shard retained by the guard above is offered
+///   to `proof`, which asks every CURRENT committed holder whether it already
+///   holds a superset of this node's records. Only a unanimous confirmation
+///   reclaims — see [`ShardHolderProof`] for why the guard needed an
+///   earn-the-proof path rather than a relaxation, and why unanimity (not a
+///   single holder) is the bar. `proof = None` keeps the pre-W12 behavior
+///   exactly: retain and re-offer next pass.
 /// - `TxNotFound` during delete is non-fatal (concurrent ops may delete first).
 /// - Idempotent: running twice is safe.
 fn run_orphan_cleanup(
@@ -14571,6 +14897,7 @@ fn run_orphan_cleanup(
     shard_table: &Arc<ShardTableLock<ShardTable>>,
     migration: &Arc<Mutex<MigrationManager>>,
     topology_epoch: u64,
+    proof: Option<&dyn ShardHolderProof>,
 ) {
     use crate::cluster::shards::NUM_SHARDS;
     use crate::ops::remaining::DeleteRequest;
@@ -14594,6 +14921,11 @@ fn run_orphan_cleanup(
     // reading zero). A census gap must be visible whichever gate caused it.
     let mut skipped_unsettled = 0u32;
     let mut skipped_pending_inbound = 0u32;
+    // W12 — shards the #28 guard retained, paired with the committed holder
+    // set that must prove it already holds them. Collected under the locks,
+    // PROBED without them (below): a network round-trip inside the shard-table
+    // read guard would stall every topology change behind an unreachable peer.
+    let mut unproven: Vec<(u16, Vec<NodeId>)> = Vec::new();
     {
         let table = shard_table.read();
         let mgr = migration.lock();
@@ -14647,6 +14979,22 @@ fn run_orphan_cleanup(
             // elsewhere: a committed handoff of this shard from this node.
             if !mgr.has_committed_handoff(shard, topology_epoch) {
                 retained_no_evidence = retained_no_evidence.saturating_add(1);
+                // W12 — the evidence is missing, but it may be EARNABLE. Queue
+                // the shard for the proof-of-elsewhere phase together with the
+                // holder set the table currently commits it to; `self` is
+                // excluded because we already know this node is not one of them.
+                if proof.is_some() {
+                    let mut holders: Vec<NodeId> =
+                        Vec::with_capacity(1 + assignment.replicas.len());
+                    for holder in std::iter::once(assignment.master)
+                        .chain(assignment.replicas.iter().copied())
+                    {
+                        if holder != self_id && !holders.contains(&holder) {
+                            holders.push(holder);
+                        }
+                    }
+                    unproven.push((shard, holders));
+                }
                 debug_shard_log(
                     shard,
                     format!(
@@ -14673,6 +15021,248 @@ fn run_orphan_cleanup(
         }
     }
 
+    // W12 — proof-of-elsewhere phase. Runs with NO locks held (a probe is a
+    // network round-trip; holding the shard-table read guard across it would
+    // stall every topology change behind an unreachable peer) and BEFORE the
+    // census is published, so the gauge reports what is retained after ALL
+    // available evidence, not just after the in-memory #28 map.
+    let mut proof_reclaimed = 0u32;
+    let mut proof_refused = 0u32;
+    // P2-4 — shards the holders DID vouch for but which gave up no records,
+    // because every one of them moved past the proven generation. Neither a
+    // refusal (the holders agreed) nor a reclaim (the third copy is still
+    // there), so it needs its own counter rather than inflating either.
+    let mut proof_stale_no_delete = 0u32;
+    // W12 P2 — shards retained WITHOUT asking anyone because their manifest
+    // would exceed the per-probe cap. Neither refused nor reclaimed, so it
+    // needs its own counter: otherwise the census stays pinned with both proof
+    // counters flat, which reads exactly like "the pass never ran" (the
+    // ambiguity W11 FIX 4(b) forbids in this function).
+    let mut proof_oversized = 0u32;
+    if let Some(proof) = proof
+        && !unproven.is_empty()
+    {
+        let started = std::time::Instant::now();
+        // P1-1 (b) — resume where the previous pass stopped. Without this a
+        // budget-limited pass always restarts at the lowest shard id, so the
+        // tail of the shard space is never probed at all.
+        rotate_unproven_to_cursor(
+            &mut unproven,
+            (ORPHAN_PROBE_CURSOR.load(Ordering::Relaxed) & 0x0FFF) as u16,
+        );
+        // P1-1 (a) — holders that have already failed THIS pass. A hung but
+        // connectable holder costs a full per-holder probe budget, and it
+        // holds ~1/N of every shard, so without this memo one dead peer
+        // consumes the whole pass budget on the first few shards and the
+        // backlog never drains. Short-circuited with NO round-trip.
+        let mut failed_holders: std::collections::HashSet<NodeId> =
+            std::collections::HashSet::new();
+        // Cleared by any early exit, so the cursor is only reset when the
+        // whole candidate list was actually walked.
+        let mut completed_full_sweep = true;
+        // P1-2 — ONE index walk for the whole pass. Calling
+        // `keys_for_shard` per unproven shard re-walked the entire primary
+        // index per shard (135 full walks per pass at the observed backlog) —
+        // exactly the unbounded per-item enumeration W10 P1-4 already bounded
+        // elsewhere.
+        let mut keys_by_shard = engine.keys_by_shard();
+        for (shard, holders) in unproven {
+            if started.elapsed() >= ORPHAN_RECLAIM_PROBE_BUDGET {
+                // Resume here next pass rather than re-covering the same
+                // prefix forever.
+                ORPHAN_PROBE_CURSOR.store(shard as u32, Ordering::Relaxed);
+                completed_full_sweep = false;
+                tracing::info!(
+                    resume_at_shard = shard,
+                    "cluster: orphan-reclaim proof phase hit its wall-clock \
+                     budget — remaining shards stay retained and the next pass \
+                     resumes from here",
+                );
+                break;
+            }
+            // Unreachable in practice: a shard reaches here only via
+            // `effective_assignment`, which always names a master, and `self`
+            // is excluded only after the `owned` test already failed. Kept as
+            // a fail-closed backstop — no holder to ask is not a proof.
+            if holders.is_empty() {
+                continue;
+            }
+            // P1-1 (a) — if a holder already failed this pass, this shard can
+            // never reach unanimity. Refuse it for free.
+            if holders.iter().any(|h| failed_holders.contains(h)) {
+                proof_refused = proof_refused.saturating_add(1);
+                continue;
+            }
+            if shard_table.read().version != topology_epoch {
+                completed_full_sweep = false;
+                break;
+            }
+            // The manifest is this node's EXACT current image of the shard —
+            // the same `(txid, generation)` shape the drain-convergence probe
+            // ships. A read failure is not a "no" from the holders, so it must
+            // not be counted as a refusal; retain and re-ask next pass.
+            let keys = keys_by_shard.remove(&shard).unwrap_or_default();
+            // P1-2 — refuse oversized shards BEFORE paying for the manifest.
+            // Beyond the cap the frame would approach/exceed `MAX_FRAME_SIZE`
+            // and could never be confirmed anyway, so building it is pure
+            // waste repeated every pass.
+            if keys.len() > ORPHAN_RECLAIM_MAX_MANIFEST_ENTRIES {
+                proof_oversized = proof_oversized.saturating_add(1);
+                debug_shard_log(
+                    shard,
+                    "orphan_cleanup RETAIN (manifest over the per-probe cap)",
+                );
+                tracing::debug!(
+                    shard,
+                    keys = keys.len(),
+                    cap = ORPHAN_RECLAIM_MAX_MANIFEST_ENTRIES,
+                    "cluster: orphan-reclaim proof skipped — shard exceeds the \
+                     manifest cap; retained (gauged as \
+                     teraslab_orphan_cleanup_proof_oversized_total)",
+                );
+                continue;
+            }
+            let entries = match collect_manifest_entries(engine, shard, &keys) {
+                Ok(entries) => entries,
+                Err(err) => {
+                    tracing::debug!(
+                        shard,
+                        %err,
+                        "cluster: orphan-reclaim proof skipped — manifest collection failed",
+                    );
+                    continue;
+                }
+            };
+            if entries.is_empty() {
+                continue;
+            }
+            // P1-2 — enumeration itself costs device reads, so re-check the
+            // budget AFTER it, not only before. Otherwise one huge shard can
+            // overrun the budget arbitrarily.
+            if started.elapsed() >= ORPHAN_RECLAIM_PROBE_BUDGET {
+                ORPHAN_PROBE_CURSOR.store(shard as u32, Ordering::Relaxed);
+                completed_full_sweep = false;
+                break;
+            }
+            // UNANIMITY, not "any holder": confirming only one of two RF=2
+            // holders would license dropping to a single surviving copy. See
+            // `ShardHolderProof` for why unanimity is SUFFICIENT (the
+            // version-ordering asymmetry). Short-circuits on the first
+            // refusal, and memoises it so no other shard pays for it again.
+            let mut unanimous = true;
+            for holder in &holders {
+                if proof.holder_holds_superset(shard, *holder, topology_epoch, &entries) {
+                    continue;
+                }
+                failed_holders.insert(*holder);
+                unanimous = false;
+                break;
+            }
+            if !unanimous {
+                proof_refused = proof_refused.saturating_add(1);
+                debug_shard_log(shard, "orphan_cleanup RETAIN (proof-of-elsewhere refused)");
+                continue;
+            }
+            // Re-verify every gate under the locks: the probe took wall-clock
+            // time, so the topology may have moved the shard back here, a pull
+            // may have been queued, or a task may have re-opened. LOCK ORDER
+            // (W8) — shard_table before migration.
+            //
+            // NOTE — an unchanged `version` does NOT imply an unchanged holder
+            // set: `commit_shard` / `rollback_shard` mutate `handoff_state`
+            // and the effective assignment at CONSTANT version
+            // (`cluster::shards`). That is why the ownership test below is
+            // re-evaluated from a FRESH `effective_assignment` rather than
+            // being skipped once the version matches. It is also why a holder
+            // set that changed under a constant version can leave the proof
+            // attesting a set we no longer ask about — bounded by the fact
+            // that any such change either re-assigns the shard here (caught by
+            // the `owned` test) or narrows a handoff whose target already
+            // confirmed.
+            {
+                let table = shard_table.read();
+                if table.version != topology_epoch {
+                    completed_full_sweep = false;
+                    break;
+                }
+                let assignment = table.effective_assignment(shard);
+                if assignment.master == self_id || assignment.replicas.contains(&self_id) {
+                    continue;
+                }
+                let mgr = migration.lock();
+                if mgr.has_pending_inbound(shard) {
+                    continue;
+                }
+                if mgr
+                    .active_migrations()
+                    .iter()
+                    .any(|p| p.shard == shard && !p.is_complete())
+                {
+                    continue;
+                }
+            }
+            let mut deleted = 0u64;
+            for (key, proven_generation) in &entries {
+                // The proof covers this EXACT image, so the delete is gated on
+                // that generation INSIDE the engine's per-tx stripe lock
+                // (W12 P2-3). A record that mutated after the manifest was
+                // folded was never shown to the holders and comes back
+                // `NotDue`; re-enumerating the shard here, or checking the
+                // generation out here where the check is lock-free, would both
+                // let an unconfirmed image be destroyed.
+                match engine.reclaim_held_copy_at_generation(
+                    &DeleteRequest {
+                        tx_key: *key,
+                        due_guard: None,
+                    },
+                    *proven_generation,
+                ) {
+                    Ok(()) => deleted += 1,
+                    // Gone already, or moved past the proof — both leave the
+                    // record's fate to a later pass.
+                    Err(crate::ops::error::SpendError::TxNotFound)
+                    | Err(crate::ops::error::SpendError::NotDue) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            shard,
+                            err = ?e,
+                            "cluster: orphan-reclaim proof delete error",
+                        );
+                    }
+                }
+            }
+            // P2-4 — only a shard that actually gave up records is "resolved".
+            // A shard whose every record moved past the proof (generation
+            // guard) deleted nothing and is still a third copy; counting it as
+            // reclaimed drained this PR's own success gauge while the
+            // over-replication remained.
+            if deleted == 0 {
+                proof_stale_no_delete = proof_stale_no_delete.saturating_add(1);
+                debug_shard_log(
+                    shard,
+                    "orphan_cleanup RETAIN (proof-of-elsewhere proved, but every \
+                     record moved past it)",
+                );
+                continue;
+            }
+            // The census counted this shard as retained during the scan; the
+            // proof has since resolved it, so the gauge published below must
+            // not still claim it.
+            retained_no_evidence = retained_no_evidence.saturating_sub(1);
+            proof_reclaimed = proof_reclaimed.saturating_add(1);
+            debug_shard_log(
+                shard,
+                format!("orphan_cleanup RECLAIM (proof-of-elsewhere) deleted={deleted}"),
+            );
+        }
+        // A pass that walked the whole candidate list owes the next one no
+        // resume point; one that stopped early left the cursor at its
+        // stopping shard.
+        if completed_full_sweep {
+            ORPHAN_PROBE_CURSOR.store(0, Ordering::Relaxed);
+        }
+    }
+
     // GAP 2 — publish the retained-without-evidence census for THIS pass
     // (including zero, so a reclaimed shard leaves the gauge). Stored before
     // the empty-early-return: a pass that retains everything still reports.
@@ -14683,6 +15273,14 @@ fn run_orphan_cleanup(
         // pass, including zero, so a cleared skip leaves the gauge).
         m.orphan_cleanup_skipped_pending_inbound
             .store(skipped_pending_inbound, Ordering::Relaxed);
+        // W12 — counters, not gauges: these accumulate the proof phase's
+        // verdicts so a drained census is distinguishable from a pass that
+        // never asked.
+        m.orphan_cleanup_proof_reclaimed.add(proof_reclaimed as u64);
+        m.orphan_cleanup_proof_refused.add(proof_refused as u64);
+        m.orphan_cleanup_proof_stale_no_delete
+            .add(proof_stale_no_delete as u64);
+        m.orphan_cleanup_proof_oversized.add(proof_oversized as u64);
     }
     if retained_no_evidence > 0 {
         tracing::warn!(
@@ -14834,6 +15432,17 @@ fn cleanup_orphaned_shard_if_settled(
         // may hold the last copy (table advanced past an incomplete handoff, or
         // a stale prior-epoch handoff whose target since died); retain it.
         if !mgr.has_committed_handoff(shard, topology_epoch) {
+            // W12 P2-6 — never silent: this is the same W11 FIX 4(b) failure
+            // mode one branch lower. Its two siblings above meter their
+            // returns, so a run that only ever bailed HERE reclaimed nothing
+            // while every reclaim gauge read clean.
+            if let Some(m) = crate::metrics::migration_metrics() {
+                m.orphan_cleanup_shard_skipped.inc();
+            }
+            debug_shard_log(
+                shard,
+                "per-shard orphan_cleanup SKIP (no committed handoff, #28)",
+            );
             return;
         }
     }
@@ -16638,6 +17247,106 @@ pub(crate) fn migration_complete_rejection_error(status: u8, payload: &[u8]) -> 
     format!("target rejected: status {status}{detail}")
 }
 
+/// One superset probe's outcome.
+///
+/// Split in two because the two callers need different strengths of evidence,
+/// and collapsing them hid a real hole:
+///
+/// * the DRAIN path (`transfer-then-relinquish`) STREAMED ITS RECORDS TO THE
+///   ADDRESS IT THEN ASKS. So even under an address collision the answer comes
+///   from the node that received the stream — the collision is
+///   SELF-CONSISTENT, and `STATUS_OK` is sufficient. That contract is
+///   unchanged.
+///
+///   That reasoning can never hold for unanimity over a holder set the
+///   manifest was never shipped to, which is precisely why one caller needs
+///   `binding` and the other does not. Do not "harmonise" them.
+/// * the ORPHAN-RECLAIM path asks SEVERAL nodes and requires unanimity, so an
+///   answer that cannot be attributed to a specific node is worthless to it
+///   (W12 P2-5). It requires `binding`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SupersetAnswer {
+    /// The responder returned `STATUS_OK`.
+    confirmed: bool,
+    /// The responder's attestation, when it supplied one.
+    binding: Option<SupersetConfirmation>,
+}
+
+impl SupersetAnswer {
+    /// Not confirmed — rejection, timeout, unreachable, exhausted retries.
+    const fn refused() -> Self {
+        Self {
+            confirmed: false,
+            binding: None,
+        }
+    }
+}
+
+/// What a `STATUS_OK` superset answer attests, decoded from its body.
+///
+/// W12 P2-5 — the answer used to be an empty body, so it was attributable
+/// only to the ADDRESS dialled. Two holder ids resolving to one address let a
+/// single node's single answer satisfy "every holder confirmed", which is
+/// exactly the RF-1 drop unanimity exists to prevent. The responder now names
+/// itself, the shard it checked, its own shard-table version and the manifest
+/// it verified; [`SupersetConfirmation::attests`] is the matching check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SupersetConfirmation {
+    shard: u16,
+    /// The RESPONDER's shard-table version at the moment it answered.
+    responder_epoch: u64,
+    responder: NodeId,
+    manifest_hash: [u8; 32],
+}
+
+impl SupersetConfirmation {
+    /// Wire size: `[shard:u16][responder_epoch:u64][responder:u64][manifest:32]`.
+    const ENCODED_LEN: usize = 2 + 8 + 8 + 32;
+
+    /// Decode a confirmation body. `None` for any body that is absent or
+    /// short — a responder that did not attest its identity has not proven
+    /// anything, and the caller must keep its data.
+    fn decode(payload: &[u8]) -> Option<Self> {
+        if payload.len() < Self::ENCODED_LEN {
+            return None;
+        }
+        let mut manifest_hash = [0u8; 32];
+        manifest_hash.copy_from_slice(&payload[18..50]);
+        Some(Self {
+            shard: u16::from_le_bytes([payload[0], payload[1]]),
+            responder_epoch: u64::from_le_bytes(payload[2..10].try_into().ok()?),
+            responder: NodeId(u64::from_le_bytes(payload[10..18].try_into().ok()?)),
+            manifest_hash,
+        })
+    }
+
+    /// Does this answer actually attest what the asker needs?
+    ///
+    /// All four must hold: it is about the shard we asked about, it came from
+    /// the node we believe we asked (defeats the address-collision case
+    /// above), it covers the exact manifest we shipped, and the responder's
+    /// own version is at least our probe epoch — which is the ordering the
+    /// anti-mutual-reclaim argument in [`ShardHolderProof`] rests on, checked
+    /// HERE rather than delegated to the responder's own staleness gate.
+    fn attests(
+        &self,
+        shard: u16,
+        holder: NodeId,
+        topology_epoch: u64,
+        manifest_hash: &[u8; 32],
+    ) -> bool {
+        // `NodeId(0)` is what an UNCLUSTERED responder reports (it has no
+        // identity to attest) and is also the codebase's inbound sentinel, so
+        // it is never a real holder — refuse it explicitly rather than letting
+        // a zero match a zero.
+        self.responder != NodeId(0)
+            && self.shard == shard
+            && self.responder == holder
+            && self.responder_epoch >= topology_epoch
+            && &self.manifest_hash == manifest_hash
+    }
+}
+
 /// Retry/timeout budget for one [`confirm_target_holds_superset`] call.
 ///
 /// The probe's cost is `retry_delays_ms.len()` attempts, each bounded by
@@ -16710,9 +17419,9 @@ fn confirm_target_holds_superset(
     manifest_entries: &[(TxKey, u32)],
     auth_secret: Option<&[u8]>,
     profile: &SupersetProbeProfile,
-) -> bool {
+) -> SupersetAnswer {
     if manifest_entries.is_empty() {
-        return false;
+        return SupersetAnswer::refused();
     }
     // Wire layout matches `send_migration_complete`'s verify-only frame; the
     // SUPERSET flag selects the containment check on the receiver.
@@ -16740,7 +17449,7 @@ fn confirm_target_holds_superset(
     // target (confirmed superset or a logical reject); `Ok(None)` /  `Err`
     // is a TRANSIENT connection failure (the target's per-IP connection cap
     // resetting the migration burst), which is retried below.
-    let attempt = || -> std::result::Result<Option<bool>, String> {
+    let attempt = || -> std::result::Result<Option<SupersetAnswer>, String> {
         let mut stream = TcpStream::connect_timeout(&target_addr, profile.connect_timeout)
             .map_err(|e| format!("connect: {e}"))?;
         stream
@@ -16751,7 +17460,13 @@ fn confirm_target_holds_superset(
             .map_err(|e| format!("set write timeout: {e}"))?;
         crate::replication::tcp_transport::configure_tcp_keepalive(&stream);
         let response = exchange_frame(&mut stream, &request, auth_secret)?;
-        Ok(Some(response.status == STATUS_OK))
+        if response.status != STATUS_OK {
+            return Ok(Some(SupersetAnswer::refused()));
+        }
+        Ok(Some(SupersetAnswer {
+            confirmed: true,
+            binding: SupersetConfirmation::decode(&response.payload),
+        }))
     };
 
     // The probe competes with the migration pool (up to `migration_pool_size`
@@ -16780,7 +17495,7 @@ fn confirm_target_holds_superset(
         err = %last_err,
         "cluster: superset probe failed after retries — keeping data, rolling back",
     );
-    false
+    SupersetAnswer::refused()
 }
 
 /// Send batched migration-complete handshakes for multiple shards in a
@@ -26715,6 +27430,7 @@ mod tests {
             &shard_table,
             &migration,
             new_table.version,
+            None,
         );
 
         assert_eq!(
@@ -26758,12 +27474,682 @@ mod tests {
             &shard_table,
             &migration,
             new_table.version,
+            None,
         );
 
         assert_eq!(
             engine.shard_record_count(shard),
             0,
             "run_orphan_cleanup must reclaim a non-owned shard after a committed handoff",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // W12 — proof-of-elsewhere for the #28 fail-closed retain
+    // -----------------------------------------------------------------
+
+    /// A scripted [`ShardHolderProof`] that answers from a fixed allow-list and
+    /// records every question asked, so a test can pin BOTH the verdict and
+    /// who was consulted.
+    struct ScriptedProof {
+        /// Holders that confirm containment. Any holder absent from this set
+        /// answers "no" — the fail-closed outcome.
+        confirming: std::collections::HashSet<NodeId>,
+        asked: Mutex<Vec<(u16, NodeId, usize)>>,
+        /// Runs before each answer, so a test can mutate engine state
+        /// underneath an in-flight probe (the TOCTOU guard).
+        on_probe: Option<Box<dyn Fn(u16) + Send + Sync>>,
+    }
+
+    impl ScriptedProof {
+        fn new(confirming: &[NodeId]) -> Self {
+            Self {
+                confirming: confirming.iter().copied().collect(),
+                asked: Mutex::new(Vec::new()),
+                on_probe: None,
+            }
+        }
+
+        fn asked_for_shard(&self, shard: u16) -> Vec<NodeId> {
+            let mut v: Vec<NodeId> = self
+                .asked
+                .lock()
+                .iter()
+                .filter(|(s, _, _)| *s == shard)
+                .map(|(_, n, _)| *n)
+                .collect();
+            v.sort_by_key(|n| n.0);
+            v
+        }
+    }
+
+    impl ShardHolderProof for ScriptedProof {
+        fn holder_holds_superset(
+            &self,
+            shard: u16,
+            holder: NodeId,
+            _topology_epoch: u64,
+            entries: &[(TxKey, u32)],
+        ) -> bool {
+            if let Some(hook) = &self.on_probe {
+                hook(shard);
+            }
+            self.asked.lock().push((shard, holder, entries.len()));
+            self.confirming.contains(&holder)
+        }
+    }
+
+    /// Pick a shard node1 holds but the post-change table no longer assigns to
+    /// it — the exact shape both #28 tests above use.
+    fn shard_node1_lost(old_table: &ShardTable, new_table: &ShardTable) -> u16 {
+        (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let old = old_table.target_assignment(s);
+                let new = new_table.target_assignment(s);
+                (old.master == NodeId(1) || old.replicas.contains(&NodeId(1)))
+                    && new.master != NodeId(1)
+                    && !new.replicas.contains(&NodeId(1))
+            })
+            .expect("node1 should hold a shard it no longer owns after removal")
+    }
+
+    /// W12 — THE over-replication fix. A node holding a third RF=2 copy with
+    /// NO committed-handoff evidence (the SIGKILL / never-handed-off case,
+    /// where the in-memory epoch-exact evidence is UNEARNABLE) must reclaim it
+    /// once every committed holder positively confirms it already holds a
+    /// superset of the copy.
+    ///
+    /// Fail-before: the #28 guard retains unconditionally, so the third copy
+    /// survives forever (default-15: 45/295 records at 3 holders after 19
+    /// census rounds; default-17: 192/2000). Pass-after: the proof reclaims it.
+    #[test]
+    fn run_orphan_cleanup_reclaims_without_handoff_when_every_holder_proves_superset() {
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let shard = shard_node1_lost(&old_table, &new_table);
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(shard, 61));
+        assert_eq!(engine.shard_record_count(shard), 1, "the stale third copy");
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        // NO committed handoff — this is precisely the state #28 retains and
+        // that no future event can ever repair.
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let proof = ScriptedProof::new(&[NodeId(2), NodeId(3)]);
+
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+            Some(&proof),
+        );
+
+        assert_eq!(
+            engine.shard_record_count(shard),
+            0,
+            "a unanimous proof-of-elsewhere must reclaim the copy #28 cannot prove",
+        );
+        let assignment = new_table.effective_assignment(shard);
+        let mut expected: Vec<NodeId> = std::iter::once(assignment.master)
+            .chain(assignment.replicas.iter().copied())
+            .filter(|n| *n != NodeId(1))
+            .collect();
+        expected.sort_by_key(|n| n.0);
+        expected.dedup();
+        assert_eq!(
+            proof.asked_for_shard(shard),
+            expected,
+            "every committed holder must be asked — a single holder's word is \
+             not enough to drop to RF-1",
+        );
+    }
+
+    /// P1-3 — the anti-mutual-reclaim invariant must not evaporate at epoch 0.
+    ///
+    /// What stops A and B reclaiming the same shard from each other is a
+    /// VERSION-ORDERING argument (see [`ShardHolderProof`]): a confirmation
+    /// implies the responder's table version is >= the asker's probe epoch, so
+    /// mutual confirmation forces equal versions, where the `owned` test
+    /// already excludes the shard on both sides. That argument is enforced by
+    /// the responder's `local_version < migration_epoch` gate — which lives
+    /// inside `if migration_epoch > 0` (dispatch.rs), so at epoch 0 the
+    /// responder answers unconditionally and the asymmetry disappears.
+    ///
+    /// A probe carrying epoch 0 therefore has no ordering guarantee behind it
+    /// and must be refused BEFORE the wire, not merely answered "no" after it.
+    /// Fail-before: the probe dials and asks.
+    #[test]
+    fn peer_superset_proof_refuses_epoch_zero_without_dialling() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let accepts_thread = accepts.clone();
+        let stop_thread = stop.clone();
+        let acceptor = std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok(_stream) => {
+                        accepts_thread.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        });
+
+        let mut node_addrs = std::collections::HashMap::new();
+        node_addrs.insert(NodeId(2), addr);
+        let proof = PeerSupersetProof {
+            self_id: NodeId(1),
+            node_addrs,
+            cluster_secret: None,
+        };
+        let entries = vec![(TxKey { txid: [7u8; 32] }, 3u32)];
+
+        assert!(
+            !proof.holder_holds_superset(9, NodeId(2), 0, &entries),
+            "an epoch-0 probe carries no version ordering and must not confirm",
+        );
+        // Give a (wrongly) dialled connection time to land before sampling.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            accepts.load(Ordering::Relaxed),
+            0,
+            "an epoch-0 probe must be refused before the wire — a responder at \
+             epoch 0 skips BOTH staleness gates and would answer unconditionally",
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        acceptor.join().expect("acceptor thread");
+    }
+
+    /// P2-5 — a confirmation must be BOUND to the holder, shard, manifest and
+    /// version it claims to answer for.
+    ///
+    /// The vacuous-unanimity path: two holder ids resolving to ONE address
+    /// (config error, recycled container address, stale entry after a node-id
+    /// change) means one node answers both probes. With an unbound answer that
+    /// single reply satisfies "every holder confirmed" and licenses the very
+    /// RF-1 drop unanimity exists to prevent. The `responder` field is what
+    /// makes the second probe fail.
+    #[test]
+    fn superset_confirmation_attests_only_what_it_is_bound_to() {
+        let manifest = [9u8; 32];
+        let other_manifest = [8u8; 32];
+        let confirmation = SupersetConfirmation {
+            shard: 77,
+            responder_epoch: 12,
+            responder: NodeId(2),
+            manifest_hash: manifest,
+        };
+
+        assert!(
+            confirmation.attests(77, NodeId(2), 12, &manifest),
+            "the exact answer asked for must attest",
+        );
+        assert!(
+            confirmation.attests(77, NodeId(2), 11, &manifest),
+            "a responder AHEAD of the probe epoch still attests",
+        );
+        // The address-collision case: node3's probe answered by node2.
+        assert!(
+            !confirmation.attests(77, NodeId(3), 12, &manifest),
+            "an answer from a different node must NOT satisfy another holder's \
+             probe — this is the vacuous-unanimity path",
+        );
+        assert!(
+            !confirmation.attests(78, NodeId(2), 12, &manifest),
+            "an answer about another shard must not attest",
+        );
+        assert!(
+            !confirmation.attests(77, NodeId(2), 13, &manifest),
+            "a responder BEHIND the probe epoch breaks the version ordering \
+             the anti-mutual-reclaim argument rests on",
+        );
+        assert!(
+            !confirmation.attests(77, NodeId(2), 12, &other_manifest),
+            "an answer about a different manifest must not attest",
+        );
+
+        // An UNCLUSTERED responder has no identity and reports NodeId(0),
+        // which is also the inbound sentinel — a zero must never satisfy a
+        // zero.
+        let unidentified = SupersetConfirmation {
+            responder: NodeId(0),
+            ..confirmation
+        };
+        assert!(
+            !unidentified.attests(77, NodeId(0), 12, &manifest),
+            "NodeId(0) is not an identity and must never attest, even against \
+             a NodeId(0) holder",
+        );
+    }
+
+    /// The two callers need different strengths of evidence, and the type must
+    /// keep them apart. A bare `STATUS_OK` settles the DRAIN question (one
+    /// responder, at a known address, relinquishing only the asker's own
+    /// phantom copy) but must never settle an ORPHAN holder's vote, where
+    /// unanimity is only meaningful if each answer is attributable.
+    #[test]
+    fn superset_answer_separates_bare_confirmation_from_an_attributable_one() {
+        let refused = SupersetAnswer::refused();
+        assert!(!refused.confirmed, "a refusal is not a confirmation");
+        assert!(refused.binding.is_none());
+
+        let bare = SupersetAnswer {
+            confirmed: true,
+            binding: None,
+        };
+        assert!(
+            bare.confirmed,
+            "a bare STATUS_OK still answers the drain path's question",
+        );
+        assert!(
+            bare.binding.is_none(),
+            "…but carries nothing the orphan path can attribute to a holder, \
+             so it can never count toward unanimity",
+        );
+    }
+
+    /// A confirmation body that is absent or truncated is not a proof. Pins
+    /// the fail-closed decode so a responder that never attested its identity
+    /// can never be read as a yes.
+    #[test]
+    fn superset_confirmation_decode_rejects_a_short_body() {
+        assert_eq!(SupersetConfirmation::decode(&[]), None);
+        assert_eq!(
+            SupersetConfirmation::decode(&[0u8; SupersetConfirmation::ENCODED_LEN - 1]),
+            None,
+            "a truncated binding must not decode into a confirmation",
+        );
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&77u16.to_le_bytes());
+        body.extend_from_slice(&12u64.to_le_bytes());
+        body.extend_from_slice(&2u64.to_le_bytes());
+        body.extend_from_slice(&[9u8; 32]);
+        assert_eq!(
+            SupersetConfirmation::decode(&body),
+            Some(SupersetConfirmation {
+                shard: 77,
+                responder_epoch: 12,
+                responder: NodeId(2),
+                manifest_hash: [9u8; 32],
+            }),
+            "a well-formed binding must round-trip the responder's attestation",
+        );
+    }
+
+    /// P2-3 — the generation predicate must be re-validated INSIDE the stripe
+    /// lock the delete takes, not by the caller outside it.
+    ///
+    /// `reclaim_held_copy` has no generation predicate at all, so a caller
+    /// whose authority covers one exact image had no way to express it. Pins
+    /// both directions of the new entry point.
+    #[test]
+    fn reclaim_held_copy_at_generation_refuses_a_moved_record() {
+        use crate::ops::remaining::{DeleteRequest, FreezeRequest};
+
+        let engine = test_engine();
+        let key = tx_key_for_shard(123, 7);
+        create_test_record(&engine, key);
+        let proven = engine.read_metadata(&key).unwrap().generation;
+
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: [0x44u8; 32],
+            })
+            .expect("freeze bumps the generation");
+        let moved = engine.read_metadata(&key).unwrap().generation;
+        assert!(
+            moved > proven,
+            "fixture must advance the generation (proven {proven}, now {moved})",
+        );
+
+        match engine.reclaim_held_copy_at_generation(
+            &DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            },
+            proven,
+        ) {
+            Err(crate::ops::error::SpendError::NotDue) => {}
+            other => panic!("a moved record must be refused with NotDue, got {other:?}"),
+        }
+        assert!(
+            engine.read_metadata(&key).is_ok(),
+            "the refused record must be left intact",
+        );
+
+        // At the CURRENT generation the same call reclaims.
+        engine
+            .reclaim_held_copy_at_generation(
+                &DeleteRequest {
+                    tx_key: key,
+                    due_guard: None,
+                },
+                moved,
+            )
+            .expect("the proven image must be reclaimable");
+        assert_eq!(
+            engine.shard_record_count(123),
+            0,
+            "reclaiming the proven image must actually free it",
+        );
+    }
+
+    /// P1-1 (a) — a holder that fails once must not be re-dialled for every
+    /// other shard in the same pass.
+    ///
+    /// A hung-but-connectable holder costs a full per-holder probe budget
+    /// (~4.7 s). It is a holder of roughly 1/N of all shards, so without a
+    /// per-pass failure memo the pass pays that cost once per shard and the
+    /// wall-clock budget is exhausted after the first one — the 135-shard
+    /// backlog this whole path exists to drain never drains.
+    ///
+    /// Fail-before: one ask per unproven shard (thousands). Pass-after: one
+    /// ask per distinct holder.
+    #[test]
+    fn run_orphan_cleanup_proof_asks_a_failed_holder_at_most_once_per_pass() {
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 30, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 31, 1);
+        let engine = Arc::new(test_engine());
+        let lost: Vec<u16> = (0..NUM_SHARDS as u16)
+            .filter(|&s| {
+                let old = old_table.target_assignment(s);
+                let new = new_table.target_assignment(s);
+                (old.master == NodeId(1) || old.replicas.contains(&NodeId(1)))
+                    && new.master != NodeId(1)
+                    && !new.replicas.contains(&NodeId(1))
+            })
+            .take(64)
+            .collect();
+        assert!(
+            lost.len() > 8,
+            "need a meaningful backlog to distinguish per-shard from per-holder \
+             dialling (got {})",
+            lost.len(),
+        );
+        for (i, &shard) in lost.iter().enumerate() {
+            create_test_record(&engine, tx_key_for_shard(shard, 100 + i as u8));
+        }
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        // Nobody confirms — every holder "fails" on its first ask.
+        let proof = ScriptedProof::new(&[]);
+
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+            Some(&proof),
+        );
+
+        let total_asks = proof.asked.lock().len();
+        assert!(
+            total_asks <= 2,
+            "a failed holder must be memoised for the pass: expected at most \
+             one ask per distinct holder (2), got {total_asks} across \
+             {} unproven shards",
+            lost.len(),
+        );
+    }
+
+    /// P1-1 (b) — successive passes must ROTATE through the shard space.
+    ///
+    /// `unproven` is rebuilt in ascending shard order every pass. With the
+    /// budget checked inside the loop, a pass that exhausts its budget early
+    /// always does so at the same low shard ids, so the high ones are never
+    /// probed — pass after pass, forever. The cursor makes the next pass
+    /// resume where this one stopped.
+    #[test]
+    fn rotate_unproven_to_cursor_resumes_where_the_last_pass_stopped() {
+        let build = || {
+            vec![
+                (10u16, vec![NodeId(2)]),
+                (20u16, vec![NodeId(2)]),
+                (30u16, vec![NodeId(2)]),
+                (40u16, vec![NodeId(2)]),
+            ]
+        };
+
+        // Cursor 0 (first pass ever) — untouched ascending order.
+        let mut v = build();
+        rotate_unproven_to_cursor(&mut v, 0);
+        assert_eq!(
+            v.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![10, 20, 30, 40],
+        );
+
+        // A pass that stopped after shard 20 resumes at 30 and WRAPS, so the
+        // shards it already covered are retried last, not first.
+        let mut v = build();
+        rotate_unproven_to_cursor(&mut v, 21);
+        assert_eq!(
+            v.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![30, 40, 10, 20],
+            "the next pass must resume past the cursor and wrap",
+        );
+
+        // A cursor beyond every candidate wraps fully rather than emptying the
+        // pass (the shard set shrinks as shards are reclaimed).
+        let mut v = build();
+        rotate_unproven_to_cursor(&mut v, 41);
+        assert_eq!(
+            v.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![10, 20, 30, 40],
+            "a cursor past the end must wrap to the start, never drop shards",
+        );
+
+        // Exact hit on a candidate starts AT it.
+        let mut v = build();
+        rotate_unproven_to_cursor(&mut v, 30);
+        assert_eq!(
+            v.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![30, 40, 10, 20],
+        );
+    }
+
+    /// The proof phase sits UNDER the wave-10 pending-inbound skip, not beside
+    /// it. A shard whose reverse-pull is still fenced/queued must never be
+    /// offered to a holder for proof — its records are the very thing an
+    /// in-flight pull is about to move, so a confirmation would be about the
+    /// wrong moment in time. The shard must be skipped without a single probe.
+    ///
+    /// Fail-before (a proof phase wired above the gate): the fenced shard is
+    /// probed and reclaimed mid-pull.
+    #[test]
+    fn run_orphan_cleanup_proof_never_probes_a_shard_with_a_pending_inbound() {
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 20, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 21, 1);
+        let mut shards = (0..NUM_SHARDS as u16).filter(|&s| {
+            let old = old_table.target_assignment(s);
+            let new = new_table.target_assignment(s);
+            (old.master == NodeId(1) || old.replicas.contains(&NodeId(1)))
+                && new.master != NodeId(1)
+                && !new.replicas.contains(&NodeId(1))
+        });
+        let fenced = shards.next().expect("a shard node1 no longer owns");
+        let unfenced = shards.next().expect("a second such shard");
+
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(fenced, 65));
+        create_test_record(&engine, tx_key_for_shard(unfenced, 66));
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        // NEITHER shard has #28 evidence, so the proof phase is the only thing
+        // that could reclaim either — the FENCE is the only difference.
+        migration.lock().mark_heal_fence_active(fenced);
+
+        // A proof that would confirm anything it is asked about.
+        let proof = ScriptedProof::new(&[NodeId(1), NodeId(2), NodeId(3)]);
+
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+            Some(&proof),
+        );
+
+        assert!(
+            proof.asked_for_shard(fenced).is_empty(),
+            "a shard with a pending inbound must be skipped before the proof \
+             phase, not proven out from under its own pull (W10 P2-2)",
+        );
+        assert_eq!(
+            engine.shard_record_count(fenced),
+            1,
+            "the fenced shard's records must survive",
+        );
+        assert_eq!(
+            engine.shard_record_count(unfenced),
+            0,
+            "…while the unfenced sibling is still proven and reclaimed — the \
+             gate is per-shard, not a global bail",
+        );
+    }
+
+    /// The safety mirror, and the reason the bar is UNANIMITY. One committed
+    /// holder confirms, the other does not: reclaiming would leave a single
+    /// copy, so the pass must retain exactly as #28 does today.
+    #[test]
+    fn run_orphan_cleanup_retains_when_any_holder_refuses_the_superset_proof() {
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let shard = shard_node1_lost(&old_table, &new_table);
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(shard, 62));
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        // Only node2 confirms; node3 (the other committed holder) does not.
+        let proof = ScriptedProof::new(&[NodeId(2)]);
+
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+            Some(&proof),
+        );
+
+        assert_eq!(
+            engine.shard_record_count(shard),
+            1,
+            "a partial proof is not a proof — dropping here would leave one copy",
+        );
+    }
+
+    /// A holder that answers "no" for EVERY shard must leave the pass exactly
+    /// where `proof = None` leaves it: nothing reclaimed, nothing lost. This
+    /// pins the fail-closed default so a future probe-transport change (a
+    /// timeout, an unreachable peer, an unknown address) can never be
+    /// mistaken for permission.
+    #[test]
+    fn run_orphan_cleanup_with_a_wholly_unconfirming_proof_reclaims_nothing() {
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let shard = shard_node1_lost(&old_table, &new_table);
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(shard, 63));
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let proof = ScriptedProof::new(&[]);
+
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+            Some(&proof),
+        );
+
+        assert_eq!(
+            engine.shard_record_count(shard),
+            1,
+            "an unconfirmed shard must be retained, exactly as with no proof",
+        );
+    }
+
+    /// The proof covers the EXACT `(txid, generation)` image that was shipped.
+    /// If a record mutates locally between the probe and the delete, the
+    /// holders never saw that newer image, so it is NOT proven elsewhere and
+    /// must survive.
+    ///
+    /// Fail-before (a naive implementation re-enumerating `keys_for_shard` and
+    /// deleting whatever it finds): the newer image is dropped and the
+    /// mutation is lost. Pass-after: the generation guard skips it.
+    #[test]
+    fn run_orphan_cleanup_proof_does_not_reclaim_a_record_that_moved_past_the_proof() {
+        use crate::ops::remaining::FreezeRequest;
+
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let shard = shard_node1_lost(&old_table, &new_table);
+        let engine = Arc::new(test_engine());
+        let key = tx_key_for_shard(shard, 64);
+        create_test_record(&engine, key);
+        let proven_generation = engine.read_metadata(&key).unwrap().generation;
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+
+        // The mutation lands WHILE the probe is in flight — after the manifest
+        // was folded, before the delete loop runs.
+        let mutate_engine = engine.clone();
+        let mut proof = ScriptedProof::new(&[NodeId(2), NodeId(3)]);
+        proof.on_probe = Some(Box::new(move |_shard| {
+            let _ = mutate_engine.freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: [0x44u8; 32],
+            });
+        }));
+
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+            Some(&proof),
+        );
+
+        let after = engine
+            .read_metadata(&key)
+            .expect("a record that moved past the proof must survive the reclaim");
+        let after_generation = after.generation;
+        assert!(
+            after_generation > proven_generation,
+            "the fixture must actually advance the generation for this test to \
+             mean anything (proven {proven_generation}, after {after_generation})",
+        );
+        assert_eq!(
+            engine.shard_record_count(shard),
+            1,
+            "only the exact proven image may be reclaimed",
         );
     }
 
@@ -26813,6 +28199,7 @@ mod tests {
             &shard_table,
             &migration,
             new_table.version,
+            None,
         );
         assert_eq!(
             engine.shard_record_count(shard),
@@ -26873,6 +28260,7 @@ mod tests {
             &shard_table,
             &migration,
             new_table.version,
+            None,
         );
         assert_eq!(engine.shard_record_count(shard), 1, "fail-closed: retained");
         assert_eq!(
@@ -26893,6 +28281,7 @@ mod tests {
             &shard_table,
             &migration,
             new_table.version,
+            None,
         );
         assert_eq!(engine.shard_record_count(shard), 0);
         assert_eq!(
@@ -27045,6 +28434,7 @@ mod tests {
             &shard_table,
             &migration,
             new_table.version,
+            None,
         );
         assert_eq!(
             engine.shard_record_count(fenced),
@@ -27217,6 +28607,7 @@ mod tests {
             &shard_table,
             &migration,
             new_table.version,
+            None,
         );
 
         assert_eq!(engine.shard_record_count(shard), 0, "reclaim must remove");
@@ -27297,6 +28688,7 @@ mod tests {
             &shard_table,
             &migration,
             new_table.version,
+            None,
         );
 
         assert_eq!(
@@ -27422,6 +28814,7 @@ mod tests {
             &shard_table,
             &migration,
             table_n1.version,
+            None,
         );
 
         assert_eq!(
@@ -28889,6 +30282,7 @@ mod tests {
                     None,
                     None,
                     origin,
+                    None,
                 )
             });
 
@@ -46242,7 +47636,7 @@ mod tests {
             std::thread::spawn(move || {
                 barrier.wait();
                 for _ in 0..ITERS {
-                    run_orphan_cleanup(self_id, &engine, &shard_table, &migration, epoch);
+                    run_orphan_cleanup(self_id, &engine, &shard_table, &migration, epoch, None);
                 }
                 done.fetch_add(1, AOrd::SeqCst);
             })
