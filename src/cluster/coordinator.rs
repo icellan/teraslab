@@ -14677,18 +14677,18 @@ fn rotate_unproven_to_cursor(unproven: &mut [(u16, Vec<NodeId>)], cursor: u16) {
 ///
 /// # Why unanimity is sufficient — the version-ordering asymmetry
 ///
-/// Unanimous confirmation is only safe because of a property of the
-/// RESPONDER, and it must be stated here or the next reader will assume the
-/// probe is self-contained. The responder refuses any probe whose
-/// `migration_epoch` exceeds its own shard-table version
-/// (`ERR_MIGRATION_TARGET_NOT_READY`, `server::dispatch`). So:
+/// Unanimity is safe because of a VERSION-ORDERING ASYMMETRY, and the ASKER
+/// enforces it here rather than trusting the peer to: the responder echoes its
+/// own shard-table version, and [`SupersetConfirmation::attests`] requires
+/// `responder_epoch >= topology_epoch` before a confirmation counts. So the
+/// invariant is checked at the deletion site and cannot be lost by a refactor
+/// of the peer's own gate (the responder does also refuse a probe whose
+/// `migration_epoch` exceeds its version — `ERR_MIGRATION_TARGET_NOT_READY`,
+/// `server::dispatch` — but that is now defence in depth, not the load-bearing
+/// check).
 ///
-/// The asker ENFORCES this itself — the responder echoes its own shard-table
-/// version and [`SupersetConfirmation::attests`] requires
-/// `responder_epoch >= topology_epoch` — so the invariant no longer depends on
-/// the peer's gate being reached. The peer-side reasoning below is still what
-/// makes the ordering MEANINGFUL, and is recorded here because a reader
-/// standing at the deletion site must be able to find it:
+/// What that ordering BUYS is the argument below, recorded here because a
+/// reader standing at the deletion site must be able to find it:
 ///
 /// * A reclaiming shard S at epoch `Va` implies every holder B confirmed,
 ///   hence `Vb >= Va`.
