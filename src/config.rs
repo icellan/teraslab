@@ -1629,10 +1629,28 @@ pub struct ServerConfig {
     /// ran for the entire history before this path and lost no data.
     ///
     /// ON, the reclaim is armed and every reclaimed shard is logged at INFO
-    /// with its record count and confirming holders, and counted in
-    /// `teraslab_orphan_cleanup_proof_reclaimed_total`. Arm it only in a
-    /// cluster where you accept that a unanimous instant-in-time confirmation
-    /// may be voided by a concurrent drain on the confirming holders.
+    /// with its record count, destroyed txids and confirming holders, and
+    /// counted in `teraslab_orphan_cleanup_proof_reclaimed_total`; the node
+    /// also emits a boot WARN naming this flag. Arm it only in a cluster where
+    /// you accept that a unanimous instant-in-time confirmation may be voided
+    /// by a concurrent drain on the confirming holders.
+    ///
+    /// # TRAP — the CI failure this default knowingly re-reds
+    ///
+    /// Leaving this OFF re-reds `assert_rf2_replication_exact` (the E2E
+    /// harness's exact-RF=2 census) on scenarios 15 and 17: after a SIGKILL
+    /// the committed-handoff evidence is UNEARNABLE, so the #28 guard retains
+    /// third copies forever — W12 measured 45/295 (default-15) and 192/2000
+    /// (default-17) records at three holders, and the harness only allows a
+    /// 15s convergence window (`RF2_CENSUS_WINDOW`).
+    ///
+    /// That red is the SAFE state. The obvious "fix" — flipping this flag to
+    /// `true` so the extra holders disappear — is precisely the configuration
+    /// that deleted four acked records. It trades bounded over-replication
+    /// (wasted space, fully visible in
+    /// `teraslab_orphan_cleanup_retained_no_evidence`) for silent data loss
+    /// (acked UTXOs reading `NotFound`). Fix the retention protocol or scope
+    /// the assertion; never reach for this flag to turn CI green.
     pub orphan_cleanup_proof_reclaim_enabled: bool,
 
     /// SWIM probe interval in milliseconds.

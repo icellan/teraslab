@@ -2846,6 +2846,43 @@ impl ReplicationCheckReport {
         format!("holder_count_histogram=[{histogram}], examples=[{examples}]")
     }
 
+    /// W13 round-2 review P2-4 — the TRAP, rendered into the PANIC MESSAGE of
+    /// an over-replication failure (records at more than RF holders).
+    ///
+    /// A CI triager reads the assertion failure, not this file's doc comments.
+    /// The obvious move on seeing "3:45" in the histogram is to arm
+    /// `orphan_cleanup_proof_reclaim_enabled` so the third copies get
+    /// reclaimed — which is exactly the configuration that destroyed four
+    /// acked records. Empty for a clean or UNDER-replicated report: that is a
+    /// different failure with a different fix, and a note that always fires is
+    /// a note nobody reads.
+    fn over_replication_trap_note(&self) -> String {
+        let over_replicated: u32 = self
+            .holder_count_histogram
+            .iter()
+            .enumerate()
+            .filter(|(holders, _)| *holders > RF2_EXPECTED_HOLDERS)
+            .map(|(_, count)| *count)
+            .sum();
+        if over_replicated == 0 {
+            return String::new();
+        }
+        format!(
+            "\n  NOTE — {over_replicated} of these are OVER-replicated (more than \
+             {RF2_EXPECTED_HOLDERS} holders), which is the SAFE state and is EXPECTED on \
+             scenarios 15/17: after a SIGKILL the committed-handoff evidence is \
+             unearnable, so the fail-closed #28 guard retains the extra copy \
+             forever. Do NOT 'fix' this by setting \
+             orphan_cleanup_proof_reclaim_enabled = true — that is the \
+             configuration that DELETED FOUR ACKED RECORDS in CI (a unanimous \
+             superset confirmation is an instant-in-time attestation with no \
+             retention commitment, so confirming holders draining the same copy \
+             leave this node deleting the last one). Over-replication is wasted \
+             space; a destroyed UTXO is not recoverable. Fix the retention \
+             protocol or scope this assertion — never the flag."
+        )
+    }
+
     fn mismatch_diagnostics(&self) -> String {
         if self.mismatch_examples.is_empty() {
             "examples=[none]".to_string()
@@ -2910,7 +2947,7 @@ async fn batch_verify_replication_report(
         }
 
         if expect_present {
-            if holder_indices.len() != 2 {
+            if holder_indices.len() != RF2_EXPECTED_HOLDERS {
                 report.record_holder_error(txid, &holder_indices);
                 continue;
             }
@@ -2990,6 +3027,12 @@ const RF2_CENSUS_WINDOW: Duration = Duration::from_secs(15);
 /// Delay between holder-census rounds inside [`RF2_CENSUS_WINDOW`].
 const RF2_CENSUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Holders every present record must have under the harness's RF=2 configs.
+/// More than this is OVER-replication (see
+/// `ReplicationCheckReport::over_replication_trap_note`); fewer is
+/// under-replication.
+const RF2_EXPECTED_HOLDERS: usize = 2;
+
 /// What to do after one round of the RF=2 holder census.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Rf2CensusVerdict {
@@ -3029,6 +3072,31 @@ fn rf2_census_verdict(
 /// [`RF2_CENSUS_WINDOW`]; violations only fail the scenario if they are
 /// still present at the deadline, and the assertion then reports the LAST
 /// census's histogram and examples.
+///
+/// # TRAP — do NOT "fix" an over-replication failure here by arming `orphan_cleanup_proof_reclaim_enabled`
+///
+/// This assertion is EXPECTED to red on scenarios 15 and 17 with a
+/// three-holder (over-replication) histogram, and that is the SAFE state.
+///
+/// After a SIGKILL the surviving node's committed-handoff evidence for a
+/// shard is unearnable, so the fail-closed task-#28 guard retains its copy
+/// forever — W12 measured 45/295 (default-15) and 192/2000 (default-17)
+/// records sitting at three holders. W12 added a "proof-of-elsewhere" reclaim
+/// to clear exactly that, and it DESTROYED FOUR ACKED RECORDS in CI: a
+/// unanimous superset confirmation is an instant-in-time attestation with no
+/// retention commitment, so holders draining the same copy through the legacy
+/// path (observed ~100 ms after confirming) — or a retired issue-#46 parking
+/// refusal — leave this node deleting the LAST copy. It now ships behind
+/// `orphan_cleanup_proof_reclaim_enabled`, default OFF.
+///
+/// So the obvious move when this assertion goes red — flip that flag to
+/// `true` and watch the extra holders disappear — is a trade of BOUNDED
+/// OVER-REPLICATION (this red) for SILENT DATA LOSS (records that read
+/// `NotFound` after being acked). Over-replication is wasted space; a
+/// destroyed UTXO is not recoverable. Fix the retention protocol (lease /
+/// transfer-then-relinquish) or scope the assertion, never the flag.
+/// The server-side rationale lives on
+/// `ServerConfig::orphan_cleanup_proof_reclaim_enabled`.
 pub async fn assert_rf2_replication_exact(
     client: &Client,
     docker: &DockerHelpers,
@@ -3069,10 +3137,13 @@ pub async fn assert_rf2_replication_exact(
                     report.holder_errors,
                     0,
                     "{label}: {}/{} records did not have exactly RF=2 local holders ({}) \
-                     [still violated after {rounds} census rounds over {elapsed:.1}s]",
+                     [still violated after {rounds} census rounds over {elapsed:.1}s]{}",
                     report.holder_errors,
                     txids.len(),
                     report.holder_diagnostics(),
+                    // W13 P2-4 — the TRAP travels with the failure a triager
+                    // actually reads, not just the doc comment above.
+                    report.over_replication_trap_note(),
                 );
                 assert_eq!(
                     report.mismatches,
@@ -4118,6 +4189,47 @@ mod replication_report_tests {
             local_view_effective_master_id: s.master_id,
             is_serving_fenced: false,
         }
+    }
+
+    /// W13 round-2 review P2-4 — a CI triager reads the assertion FAILURE, not
+    /// the source. When the census fails with records at THREE holders, the
+    /// panic itself must say that over-replication is the safe state and that
+    /// arming `orphan_cleanup_proof_reclaim_enabled` to clear it is the
+    /// configuration that destroyed four acked records.
+    ///
+    /// Under-replication (fewer than RF holders) is a different failure with a
+    /// different fix, so it must NOT carry the note — otherwise the warning
+    /// becomes noise that gets skimmed past.
+    #[test]
+    fn over_replication_failure_carries_the_orphan_proof_trap_note() {
+        // 3 holders under RF=2 — the default-15/17 shape.
+        let mut over = ReplicationCheckReport::new(3);
+        over.record_holder_error(&[0x11u8; 32], &[0, 1, 2]);
+        let note = over.over_replication_trap_note();
+        assert!(
+            note.contains("orphan_cleanup_proof_reclaim_enabled"),
+            "the note must name the flag a triager would otherwise reach for: {note}",
+        );
+        assert!(
+            note.contains("SAFE"),
+            "the note must say the over-replication red is the safe state: {note}",
+        );
+        assert!(
+            note.contains("DELETED FOUR ACKED RECORDS"),
+            "the note must state the cost of the obvious 'fix': {note}",
+        );
+
+        // 1 holder under RF=2 — under-replication, a different problem.
+        let mut under = ReplicationCheckReport::new(3);
+        under.record_holder_error(&[0x22u8; 32], &[0]);
+        assert!(
+            under.over_replication_trap_note().is_empty(),
+            "an under-replication failure must not carry the over-replication note",
+        );
+
+        // A clean report says nothing either.
+        let clean = ReplicationCheckReport::new(3);
+        assert!(clean.over_replication_trap_note().is_empty());
     }
 
     /// Two failing txids surveyed across three nodes (1, 2, 3): node 1

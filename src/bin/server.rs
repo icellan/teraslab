@@ -369,6 +369,82 @@ fn run_one_catchup_pass(
 /// vs clock-skew rejection counters.
 static CLUSTER_AUTH_METRICS: ClusterAuthMetrics = ClusterAuthMetrics::new();
 
+/// Project the operator's [`ServerConfig`] onto the coordinator's
+/// [`ClusterConfig`], the FIRST of the two wiring hops every cluster policy
+/// flag travels (the second is `ClusterConfig` -> `MigrationManager`, wired in
+/// `ClusterCoordinator::new`).
+///
+/// Extracted from `main` deliberately (W13 review): this projection is a wall
+/// of near-identical `field: config.field` lines, several of which default to
+/// `true`, so a copy-paste that feeds the WRONG source field into a
+/// safety-critical flag type-checks and runs. Living in `main` it could not be
+/// tested at all; as a function the hop is pinned by
+/// `cluster_config_maps_each_cluster_flag_from_its_own_server_config_field`.
+///
+/// Parameters are the values `main` derives around it: the resolved listen /
+/// SWIM addresses, the resolved seed list, the SWIM `incarnation` loaded from
+/// durable topology state, the validated cluster id, and whether reverse-heal
+/// is enabled (which arms online re-heal).
+#[allow(clippy::too_many_arguments)]
+fn build_cluster_config(
+    config: &ServerConfig,
+    self_addr: std::net::SocketAddr,
+    swim_bind: std::net::SocketAddr,
+    seed_nodes: Vec<std::net::SocketAddr>,
+    persisted_incarnation: u64,
+    cluster_id: teraslab::cluster::topology::ClusterId,
+    reverse_heal_enabled: bool,
+) -> teraslab::cluster::coordinator::ClusterConfig {
+    use teraslab::cluster::coordinator::ClusterConfig;
+    use teraslab::cluster::shards::NodeId;
+
+    ClusterConfig {
+        self_id: NodeId(config.node_id),
+        self_addr,
+        swim_bind,
+        swim_advertise_addr: None,
+        seed_nodes,
+        replication_factor: config.replication_factor,
+        committed_master_election_enabled: config.committed_master_election_enabled,
+        under_replication_sweep_enabled: config.under_replication_sweep_enabled,
+        replica_abort_forced_resync_enabled: config.replica_abort_forced_resync_enabled,
+        migration_vetoed_reduction_enabled: config.migration_vetoed_reduction_enabled,
+        migration_weak_veto_arbitration_enabled: config.migration_weak_veto_arbitration_enabled,
+        // W13 — MUST be `config.orphan_cleanup_proof_reclaim_enabled`. Feeding
+        // any sibling flag here (two of them default ON) silently arms a
+        // deleting path that destroyed four acked records. Pinned by test.
+        orphan_cleanup_proof_reclaim_enabled: config.orphan_cleanup_proof_reclaim_enabled,
+        probe_interval: std::time::Duration::from_millis(config.swim_probe_interval_ms),
+        suspicion_timeout: std::time::Duration::from_millis(config.swim_suspicion_timeout_ms),
+        cluster_secret: config
+            .cluster_secret
+            .as_ref()
+            .map(|s| s.as_bytes().to_vec()),
+        max_migration_threads: config.max_migration_threads,
+        topology_propose_timeout: std::time::Duration::from_millis(
+            config.resolved_topology_propose_timeout_ms(),
+        ),
+        topology_debounce: std::time::Duration::from_millis(config.resolved_topology_debounce_ms()),
+        migration_pool_size: config.migration_pool_size,
+        migration_batch_size: config.migration_batch_size,
+        persisted_incarnation,
+        cluster_id,
+        // Reverse-heal Phase 3b — RUNTIME online re-heal rides the reverse-heal
+        // enable (`reverse_heal.tombstones`): RULE-DS, the delete-safe apply the
+        // pull relies on, is a no-op without it. Default OFF.
+        reverse_heal_online: reverse_heal_enabled,
+        // Reverse-heal Phase 3c — fenced-heal deadline + fallback (design §E3).
+        // Only consulted when online re-heal is enabled; a heal stuck past the
+        // deadline escalates to a fresher master (default) or alert-and-holds.
+        heal_deadline: config.reverse_heal.resolved_heal_deadline(),
+        heal_deadline_action: config.reverse_heal.heal_deadline_action,
+        // W11 FIX 3 / P1-B — partial serving from a stale shard table is
+        // an operator opt-in (default OFF = the historical fail-closed
+        // posture).
+        stale_table_partial_serving: config.stale_table_partial_serving,
+    }
+}
+
 fn main() {
     // Parse config first so the observability section can drive the
     // subscriber (OTLP endpoint, sampling ratio, service name).
@@ -1731,10 +1807,7 @@ fn main() {
     // when single-node / RF=1 (no replicas to repair).
     let mut catchup_ctx: Option<CatchupContext> = None;
     let cluster = if config.is_clustered() {
-        use teraslab::cluster::coordinator::{
-            ClusterConfig, ClusterCoordinator, ReplicationRuntimeConfig,
-        };
-        use teraslab::cluster::shards::NodeId;
+        use teraslab::cluster::coordinator::{ClusterCoordinator, ReplicationRuntimeConfig};
 
         // `validate_safe_defaults` already parsed both `listen_addr` and
         // `advertise_addr` (when set) — F-G10-013 made `advertise_addr` a
@@ -1795,8 +1868,6 @@ fn main() {
             })
             .collect();
 
-        let probe_interval = std::time::Duration::from_millis(config.swim_probe_interval_ms);
-
         let cluster_state_path = config.resolved_cluster_state_path();
         // Load the durable topology state. Fail-closed: a state file that
         // exists but cannot be read or decoded aborts startup. Booting past it
@@ -1839,50 +1910,15 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        let cluster_config = ClusterConfig {
-            self_id: NodeId(config.node_id),
+        let cluster_config = build_cluster_config(
+            &config,
             self_addr,
             swim_bind,
-            swim_advertise_addr: None,
-            seed_nodes: seed_addrs,
-            replication_factor: config.replication_factor,
-            committed_master_election_enabled: config.committed_master_election_enabled,
-            under_replication_sweep_enabled: config.under_replication_sweep_enabled,
-            replica_abort_forced_resync_enabled: config.replica_abort_forced_resync_enabled,
-            migration_vetoed_reduction_enabled: config.migration_vetoed_reduction_enabled,
-            migration_weak_veto_arbitration_enabled: config.migration_weak_veto_arbitration_enabled,
-            orphan_cleanup_proof_reclaim_enabled: config.orphan_cleanup_proof_reclaim_enabled,
-            probe_interval,
-            suspicion_timeout: std::time::Duration::from_millis(config.swim_suspicion_timeout_ms),
-            cluster_secret: config
-                .cluster_secret
-                .as_ref()
-                .map(|s| s.as_bytes().to_vec()),
-            max_migration_threads: config.max_migration_threads,
-            topology_propose_timeout: std::time::Duration::from_millis(
-                config.resolved_topology_propose_timeout_ms(),
-            ),
-            topology_debounce: std::time::Duration::from_millis(
-                config.resolved_topology_debounce_ms(),
-            ),
-            migration_pool_size: config.migration_pool_size,
-            migration_batch_size: config.migration_batch_size,
-            persisted_incarnation: topo_state.incarnation,
-            cluster_id: resolved_cluster_id,
-            // Reverse-heal Phase 3b — RUNTIME online re-heal rides the reverse-heal
-            // enable (`reverse_heal.tombstones`): RULE-DS, the delete-safe apply the
-            // pull relies on, is a no-op without it. Default OFF.
-            reverse_heal_online: reverse_heal_enabled,
-            // Reverse-heal Phase 3c — fenced-heal deadline + fallback (design §E3).
-            // Only consulted when online re-heal is enabled; a heal stuck past the
-            // deadline escalates to a fresher master (default) or alert-and-holds.
-            heal_deadline: config.reverse_heal.resolved_heal_deadline(),
-            heal_deadline_action: config.reverse_heal.heal_deadline_action,
-            // W11 FIX 3 / P1-B — partial serving from a stale shard table is
-            // an operator opt-in (default OFF = the historical fail-closed
-            // posture).
-            stale_table_partial_serving: config.stale_table_partial_serving,
-        };
+            seed_addrs,
+            topo_state.incarnation,
+            resolved_cluster_id,
+            reverse_heal_enabled,
+        );
         if initial_peak > 1 {
             tracing::info!(
                 peak = initial_peak,
@@ -2902,8 +2938,170 @@ fn init_tracing_subscriber_fallback() {
 
 #[cfg(test)]
 mod tests {
-    use super::{buffered_loss_window_applies, is_redo_pressure};
+    use super::{buffered_loss_window_applies, build_cluster_config, is_redo_pressure};
     use teraslab::redo::RedoError;
+
+    /// Build the hop-1 projection from a `ServerConfig` with everything but
+    /// the flags under test left at its shipped default.
+    fn cluster_config_from(config: &teraslab::config::ServerConfig) -> ClusterConfig {
+        build_cluster_config(
+            config,
+            "127.0.0.1:3300".parse().expect("self addr"),
+            "127.0.0.1:3301".parse().expect("swim bind"),
+            Vec::new(),
+            0,
+            teraslab::cluster::topology::ClusterId::UNSET,
+            false,
+        )
+    }
+
+    use teraslab::cluster::coordinator::ClusterConfig;
+    use teraslab::config::ServerConfig;
+
+    /// W13 review, hop 1 of 2 (`ServerConfig` -> `ClusterConfig`).
+    ///
+    /// The projection is a wall of near-identical `field: config.field` lines
+    /// and TWO siblings of the orphan-proof flag default to `true`
+    /// (`replica_abort_forced_resync_enabled`,
+    /// `migration_weak_veto_arbitration_enabled`). A copy-paste feeding either
+    /// of those into `orphan_cleanup_proof_reclaim_enabled` type-checks, keeps
+    /// every other test green, and silently ARMS a path that deleted four
+    /// acked records on every default deployment.
+    ///
+    /// This pins the hop in both directions: a DEFAULT config must project
+    /// disarmed, and each flag must be sourced from its OWN field — proved by
+    /// flipping one flag at a time and requiring exactly that flag to move.
+    #[test]
+    fn cluster_config_maps_each_cluster_flag_from_its_own_server_config_field() {
+        let defaults = cluster_config_from(&ServerConfig::default());
+        assert!(
+            !defaults.orphan_cleanup_proof_reclaim_enabled,
+            "a default ServerConfig MUST project a DISARMED proof reclaim — a \
+             sibling flag was wired in its place",
+        );
+
+        // Flip ONLY the orphan-proof flag: it must move, and nothing else may.
+        let armed = cluster_config_from(&ServerConfig {
+            orphan_cleanup_proof_reclaim_enabled: true,
+            ..ServerConfig::default()
+        });
+        assert!(
+            armed.orphan_cleanup_proof_reclaim_enabled,
+            "an explicitly armed ServerConfig must project an armed ClusterConfig",
+        );
+        assert_eq!(
+            armed.migration_weak_veto_arbitration_enabled,
+            defaults.migration_weak_veto_arbitration_enabled,
+            "arming the orphan proof must not disturb a sibling flag",
+        );
+        assert_eq!(
+            armed.replica_abort_forced_resync_enabled, defaults.replica_abort_forced_resync_enabled,
+            "arming the orphan proof must not disturb a sibling flag",
+        );
+
+        // The mirror: flipping a SIBLING must NOT move the orphan-proof flag.
+        // This is the copy-paste that would arm the deleting path.
+        let sibling_off = cluster_config_from(&ServerConfig {
+            migration_weak_veto_arbitration_enabled: false,
+            replica_abort_forced_resync_enabled: false,
+            ..ServerConfig::default()
+        });
+        assert!(
+            !sibling_off.orphan_cleanup_proof_reclaim_enabled,
+            "the orphan-proof flag tracked a SIBLING field — it must be sourced \
+             from `orphan_cleanup_proof_reclaim_enabled` alone",
+        );
+        assert!(!sibling_off.migration_weak_veto_arbitration_enabled);
+        assert!(!sibling_off.replica_abort_forced_resync_enabled);
+    }
+
+    /// W13 round-2 review P2-3 — the extraction moved the mis-wire class to a
+    /// NEW seam: `build_cluster_config` takes two adjacent `SocketAddr`
+    /// positional params (`self_addr`, `swim_bind`), and the projection also
+    /// carries several same-typed scalar pairs (two `Duration`s from two
+    /// `u64` ms fields; three `usize` migration knobs). A transposition there
+    /// type-checks exactly like the flag copy-paste does.
+    ///
+    /// Every value below is DISTINCT, so any swapped pair lands the wrong
+    /// value in an asserted field.
+    #[test]
+    fn cluster_config_carries_addresses_and_scalars_without_transposition() {
+        let self_addr = "127.0.0.1:3300".parse().expect("self addr");
+        let swim_bind = "127.0.0.2:3399".parse().expect("swim bind");
+        let seed: std::net::SocketAddr = "127.0.0.3:3311".parse().expect("seed");
+        let cluster_id = teraslab::cluster::topology::ClusterId([0xAB; 16]);
+
+        let config = ServerConfig {
+            node_id: 7,
+            replication_factor: 3,
+            // Two u64 ms fields that become two `Duration`s — deliberately
+            // different so a swap is visible.
+            swim_probe_interval_ms: 111,
+            swim_suspicion_timeout_ms: 2222,
+            // Three `usize` knobs, all distinct.
+            max_migration_threads: 5,
+            migration_pool_size: 64,
+            migration_batch_size: 900,
+            ..ServerConfig::default()
+        };
+        let cc = build_cluster_config(
+            &config,
+            self_addr,
+            swim_bind,
+            vec![seed],
+            42,
+            cluster_id,
+            true,
+        );
+
+        // The two adjacent SocketAddr params.
+        assert_eq!(cc.self_addr, self_addr, "self_addr / swim_bind transposed");
+        assert_eq!(cc.swim_bind, swim_bind, "self_addr / swim_bind transposed");
+        assert_eq!(cc.seed_nodes, vec![seed], "seed list must be carried whole");
+        assert!(
+            cc.swim_advertise_addr.is_none(),
+            "no advertise addr is derived here",
+        );
+
+        // The two Durations derived from two different ms fields.
+        assert_eq!(
+            cc.probe_interval,
+            std::time::Duration::from_millis(111),
+            "probe_interval / suspicion_timeout transposed",
+        );
+        assert_eq!(
+            cc.suspicion_timeout,
+            std::time::Duration::from_millis(2222),
+            "probe_interval / suspicion_timeout transposed",
+        );
+
+        // The three same-typed migration knobs.
+        assert_eq!(cc.max_migration_threads, 5);
+        assert_eq!(cc.migration_pool_size, 64);
+        assert_eq!(cc.migration_batch_size, 900);
+
+        // Remaining carried scalars.
+        assert_eq!(cc.self_id.0, 7, "self_id must come from node_id");
+        assert_eq!(cc.replication_factor, 3);
+        assert_eq!(cc.persisted_incarnation, 42);
+        assert_eq!(cc.cluster_id, cluster_id);
+        assert!(
+            cc.reverse_heal_online,
+            "the reverse-heal enable arms online re-heal",
+        );
+        assert_eq!(
+            cc.heal_deadline_action,
+            config.reverse_heal.heal_deadline_action,
+        );
+        assert_eq!(
+            cc.stale_table_partial_serving,
+            config.stale_table_partial_serving,
+        );
+        assert!(
+            cc.cluster_secret.is_none(),
+            "no secret configured must project None, not an empty secret",
+        );
+    }
 
     /// The intent-recovery startup barrier downgrades `RedoError::LogFull`
     /// (transient redo backpressure, re-drivable from source) to the retry

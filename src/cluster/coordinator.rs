@@ -3247,6 +3247,23 @@ impl ClusterCoordinator {
                 mgr.set_orphan_cleanup_proof_reclaim_enabled(
                     config.orphan_cleanup_proof_reclaim_enabled,
                 );
+                if config.orphan_cleanup_proof_reclaim_enabled {
+                    // W13 review item 5 — arming re-enables a path with KNOWN
+                    // data-loss exposure. That belongs in the boot log, not
+                    // only in a config file nobody re-reads during an
+                    // incident. Disarmed nodes stay silent.
+                    tracing::warn!(
+                        "cluster: orphan_cleanup_proof_reclaim_enabled=true — the \
+                         proof-of-elsewhere orphan reclaim is ARMED. This path has \
+                         a known data loss exposure: a unanimous superset \
+                         confirmation is an instant-in-time attestation with no \
+                         retention commitment, so holders draining the same copy \
+                         (legacy committed-handoff path) or a retired issue-#46 \
+                         refusal can leave this node deleting the LAST copy of \
+                         acked records. Ships disabled; disable it unless you are \
+                         deliberately qualifying it.",
+                    );
+                }
                 Arc::new(Mutex::new(mgr))
             },
             replication_factor: config.replication_factor,
@@ -14752,6 +14769,31 @@ const ORPHAN_RECLAIM_PROBE_BUDGET: Duration = Duration::from_secs(5);
 /// disk.
 const ORPHAN_RECLAIM_MAX_MANIFEST_ENTRIES: usize = 50_000;
 
+/// W13 review item 2 — how many destroyed txids the per-shard reclaim audit
+/// line renders before it truncates.
+///
+/// "Which records went" is the first question asked after an incident, and the
+/// freed-space arithmetic that exposed this defect could not answer it. But a
+/// shard can hold up to [`ORPHAN_RECLAIM_MAX_MANIFEST_ENTRIES`] records, so an
+/// unbounded list would flood the log as badly as the previous silence hid it.
+/// Ids beyond this cap are reported as a `txids_omitted` COUNT — never dropped
+/// without saying so.
+const ORPHAN_RECLAIM_LOGGED_TXIDS: usize = 16;
+
+/// Format a 32-byte txid as a lowercase hex string for log lines.
+///
+/// Log-only rendering: the wire protocol never hex-encodes (raw bytes, the
+/// client decides). A txid that identifies a DESTROYED record has to be
+/// copy-pasteable into a query, which raw `Debug` bytes are not.
+fn hex_txid(txid: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(64);
+    for b in txid {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 /// P1-1 — where the next orphan-reclaim proof pass starts scanning.
 ///
 /// `unproven` is rebuilt in ascending shard order every pass, so a pass that
@@ -15339,6 +15381,12 @@ fn run_orphan_cleanup(
                 }
             }
             let mut deleted = 0u64;
+            // W13 review item 2 — the txids this reclaim destroys, for the
+            // audit line below. BOUNDED at `ORPHAN_RECLAIM_LOGGED_TXIDS`: a
+            // shard can hold thousands of records and one flooding line per
+            // reclaimed shard would be as unusable as the silence it replaced.
+            // The overflow is reported as a count, never dropped silently.
+            let mut deleted_txids: Vec<String> = Vec::new();
             for (key, proven_generation) in &entries {
                 // The proof covers this EXACT image, so the delete is gated on
                 // that generation INSIDE the engine's per-tx stripe lock
@@ -15354,7 +15402,12 @@ fn run_orphan_cleanup(
                     },
                     *proven_generation,
                 ) {
-                    Ok(()) => deleted += 1,
+                    Ok(()) => {
+                        deleted += 1;
+                        if deleted_txids.len() < ORPHAN_RECLAIM_LOGGED_TXIDS {
+                            deleted_txids.push(hex_txid(&key.txid));
+                        }
+                    }
                     // Gone already, or moved past the proof — both leave the
                     // record's fate to a later pass.
                     Err(crate::ops::error::SpendError::TxNotFound)
@@ -15404,6 +15457,8 @@ fn run_orphan_cleanup(
                 records_deleted = deleted,
                 confirmed_by = ?holders.iter().map(|n| n.0).collect::<Vec<_>>(),
                 topology_epoch,
+                txids = ?deleted_txids,
+                txids_omitted = deleted.saturating_sub(deleted_txids.len() as u64),
                 "cluster: orphan cleanup DELETED this node's copy of a \
                  non-owned shard on proof-of-elsewhere — every listed holder \
                  confirmed it already holds a superset \
@@ -28000,6 +28055,197 @@ mod tests {
         );
     }
 
+    /// Capture every `tracing` event at exactly `level` emitted by `f` on THIS
+    /// thread, flattened to one `message field=value ...` line per event.
+    ///
+    /// Thread-scoped (`with_default`), so concurrent tests do not interfere.
+    /// Used by the W13 tests that pin the two log lines a deleting path owes
+    /// its operator: the per-shard reclaim announcement and the boot warning
+    /// that the reclaim is armed at all.
+    fn capture_tracing_lines(level: tracing::Level, f: impl FnOnce()) -> Vec<String> {
+        use std::sync::Mutex as StdMutex;
+        use tracing::Event;
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::Context;
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::registry::LookupSpan;
+
+        #[derive(Default)]
+        struct LineVisitor {
+            rendered: String,
+        }
+
+        impl Visit for LineVisitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.rendered.insert_str(0, &format!("{value:?} "));
+                } else {
+                    self.rendered
+                        .push_str(&format!("{}={value:?} ", field.name()));
+                }
+            }
+        }
+
+        struct CaptureLayer {
+            want: tracing::Level,
+            lines: Arc<StdMutex<Vec<String>>>,
+        }
+
+        impl<S> Layer<S> for CaptureLayer
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                if event.metadata().level() != &self.want {
+                    return;
+                }
+                let mut visitor = LineVisitor::default();
+                event.record(&mut visitor);
+                self.lines
+                    .lock()
+                    .expect("capture lock")
+                    .push(visitor.rendered);
+            }
+        }
+
+        let lines = Arc::new(StdMutex::new(Vec::new()));
+        // TRACE lets the filter pass everything through to the level test above.
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("trace"))
+            .with(CaptureLayer {
+                want: level,
+                lines: lines.clone(),
+            });
+        tracing::subscriber::with_default(subscriber, f);
+        let captured = lines.lock().expect("capture lock");
+        captured.clone()
+    }
+
+    /// A `ClusterConfig` whose cluster-policy flags are all at their SHIPPED
+    /// defaults except the ones a test names. Mirrors the production
+    /// projection in `bin/server.rs` (`build_cluster_config`).
+    fn cluster_config_for_test(
+        orphan_cleanup_proof_reclaim_enabled: bool,
+        migration_weak_veto_arbitration_enabled: bool,
+    ) -> ClusterConfig {
+        ClusterConfig {
+            self_id: NodeId(1),
+            self_addr: "127.0.0.1:19100".parse().expect("self addr"),
+            swim_bind: "127.0.0.1:19101".parse().expect("swim bind"),
+            swim_advertise_addr: None,
+            seed_nodes: Vec::new(),
+            replication_factor: 2,
+            committed_master_election_enabled: false,
+            under_replication_sweep_enabled: false,
+            replica_abort_forced_resync_enabled: true,
+            migration_vetoed_reduction_enabled: false,
+            migration_weak_veto_arbitration_enabled,
+            orphan_cleanup_proof_reclaim_enabled,
+            probe_interval: Duration::from_millis(100),
+            suspicion_timeout: Duration::from_secs(1),
+            cluster_secret: None,
+            max_migration_threads: 1,
+            topology_propose_timeout: Duration::from_millis(500),
+            topology_debounce: Duration::from_millis(0),
+            migration_pool_size: 1,
+            migration_batch_size: 1,
+            persisted_incarnation: 0,
+            cluster_id: crate::cluster::topology::ClusterId::UNSET,
+            reverse_heal_online: false,
+            heal_deadline: Duration::from_secs(60),
+            heal_deadline_action: crate::config::HealDeadlineAction::AlertAndHold,
+            stale_table_partial_serving: false,
+        }
+    }
+
+    /// W13 review, hop 2 of 2 (`ClusterConfig` -> `MigrationManager`).
+    ///
+    /// `ClusterCoordinator::new` wires four near-identical `mgr.set_*` calls in
+    /// a row, and TWO of the sibling flags default to `true`. A copy-paste
+    /// feeding one of those into `set_orphan_cleanup_proof_reclaim_enabled`
+    /// type-checks and silently ARMS the deleting path on every default
+    /// deployment; until now neither hop had a test.
+    ///
+    /// Pins both directions: a disarmed config must produce a disarmed
+    /// manager (with its siblings still carrying their OWN values), and an
+    /// armed config must produce an armed manager.
+    #[test]
+    fn coordinator_wires_the_orphan_proof_flag_onto_its_migration_manager() {
+        // Disarmed config + a sibling that defaults ON: if the sibling were
+        // wired into the orphan flag, the manager would come up ARMED.
+        let disarmed = ClusterCoordinator::new(cluster_config_for_test(false, true), 1);
+        {
+            let mgr = disarmed.migration.lock();
+            assert!(
+                !mgr.orphan_cleanup_proof_reclaim_enabled(),
+                "a disarmed ClusterConfig must produce a DISARMED manager — a \
+                 sibling flag was wired into the orphan-proof setter",
+            );
+            assert!(
+                mgr.weak_veto_arbitration_enabled(),
+                "the sibling must keep its own value (guards the reverse swap)",
+            );
+        }
+
+        // The mirror: flipping ONLY the sibling must not move the orphan flag.
+        let sibling_off = ClusterCoordinator::new(cluster_config_for_test(false, false), 1);
+        {
+            let mgr = sibling_off.migration.lock();
+            assert!(
+                !mgr.orphan_cleanup_proof_reclaim_enabled(),
+                "the orphan-proof arming tracked a sibling field",
+            );
+            assert!(!mgr.weak_veto_arbitration_enabled());
+        }
+
+        // Armed config → armed manager (the opt-in must still work).
+        let armed = ClusterCoordinator::new(cluster_config_for_test(true, true), 1);
+        {
+            let mgr = armed.migration.lock();
+            assert!(
+                mgr.orphan_cleanup_proof_reclaim_enabled(),
+                "an explicitly armed ClusterConfig must arm the manager",
+            );
+            assert!(mgr.weak_veto_arbitration_enabled());
+        }
+    }
+
+    /// W13 review item 5 — arming re-enables a path with KNOWN data-loss
+    /// exposure, so it must be visible in the log at boot, not only in the
+    /// config file. A disarmed node must stay quiet (no warning fatigue).
+    #[test]
+    fn arming_the_orphan_proof_reclaim_warns_at_startup() {
+        let armed_warnings = capture_tracing_lines(tracing::Level::WARN, || {
+            let _ = ClusterCoordinator::new(cluster_config_for_test(true, true), 1);
+        });
+        let arming_line: Vec<&String> = armed_warnings
+            .iter()
+            .filter(|l| l.contains("orphan_cleanup_proof_reclaim_enabled"))
+            .collect();
+        assert_eq!(
+            arming_line.len(),
+            1,
+            "arming the proof reclaim must emit exactly one boot WARN naming \
+             the flag; captured WARNs: {armed_warnings:?}",
+        );
+        assert!(
+            arming_line[0].contains("data loss"),
+            "the boot WARN must say what the operator is accepting: {}",
+            arming_line[0],
+        );
+
+        let disarmed_warnings = capture_tracing_lines(tracing::Level::WARN, || {
+            let _ = ClusterCoordinator::new(cluster_config_for_test(false, true), 1);
+        });
+        assert!(
+            !disarmed_warnings
+                .iter()
+                .any(|l| l.contains("orphan_cleanup_proof_reclaim_enabled")),
+            "a DISARMED node must not warn about the reclaim: {disarmed_warnings:?}",
+        );
+    }
+
     /// W13 — an ARMED reclaim must announce every deletion at INFO.
     ///
     /// The decision was logged only through `debug_shard_log`: DEBUG level AND
@@ -28014,52 +28260,6 @@ mod tests {
     /// shard — never one per record.
     #[test]
     fn run_orphan_cleanup_proof_reclaim_logs_the_deletion_at_info() {
-        use std::sync::Mutex as StdMutex;
-        use tracing::Event;
-        use tracing::field::{Field, Visit};
-        use tracing_subscriber::Layer;
-        use tracing_subscriber::layer::Context;
-        use tracing_subscriber::prelude::*;
-        use tracing_subscriber::registry::LookupSpan;
-
-        /// Flattens every INFO event into one `message field=value ...` line.
-        #[derive(Default)]
-        struct InfoVisitor {
-            rendered: String,
-        }
-
-        impl Visit for InfoVisitor {
-            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "message" {
-                    self.rendered.insert_str(0, &format!("{value:?} "));
-                } else {
-                    self.rendered
-                        .push_str(&format!("{}={value:?} ", field.name()));
-                }
-            }
-        }
-
-        struct CaptureLayer {
-            lines: Arc<StdMutex<Vec<String>>>,
-        }
-
-        impl<S> Layer<S> for CaptureLayer
-        where
-            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
-        {
-            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-                if event.metadata().level() != &tracing::Level::INFO {
-                    return;
-                }
-                let mut visitor = InfoVisitor::default();
-                event.record(&mut visitor);
-                self.lines
-                    .lock()
-                    .expect("capture lock")
-                    .push(visitor.rendered);
-            }
-        }
-
         let _guard = migration_metrics_test_guard();
         let old_table =
             ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
@@ -28075,13 +28275,7 @@ mod tests {
             .set_orphan_cleanup_proof_reclaim_enabled(true);
         let proof = ScriptedProof::new(&[NodeId(2), NodeId(3)]);
 
-        let lines = Arc::new(StdMutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_subscriber::EnvFilter::new("info"))
-            .with(CaptureLayer {
-                lines: lines.clone(),
-            });
-        tracing::subscriber::with_default(subscriber, || {
+        let captured = capture_tracing_lines(tracing::Level::INFO, || {
             run_orphan_cleanup(
                 NodeId(1),
                 &engine,
@@ -28105,7 +28299,6 @@ mod tests {
             .map(|n| n.0)
             .collect();
         holders.dedup();
-        let captured = lines.lock().expect("capture lock").clone();
         let reclaim_lines: Vec<&String> = captured
             .iter()
             .filter(|l| l.contains("orphan cleanup DELETED"))
@@ -28128,6 +28321,84 @@ mod tests {
         assert!(
             line.contains(&format!("confirmed_by={holders:?}")),
             "the deletion line must name the confirming holders {holders:?}: {line}",
+        );
+        // W13 review item 2 — WHICH records went is the first question asked
+        // after an incident, and the freed-space arithmetic that exposed this
+        // defect could not answer it.
+        let txid = hex_txid(&tx_key_for_shard(shard, 68).txid);
+        assert!(
+            line.contains(&txid),
+            "the deletion line must name the txids it destroyed ({txid}): {line}",
+        );
+        assert!(
+            line.contains("txids_omitted=0"),
+            "a fully-listed reclaim must say so explicitly: {line}",
+        );
+    }
+
+    /// W13 review item 2 — the txid list must be BOUNDED: a shard-sized
+    /// reclaim must not flood the log with thousands of ids, and the operator
+    /// must be able to tell a truncated list from a complete one.
+    ///
+    /// Fail-before (an unbounded list): every deleted txid is rendered.
+    #[test]
+    fn run_orphan_cleanup_proof_reclaim_caps_the_logged_txid_list() {
+        let _guard = migration_metrics_test_guard();
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let shard = shard_node1_lost(&old_table, &new_table);
+        let engine = Arc::new(test_engine());
+        let records = ORPHAN_RECLAIM_LOGGED_TXIDS + 5;
+        for salt in 0..records {
+            create_test_record(&engine, tx_key_for_shard(shard, 100 + salt as u8));
+        }
+        assert_eq!(engine.shard_record_count(shard), records as u64);
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration
+            .lock()
+            .set_orphan_cleanup_proof_reclaim_enabled(true);
+        let proof = ScriptedProof::new(&[NodeId(2), NodeId(3)]);
+
+        let captured = capture_tracing_lines(tracing::Level::INFO, || {
+            run_orphan_cleanup(
+                NodeId(1),
+                &engine,
+                &shard_table,
+                &migration,
+                new_table.version,
+                Some(&proof),
+            );
+        });
+        assert_eq!(engine.shard_record_count(shard), 0, "all copies reclaimed");
+
+        let line = captured
+            .iter()
+            .find(|l| l.contains("orphan cleanup DELETED"))
+            .expect("the reclaim must be announced at INFO");
+        assert!(
+            line.contains(&format!("records_deleted={records}")),
+            "the count must be the FULL count, not the capped list length: {line}",
+        );
+        // Exactly `ORPHAN_RECLAIM_LOGGED_TXIDS` ids rendered, and the overflow
+        // stated rather than silently dropped.
+        let rendered_ids = (0..records)
+            .filter(|salt| {
+                line.contains(&hex_txid(&tx_key_for_shard(shard, 100 + *salt as u8).txid))
+            })
+            .count();
+        assert_eq!(
+            rendered_ids, ORPHAN_RECLAIM_LOGGED_TXIDS,
+            "the txid list must be capped at {ORPHAN_RECLAIM_LOGGED_TXIDS}: {line}",
+        );
+        assert!(
+            line.contains(&format!(
+                "txids_omitted={}",
+                records - ORPHAN_RECLAIM_LOGGED_TXIDS
+            )),
+            "a truncated list must state how many ids it omitted: {line}",
         );
     }
 
@@ -28428,6 +28699,15 @@ mod tests {
         );
 
         let total_asks = proof.asked.lock().len();
+        // W13 review item 3 — the LOWER bound is what proves the armed path
+        // actually ran. `<= 2` alone is satisfied by ZERO asks, so a silent
+        // disarm regression (the whole point of the W13 gate) would leave this
+        // test green while it stopped testing the memo at all.
+        assert!(
+            total_asks >= 1,
+            "the armed proof phase must have asked SOMEONE — zero asks means \
+             the pass never probed and this test proves nothing",
+        );
         assert!(
             total_asks <= 2,
             "a failed holder must be memoised for the pass: expected at most \
@@ -28602,6 +28882,15 @@ mod tests {
             1,
             "a partial proof is not a proof — dropping here would leave one copy",
         );
+        // W13 review item 3 — the retain above is also what a DISARMED pass
+        // produces, so without this the test would stay green if the armed
+        // path silently stopped running. The unanimity rule is only under
+        // test if the shard was actually offered to its holders.
+        assert!(
+            !proof.asked_for_shard(shard).is_empty(),
+            "the armed pass must have asked this shard's holders — zero asks \
+             means the retain proves nothing about UNANIMITY",
+        );
     }
 
     /// A holder that answers "no" for EVERY shard must leave the pass exactly
@@ -28641,6 +28930,14 @@ mod tests {
             engine.shard_record_count(shard),
             1,
             "an unconfirmed shard must be retained, exactly as with no proof",
+        );
+        // W13 review item 3 — "retained" is also the DISARMED outcome. The
+        // claim under test is that a REFUSAL is fail-closed, which requires
+        // the refusal to have been sought in the first place.
+        assert!(
+            !proof.asked_for_shard(shard).is_empty(),
+            "the armed pass must have asked before retaining — zero asks means \
+             this test no longer distinguishes a refusal from a disarm",
         );
     }
 
