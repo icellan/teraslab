@@ -2451,19 +2451,24 @@ async fn handle_admin_migration_status(State(state): State<Arc<HttpState>>) -> i
     match state.cluster {
         Some(ref cluster) => {
             let migrations = cluster.migration_status();
-            let inbound = cluster.inbound_pending_count();
-            let inbound_entries = cluster.pending_inbound_entries();
             // W12 TAIL 2 — an inbound entry whose source has TERMINALLY
             // refused it (ERR_MIGRATION_NO_TASKS) and which the fail-closed
-            // record guard retained is NOT a transfer in flight; it is a
-            // fixpoint held open by orphans only the committed-handoff-gated
-            // orphan cleanup can reclaim. Reported separately so "is a
-            // migration still running?" and "is anything stuck?" stop being
-            // the same question — armed scenario 08 @ fc5e5f7 spent 300 s
-            // waiting on two of these because the status could not tell them
-            // apart from live inbound work.
-            let refused_retained = cluster.refused_retained_inbound_entries();
-            let fenced = cluster.fenced_shard_count();
+            // record guard retained as an ORPHAN fence is NOT a transfer in
+            // flight; it is a fixpoint held open by records only the
+            // committed-handoff-gated orphan cleanup can reclaim. Reported
+            // separately so "is a migration still running?" and "is anything
+            // stuck?" stop being the same question — armed scenario 08 @
+            // fc5e5f7 spent 300 s waiting on two of these because the status
+            // could not tell them apart from live inbound work.
+            //
+            // W12 review NIT — ONE snapshot under a single migration lock, so
+            // the four numbers below cannot straddle a concurrent refusal and
+            // render an impossible state (refused > pending).
+            let inbound_snapshot = cluster.inbound_status_snapshot();
+            let inbound = inbound_snapshot.pending_count;
+            let inbound_entries = &inbound_snapshot.entries;
+            let refused_retained = &inbound_snapshot.refused_retained;
+            let fenced = inbound_snapshot.fenced_count;
             let active_count = migrations
                 .iter()
                 .filter(|m| {

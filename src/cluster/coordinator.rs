@@ -2,7 +2,7 @@
 //! table, and coordinates data migration.
 
 use crate::cluster::membership::ClusterEvent;
-use crate::cluster::migration::MigrationManager;
+use crate::cluster::migration::{InboundRetention, MigrationManager};
 use crate::cluster::shards::*;
 use crate::cluster::swim::{SwimConfig, SwimRunner};
 use crate::index::TxKey;
@@ -1569,17 +1569,56 @@ fn catch_up_fallback_proposal(
 /// Only a non-holder with zero local records is safe to drop, which is exactly
 /// the stranded-forever case: nothing will ever be sent, and nothing is left
 /// behind to hide.
+///
+/// W12 review P1-1 — callers that need to know WHY an entry is kept must use
+/// [`inbound_entry_retention`]. The two KEEP grounds are opposite states: a
+/// HOLDER's inbound is legitimate, satisfiable work, while a non-holder's is
+/// an orphan fence. Collapsing them into one `bool` is what let the
+/// refused-entry mark be applied to a satisfiable transfer.
 fn inbound_entry_must_be_kept(
     table: &ShardTable,
     self_id: NodeId,
     shard: u16,
     local_record_count: u64,
 ) -> bool {
+    inbound_entry_retention(table, self_id, shard, local_record_count).keeps()
+}
+
+/// W12 review NIT — one consistent view of a node's inbound bookkeeping, as
+/// produced by [`RunningCluster::inbound_status_snapshot`] under a single
+/// migration lock.
+#[derive(Debug, Clone)]
+pub struct InboundStatusSnapshot {
+    /// Shards with at least one uncompleted inbound entry (the fence count).
+    pub pending_count: usize,
+    /// Every uncompleted `(shard, from_node)` entry.
+    pub entries: Vec<(u16, NodeId)>,
+    /// The subset of `entries` whose source terminally refused them and which
+    /// the fail-closed record guard retained (`InboundRetention::KeepOrphan`).
+    pub refused_retained: std::collections::HashSet<(u16, NodeId)>,
+    /// Shards with a write fence active.
+    pub fenced_count: usize,
+}
+
+/// W12 review P1-1 — the fail-closed retention judgement for a pending inbound
+/// entry, carrying WHY it is retained. See [`InboundRetention`] for what each
+/// arm means and why the distinction is load-bearing;
+/// [`inbound_entry_must_be_kept`] is the `bool` view for callers that only
+/// need the disposition.
+fn inbound_entry_retention(
+    table: &ShardTable,
+    self_id: NodeId,
+    shard: u16,
+    local_record_count: u64,
+) -> InboundRetention {
     let a = table.target_assignment(shard);
     if a.master == self_id || a.replicas.contains(&self_id) {
-        return true;
+        return InboundRetention::KeepHolder;
     }
-    local_record_count > 0
+    if local_record_count > 0 {
+        return InboundRetention::KeepOrphan;
+    }
+    InboundRetention::Drop
 }
 
 fn fail_migration_task_current_epoch(
@@ -4512,6 +4551,19 @@ impl ClusterCoordinator {
                             );
                         }
                     }
+                    // W12 review P2-2 — publish the refused-retained gauge from
+                    // THIS pass, unconditionally and including zero. Storing it
+                    // only inside the transfer-request refusal handler made it
+                    // a one-way ratchet: that handler early-returns when
+                    // nothing was refused and never runs at all once the
+                    // entries are gone, so a cleared condition kept reading as
+                    // still-stuck forever.
+                    if let Some(m) = crate::metrics::migration_metrics() {
+                        m.migration_inbound_refused_retained.store(
+                            mgr.refused_retained_inbound_entries().len() as u32,
+                            Ordering::Relaxed,
+                        );
+                    }
                     // Snapshot the handoff count under the read guard, then
                     // release it: the settled-inbound GC below takes the SWIM
                     // lock and can write the inbound state file — neither may
@@ -6147,45 +6199,41 @@ impl ClusterCoordinator {
                                 // over 300 s with `kept=2` every round and the
                                 // requester's log never once printed which two
                                 // shards they were.
-                                let retire =
-                                    |refused: &[u16], source: NodeId| -> (usize, Vec<u16>) {
-                                        if refused.is_empty() {
-                                            return (0, Vec::new());
-                                        }
-                                        let (dropped, kept) = {
-                                            // LOCK ORDER (W8): table before migration.
-                                            let table = refusal_st.read();
-                                            let mut mgr = refusal_mig.lock();
-                                            let dropped =
-                                                mgr.drop_refused_inbound(refused, source, |s| {
-                                                    inbound_entry_must_be_kept(
-                                                        &table,
-                                                        self_id,
-                                                        s,
-                                                        refusal_eng.shard_record_count(s),
-                                                    )
-                                                });
-                                            let kept: Vec<u16> = mgr
-                                                .refused_retained_inbound_entries()
-                                                .into_iter()
-                                                .map(|(shard, _)| shard)
-                                                .collect();
-                                            (dropped, kept)
+                                let retire = |refused: &[u16],
+                                              source: NodeId|
+                                 -> crate::cluster::migration::RefusedInboundOutcome {
+                                    if refused.is_empty() {
+                                        return crate::cluster::migration::RefusedInboundOutcome {
+                                            dropped: 0,
+                                            kept_holder: Vec::new(),
+                                            kept_orphan: Vec::new(),
                                         };
-                                        if let Some(m) = crate::metrics::migration_metrics() {
-                                            if dropped > 0 {
-                                                m.migration_dangling_inbound_dropped
-                                                    .inc_by(dropped as u64);
-                                            }
-                                            m.migration_inbound_refused_retained
-                                                .store(kept.len() as u32, Ordering::Relaxed);
-                                        }
-                                        (dropped, kept)
+                                    }
+                                    let outcome = {
+                                        // LOCK ORDER (W8): table before migration.
+                                        let table = refusal_st.read();
+                                        let mut mgr = refusal_mig.lock();
+                                        mgr.drop_refused_inbound(refused, source, |s| {
+                                            inbound_entry_retention(
+                                                &table,
+                                                self_id,
+                                                s,
+                                                refusal_eng.shard_record_count(s),
+                                            )
+                                        })
                                     };
+                                    if outcome.dropped > 0
+                                        && let Some(m) = crate::metrics::migration_metrics()
+                                    {
+                                        m.migration_dangling_inbound_dropped
+                                            .inc_by(outcome.dropped as u64);
+                                    }
+                                    outcome
+                                };
                                 // Bound the shard list a single log line can
                                 // carry — a refusal can name thousands.
                                 const MAX_NAMED_KEPT_SHARDS: usize = 32;
-                                let name_kept = |kept: &[u16]| -> String {
+                                let name_shards = |kept: &[u16]| -> String {
                                     let head: Vec<String> = kept
                                         .iter()
                                         .take(MAX_NAMED_KEPT_SHARDS)
@@ -6234,7 +6282,7 @@ impl ClusterCoordinator {
                                             // nothing.
                                             let refused =
                                                 parse_transfer_request_unmatched(&resp.payload);
-                                            let (dropped, kept) = retire(&refused, source);
+                                            let outcome = retire(&refused, source);
                                             if refused.is_empty() {
                                                 tracing::info!(
                                                     source = source.0,
@@ -6247,15 +6295,22 @@ impl ClusterCoordinator {
                                                     source = source.0,
                                                     shards = shards.len(),
                                                     refused = refused.len(),
-                                                    dropped,
-                                                    kept = kept.len(),
-                                                    kept_shards = %name_kept(&kept),
+                                                    dropped = outcome.dropped,
+                                                    kept_orphan = outcome.kept_orphan.len(),
+                                                    kept_orphan_shards =
+                                                        %name_shards(&outcome.kept_orphan),
+                                                    kept_holder = outcome.kept_holder.len(),
+                                                    kept_holder_shards =
+                                                        %name_shards(&outcome.kept_holder),
                                                     epoch = committed_term,
                                                     "cluster: shard transfer request PARTIALLY \
                                                      refused — the source will never send the \
                                                      named shard(s); dangling inbound entries \
                                                      dropped (entries whose records are still \
-                                                     local stay fenced for orphan cleanup)",
+                                                     local stay fenced for orphan cleanup; \
+                                                     entries for shards THIS NODE HOLDS stay \
+                                                     in-flight — the source's table may have \
+                                                     diverged and the re-heal re-plans them)",
                                                 );
                                             }
                                         }
@@ -6268,18 +6323,25 @@ impl ClusterCoordinator {
                                             // epoch we both activated. Retire
                                             // them rather than re-asking every
                                             // 10 s forever.
-                                            let (dropped, kept) = retire(&shards, source);
+                                            let outcome = retire(&shards, source);
                                             tracing::warn!(
                                                 source = source.0,
                                                 shards = shards.len(),
-                                                dropped,
-                                                kept = kept.len(),
-                                                kept_shards = %name_kept(&kept),
+                                                dropped = outcome.dropped,
+                                                kept_orphan = outcome.kept_orphan.len(),
+                                                kept_orphan_shards =
+                                                    %name_shards(&outcome.kept_orphan),
+                                                kept_holder = outcome.kept_holder.len(),
+                                                kept_holder_shards =
+                                                    %name_shards(&outcome.kept_holder),
                                                 epoch = committed_term,
                                                 "cluster: shard transfer request REFUSED — the \
                                                  source has no tasks for us; dangling inbound \
                                                  entries dropped (entries whose records are \
-                                                 still local stay fenced for orphan cleanup)",
+                                                 still local stay fenced for orphan cleanup; \
+                                                 entries for shards THIS NODE HOLDS stay \
+                                                 in-flight — the source's table may have \
+                                                 diverged and the re-heal re-plans them)",
                                             );
                                         }
                                         Ok(resp) => tracing::warn!(
@@ -13952,11 +14014,10 @@ fn run_migration_batch_with_origin(
                                             &live,
                                             auth_secret,
                                         )
-                                        .map_err(|e| {
-                                            EscalationAttemptError::Repush(format!(
-                                                "{WEAK_VETO_ARBITRATION_REJECTED_PREFIX} {e}"
-                                            ))
-                                        })?;
+                                        // The send owns the full source-visible
+                                        // string (prefix + envelope) — see
+                                        // `weak_veto_arbitration_rejection_error`.
+                                        .map_err(EscalationAttemptError::Repush)?;
                                         if let Some(m) = crate::metrics::migration_metrics() {
                                             m.migration_weak_veto_arbitrations
                                                 .inc_by(live.len() as u64);
@@ -15266,15 +15327,25 @@ pub(crate) fn completion_rejection_manifest_mismatch(err: &str) -> bool {
 /// * `ERR_STALE_EPOCH` — the two sides are on different activated versions
 ///   and the epoch-current re-drive is the mechanism that fixes it, so the
 ///   task must stay retryable;
+/// * the DISARMED-target refusal (W12 review P2-5). It carries the same code
+///   but is OPERATOR-transient, not structural: `migration_weak_veto_
+///   arbitration_enabled` is a documented per-node rollback switch (W10 review
+///   P2-6), and during a rolling rollback a still-armed source must fall back
+///   to the pre-W10 retryable disposition against already-rolled-back targets
+///   rather than terminally aborting and retiring every handoff it aims at
+///   them. Matched by message via [`WEAK_VETO_ARBITRATION_DISARMED_MSG`],
+///   which `dispatch` emits verbatim;
 /// * a SOURCE-side arbitration failure ("none of the vetoed key(s) held live
 ///   on the source"), which never reached the target at all;
 /// * a bare completion rejection carrying the same code — the
-///   `weak-veto arbitration rejected by target:` prefix
-///   ([`EscalationAction::ArbitrateWeakVeto`]'s `map_err`) is what scopes
-///   this to an arbitration.
+///   `weak-veto arbitration rejected by target:` prefix that
+///   [`weak_veto_arbitration_rejection_error`] applies is what scopes this to
+///   an arbitration.
 ///
-/// The producer, the [`migration_complete_rejection_error`] envelope and this
-/// parser are pinned together by the cross-module contract test
+/// The producer ([`weak_veto_arbitration_rejection_error`], called by
+/// [`send_weak_veto_arbitration`] on every non-OK response), the
+/// [`migration_complete_rejection_error`] envelope and this parser are pinned
+/// together by the cross-module contract test
 /// `weak_veto_authority_refusal_is_recognised_by_the_terminal_parser`
 /// (`server::dispatch` tests), so the formats cannot drift apart.
 pub(crate) fn weak_veto_arbitration_terminally_refused(err: &str) -> bool {
@@ -15283,14 +15354,45 @@ pub(crate) fn weak_veto_arbitration_terminally_refused(err: &str) -> bool {
             "(code={}:",
             crate::protocol::opcodes::ERR_INVARIANT_VIOLATION
         ))
+        && !weak_veto_arbitration_disarmed_refusal(err)
 }
 
-/// The prefix [`EscalationAction::ArbitrateWeakVeto`] wraps a TARGET refusal
-/// of `OP_MIGRATION_WEAK_VETO_ARBITRATE` in. Shared with
-/// [`weak_veto_arbitration_terminally_refused`] so the producer and the
-/// parser cannot drift.
+/// W12 review P2-5 — is this refusal the target saying arbitration is
+/// DISARMED there (`migration_weak_veto_arbitration_enabled=false`)?
+///
+/// An operator toggle, not a structural fact about the shard: it flips back
+/// the moment the rollback finishes, so it must not terminate a handoff.
+pub(crate) fn weak_veto_arbitration_disarmed_refusal(err: &str) -> bool {
+    err.contains(WEAK_VETO_ARBITRATION_DISARMED_MSG)
+}
+
+/// The exact message `dispatch` returns when `OP_MIGRATION_WEAK_VETO_ARBITRATE`
+/// reaches a node with the mechanism disarmed. Shared so the producer and
+/// [`weak_veto_arbitration_disarmed_refusal`] cannot drift.
+pub const WEAK_VETO_ARBITRATION_DISARMED_MSG: &str = "weak-veto arbitration is disabled on this node \
+     (migration_weak_veto_arbitration_enabled=false)";
+
+/// The prefix a TARGET refusal of `OP_MIGRATION_WEAK_VETO_ARBITRATE` is
+/// wrapped in. Shared with [`weak_veto_arbitration_terminally_refused`] so the
+/// producer and the parser cannot drift.
 pub(crate) const WEAK_VETO_ARBITRATION_REJECTED_PREFIX: &str =
     "weak-veto arbitration rejected by target:";
+
+/// W12 review P2-6 — compose the error string
+/// [`send_weak_veto_arbitration`] returns for a non-OK
+/// `OP_MIGRATION_WEAK_VETO_ARBITRATE` response.
+///
+/// This is the PRODUCER hop the escalation's terminal classification reads.
+/// It lives here (rather than inline at the send site) so the cross-module
+/// contract test can drive a REAL dispatch response through the REAL producer
+/// instead of re-composing the source's view by hand — which pinned only the
+/// envelope, not the wrapping.
+pub(crate) fn weak_veto_arbitration_rejection_error(status: u8, payload: &[u8]) -> String {
+    format!(
+        "{WEAK_VETO_ARBITRATION_REJECTED_PREFIX} {}",
+        migration_complete_rejection_error(status, payload),
+    )
+}
 
 /// GAP 1 — outcome of the bounded manifest-mismatch record-level re-sync
 /// ([`escalate_manifest_mismatch`]).
@@ -16563,9 +16665,17 @@ fn send_weak_veto_arbitration(
         payload: encode_weak_veto_arbitration_payload(shard, from_node, migration_epoch, keys)
             .into(),
     };
-    let response = exchange_frame(stream, &request, auth_secret)?;
+    // W12 review P2-6 — this function owns the WHOLE source-visible error
+    // string, prefix included, so the escalation does not re-wrap it and the
+    // contract test can drive the real producer instead of composing the
+    // source's view by hand. Both arms carry the prefix (an I/O failure is
+    // still "the arbitration did not land"); the terminal classifier
+    // additionally requires the code-33 envelope, which an I/O error never
+    // has, so it stays on the retryable path.
+    let response = exchange_frame(stream, &request, auth_secret)
+        .map_err(|e| format!("{WEAK_VETO_ARBITRATION_REJECTED_PREFIX} {e}"))?;
     if response.status != STATUS_OK {
-        return Err(migration_complete_rejection_error(
+        return Err(weak_veto_arbitration_rejection_error(
             response.status,
             &response.payload,
         ));
@@ -21996,11 +22106,33 @@ impl RunningCluster {
     /// W12 TAIL 2 — the subset of [`Self::pending_inbound_entries`] whose own
     /// source has TERMINALLY refused them and which the fail-closed record
     /// guard retained anyway. See
-    /// [`MigrationManager::refused_retained_inbound_entries`] — these entries
-    /// cannot progress, so a "are migrations still running?" question must
+    /// [`MigrationManager::refused_retained_inbound_entries`] — nothing is
+    /// coming for these, so a "are migrations still running?" question must
     /// exclude them and a "is anything wrong?" question must report them.
     pub fn refused_retained_inbound_entries(&self) -> Vec<(u16, NodeId)> {
         self.migration.lock().refused_retained_inbound_entries()
+    }
+
+    /// W12 review NIT — one CONSISTENT snapshot of the inbound bookkeeping for
+    /// `/admin/migration_status`, taken under a SINGLE migration lock.
+    ///
+    /// Reading the count, the entries, the refused subset and the fence count
+    /// through four separate accessors let a concurrent refusal land between
+    /// them, so the rendered JSON could report `inbound_refused_retained`
+    /// greater than `inbound_pending` — a state that never actually existed.
+    /// The refused set is returned as a `HashSet` so the caller marks entries
+    /// in O(n) instead of scanning the subset per entry.
+    pub fn inbound_status_snapshot(&self) -> InboundStatusSnapshot {
+        let mgr = self.migration.lock();
+        InboundStatusSnapshot {
+            pending_count: mgr.inbound_count(),
+            entries: mgr.pending_inbound_entries(),
+            refused_retained: mgr
+                .refused_retained_inbound_entries()
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
+            fenced_count: mgr.fenced_count(),
+        }
     }
 
     /// Number of shards with write fences active.
@@ -34031,12 +34163,23 @@ mod tests {
         }
     }
 
-    /// W10 FIX 2 — a failed/unavailable arbitration (the source holds no
-    /// live copy, or the target refused the clear) must NOT loop: the
+    /// W10 FIX 2 — a SOURCE-SIDE arbitration failure must NOT loop: the
     /// escalation falls through to the historical fail path carrying the
     /// arbitration error, exactly one arbitration round attempted.
+    ///
+    /// W12 review P1-3 — this test previously used a fabricated "target
+    /// refused the clear" string with NO error envelope. Every real target
+    /// refusal reaches the source as `(code=33: ...)` (dispatch emits
+    /// `ERR_INVARIANT_VIOLATION` for the never-arbitrable case it named), so
+    /// the string exercised a shape production cannot produce, and its claim
+    /// became the OPPOSITE of what the terminal classifier now does — two
+    /// tests in this file asserting different outcomes for the same event.
+    /// Re-pointed at the genuinely non-envelope failure: the SOURCE holding
+    /// no live copy, which never reaches the target at all and is correctly
+    /// retryable. The target-refusal disposition is owned by
+    /// `escalation_terminates_when_the_target_refuses_arbitration_authority`.
     #[test]
-    fn escalation_arbitration_failure_falls_through_to_historical_path() {
+    fn escalation_source_side_arbitration_failure_falls_through_to_historical_path() {
         let manifest = vec![(tk(2), 7u32)];
         let initial = vetoed_reject_cause(tk(2), 9, "PruneReplace");
         let mut rounds = 0usize;
@@ -34045,22 +34188,160 @@ mod tests {
                 panic!("only arbitration may run: {action:?}");
             };
             rounds += 1;
+            // The production string from the `live.is_empty()` branch: no
+            // frame was ever sent, so there is no envelope and no prefix.
             Err(EscalationAttemptError::Repush(
-                "weak-veto arbitration rejected by target: key carries a \
-                 ClientDelete/Dah tombstone — never arbitrable"
+                "weak-veto arbitration: none of the 1 vetoed key(s) held live \
+                 on the source — falling back to the historical disposition"
                     .to_string(),
             ))
         });
         assert_eq!(rounds, 1, "exactly one arbitration round");
+        assert!(
+            !weak_veto_arbitration_terminally_refused(
+                "weak-veto arbitration: none of the 1 vetoed key(s) held live \
+                 on the source — falling back to the historical disposition"
+            ),
+            "a source-side failure is not a target refusal and must stay retryable",
+        );
         match outcome {
             ExactKeyEscalation::NotExactKey { last_err } => {
                 assert!(
-                    last_err.contains("never arbitrable"),
-                    "the historical path carries the arbitration refusal: {last_err}",
+                    last_err.contains("held live on the source"),
+                    "the historical path carries the arbitration failure: {last_err}",
                 );
             }
             other => panic!("expected NotExactKey fallback, got {other:?}"),
         }
+    }
+
+    /// W12 review P2-5 — the DISARMED-target refusal carries the same code-33
+    /// envelope as the authority refusal but must stay RETRYABLE.
+    ///
+    /// `migration_weak_veto_arbitration_enabled` is a documented per-node
+    /// rollback switch (W10 review P2-6). During a rolling rollback a
+    /// still-armed source aims handoffs at already-rolled-back targets; if
+    /// that answer terminated and retired the task, the rollback would shed
+    /// handoffs instead of restoring the pre-W10 behaviour it promises.
+    #[test]
+    fn a_disarmed_target_refusal_stays_retryable() {
+        let manifest = vec![(tk(2), 7u32)];
+        let initial = vetoed_reject_cause(tk(2), 9, "PruneReplace");
+        let refusal = weak_veto_arbitration_rejection_error(
+            1,
+            &crate::protocol::codec::encode_error_payload(
+                crate::protocol::opcodes::ERR_INVARIANT_VIOLATION,
+                WEAK_VETO_ARBITRATION_DISARMED_MSG,
+            ),
+        );
+        assert!(
+            !weak_veto_arbitration_terminally_refused(&refusal),
+            "an operator toggle is not a structural refusal: {refusal}",
+        );
+        let outcome = escalate_missing_exact_keys(initial, &manifest, 3, true, true, |action| {
+            let EscalationAction::ArbitrateWeakVeto(_) = action else {
+                panic!("only arbitration may run: {action:?}");
+            };
+            Err(EscalationAttemptError::Repush(refusal.clone()))
+        });
+        match outcome {
+            ExactKeyEscalation::NotExactKey { last_err } => {
+                assert!(
+                    last_err.contains("migration_weak_veto_arbitration_enabled=false"),
+                    "the historical path carries the disarmed refusal: {last_err}",
+                );
+            }
+            other => panic!("expected the retryable historical path, got {other:?}"),
+        }
+    }
+
+    /// W12 review P1-1 (RED→GREEN) — a refusal that retains an entry because
+    /// THIS NODE IS THE SHARD'S TARGET HOLDER must NOT be marked as
+    /// terminally refused.
+    ///
+    /// `inbound_entry_must_be_kept` returns true on two opposite grounds and
+    /// the mark was applied to both. The holder ground is satisfiable work:
+    /// `terminally_abort_unshippable_task` → `ShardTable::rollback_shard`
+    /// rewrites the source's `assignments[shard]` WITHOUT bumping the table
+    /// version, so a source can answer `ERR_MIGRATION_NO_TASKS` from a
+    /// DIVERGED table while both sides' epoch checks pass — and the re-heal
+    /// machinery re-plans that very handoff on a later round. Marking it made
+    /// `in_flight_inbound_pending` discount a live transfer, and since
+    /// `shard_counts` derives masters from `effective_assignment` with no
+    /// reference to the inbound fence, a shard fenced (client-invisible) on
+    /// its own master still counts toward 4096 — so the convergence gate
+    /// would have declared success over a real wedge.
+    ///
+    /// The abstract `|shard| shard == N` predicate the manager-level test
+    /// uses is exactly why this slipped through, so this drives the REAL
+    /// `inbound_entry_retention` against real assignments.
+    #[test]
+    fn a_holder_entry_a_source_refuses_is_kept_but_never_marked_refused() {
+        let source = NodeId(2);
+
+        // RF=2 over two members: every shard's target assignment contains
+        // node 1, so node 1 is the HOLDER of the shard below.
+        let holder_table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 7, 1);
+        let held = 0u16;
+        let a = holder_table.target_assignment(held);
+        assert!(
+            a.master == NodeId(1) || a.replicas.contains(&NodeId(1)),
+            "fixture: node 1 must hold shard {held}",
+        );
+        assert_eq!(
+            inbound_entry_retention(&holder_table, NodeId(1), held, 0),
+            InboundRetention::KeepHolder,
+        );
+
+        let mut mgr = MigrationManager::new();
+        assert!(mgr.register_inbound_source(held, source));
+        let outcome = mgr.drop_refused_inbound(&[held], source, |s| {
+            inbound_entry_retention(&holder_table, NodeId(1), s, 0)
+        });
+        assert_eq!(outcome.dropped, 0, "a holder's inbound is never dropped");
+        assert_eq!(outcome.kept_holder, vec![held]);
+        assert!(outcome.kept_orphan.is_empty());
+        assert!(
+            mgr.refused_retained_inbound_entries().is_empty(),
+            "a shard THIS NODE HOLDS is satisfiable work — a spurious refusal \
+             from a source with a diverged table must not make the \
+             convergence gate blind to it",
+        );
+
+        // RF=1 over three members: some shard is mastered by node 2 with no
+        // replicas, so node 1 is NOT a holder. With local records that is the
+        // armed-08 orphan shape — and THAT one is marked.
+        let orphan_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 1, 7, 1);
+        let orphaned = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = orphan_table.target_assignment(s);
+                a.master != NodeId(1) && !a.replicas.contains(&NodeId(1))
+            })
+            .expect("with RF=1 over 3 members some shard is not node 1's");
+        assert_eq!(
+            inbound_entry_retention(&orphan_table, NodeId(1), orphaned, 4),
+            InboundRetention::KeepOrphan,
+        );
+        assert_eq!(
+            inbound_entry_retention(&orphan_table, NodeId(1), orphaned, 0),
+            InboundRetention::Drop,
+            "a non-holder with nothing local is the stranded-forever case",
+        );
+
+        let mut mgr = MigrationManager::new();
+        assert!(mgr.register_inbound_source(orphaned, source));
+        let outcome = mgr.drop_refused_inbound(&[orphaned], source, |s| {
+            inbound_entry_retention(&orphan_table, NodeId(1), s, 4)
+        });
+        assert_eq!(outcome.dropped, 0);
+        assert!(outcome.kept_holder.is_empty());
+        assert_eq!(outcome.kept_orphan, vec![orphaned]);
+        assert_eq!(
+            mgr.refused_retained_inbound_entries(),
+            vec![(orphaned, source)],
+            "the non-holder-with-records entry IS the fixpoint the mark exists for",
+        );
     }
 
     /// W12 TAIL 3 (RED→GREEN) — an arbitration the target refuses on
@@ -34171,12 +34452,9 @@ mod tests {
     #[test]
     fn arbitration_authority_refusal_classifier_is_narrow() {
         let wrap = |code: u16, msg: &str| {
-            format!(
-                "weak-veto arbitration rejected by target: {}",
-                migration_complete_rejection_error(
-                    1,
-                    &crate::protocol::codec::encode_error_payload(code, msg)
-                ),
+            weak_veto_arbitration_rejection_error(
+                1,
+                &crate::protocol::codec::encode_error_payload(code, msg),
             )
         };
         assert!(weak_veto_arbitration_terminally_refused(&wrap(
@@ -34207,6 +34485,21 @@ mod tests {
                 crate::protocol::opcodes::ERR_INVARIANT_VIOLATION,
             )),
             "a bare completion rejection is not an arbitration refusal",
+        );
+        assert!(
+            !weak_veto_arbitration_terminally_refused(&wrap(
+                crate::protocol::opcodes::ERR_INVARIANT_VIOLATION,
+                WEAK_VETO_ARBITRATION_DISARMED_MSG,
+            )),
+            "the disarmed-target refusal is an operator toggle, not structural",
+        );
+        // An I/O failure carries the prefix (the send owns it) but no
+        // envelope, so it stays retryable.
+        assert!(
+            !weak_veto_arbitration_terminally_refused(&format!(
+                "{WEAK_VETO_ARBITRATION_REJECTED_PREFIX} connection reset by peer"
+            )),
+            "a broken stream is not a refusal at all",
         );
     }
 
