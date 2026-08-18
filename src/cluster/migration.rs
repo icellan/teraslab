@@ -903,6 +903,71 @@ impl MigrationManager {
         self.orphan_cleanup_proof_reclaim_enabled
     }
 
+    /// W13 review item 4 — drop every TRANSIENT migration state (inbound
+    /// entries, outbound tasks, fences, dual-write windows, retry arms,
+    /// mismatch streaks) while PRESERVING this node's config-carried policy
+    /// flags.
+    ///
+    /// Use this wherever an activation previously did
+    /// `*mgr = MigrationManager::new()`. That reverted every arming bit to its
+    /// compile-time default with no log line and in both directions: a
+    /// deliberately disarmed [`Self::weak_veto_arbitration_enabled`] (default
+    /// ON) silently RE-ARMED, and a deliberately armed
+    /// [`Self::orphan_cleanup_proof_reclaim_enabled`] (default OFF) silently
+    /// disarmed. Arming is operator configuration, not in-flight work, so it
+    /// survives the reset; a topology activation is not a config reload.
+    ///
+    /// Implemented as "rebuild, then restore the policy" so a newly added
+    /// TRANSIENT field is cleared automatically.
+    ///
+    /// The classification is STRUCTURAL, not a hand-maintained list (W13
+    /// round-2 review P2-2): the destructure below is EXHAUSTIVE — no `..`
+    /// rest pattern — so adding any field to [`MigrationManager`] fails to
+    /// compile here until its author classifies it as transient (matched and
+    /// dropped) or policy (carried across). Silently dropping a new arming bit
+    /// on every topology activation is exactly the failure this method exists
+    /// to fix, so it must not be possible to reintroduce by omission.
+    pub fn reset_transient_state(&mut self) {
+        let (
+            replica_abort_forced_resync_enabled,
+            vetoed_reduction_enabled,
+            weak_veto_arbitration_enabled,
+            orphan_cleanup_proof_reclaim_enabled,
+        ) = {
+            let Self {
+                // --- TRANSIENT: in-flight work, rebuilt by `Self::new()` ---
+                active: _,
+                inbound_migrations: _,
+                inbound_bitmap: _,
+                fenced_shards: _,
+                dual_write_targets: _,
+                resync_dual_write: _,
+                committed_handoffs: _,
+                next_attempt: _,
+                failed_batch_retry_arm: _,
+                replica_abort_resync_arm: _,
+                failed_retry_hold: _,
+                manifest_mismatch_streaks: _,
+                // --- POLICY: operator configuration, carried across ---
+                replica_abort_forced_resync_enabled,
+                vetoed_reduction_enabled,
+                weak_veto_arbitration_enabled,
+                orphan_cleanup_proof_reclaim_enabled,
+            } = self;
+            (
+                *replica_abort_forced_resync_enabled,
+                *vetoed_reduction_enabled,
+                *weak_veto_arbitration_enabled,
+                *orphan_cleanup_proof_reclaim_enabled,
+            )
+        };
+        *self = Self::new();
+        self.replica_abort_forced_resync_enabled = replica_abort_forced_resync_enabled;
+        self.vetoed_reduction_enabled = vetoed_reduction_enabled;
+        self.weak_veto_arbitration_enabled = weak_veto_arbitration_enabled;
+        self.orphan_cleanup_proof_reclaim_enabled = orphan_cleanup_proof_reclaim_enabled;
+    }
+
     /// W8 — record that a migration batch finished with failed tasks at a
     /// still-current epoch, so the coordinator event loop should arm the
     /// self-retry machinery (event-repair trigger + delayed failed-task
@@ -3408,6 +3473,82 @@ impl Default for MigrationManager {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// W13 review item 4 — a state reset must not silently rewrite the
+    /// OPERATOR's policy.
+    ///
+    /// The activation paths wipe the manager with `*mgr = MigrationManager::new()`
+    /// to drop transient in-flight state. That also reverted every
+    /// config-carried arming bit to its COMPILE-TIME default, in both
+    /// directions and with no log line: a deliberately DISARMED weak-veto
+    /// arbitration silently re-armed (its default is `true`), and a
+    /// deliberately ARMED orphan-proof reclaim silently disarmed. Policy is not
+    /// in-flight state, so [`MigrationManager::reset_transient_state`] carries
+    /// it across the reset.
+    #[test]
+    fn reset_transient_state_preserves_operator_policy_but_clears_in_flight_work() {
+        let mut mgr = MigrationManager::new();
+        // A policy that differs from EVERY compile-time default, so a reset
+        // that reverts to `new()` cannot pass by coincidence.
+        mgr.set_orphan_cleanup_proof_reclaim_enabled(true); // default false
+        mgr.set_weak_veto_arbitration_enabled(false); // default true
+        mgr.set_vetoed_reduction_enabled(true); // default false
+        mgr.set_replica_abort_forced_resync_enabled(false); // default true
+
+        // Real in-flight state: an outbound task and a fence.
+        let task = MigrationTask {
+            shard: 11,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::from([11u16]),
+        );
+        mgr.fence_shard(11);
+        assert!(
+            !mgr.active_migrations().is_empty(),
+            "fixture: task registered"
+        );
+        assert_eq!(mgr.fenced_count(), 1, "fixture: shard fenced");
+
+        mgr.reset_transient_state();
+
+        // Transient state is gone — the whole point of the reset.
+        assert!(
+            mgr.active_migrations().is_empty(),
+            "reset must drop in-flight outbound tasks",
+        );
+        assert_eq!(mgr.fenced_count(), 0, "reset must drop fences");
+        assert!(
+            mgr.pending_inbound_entries().is_empty(),
+            "reset must drop inbound entries",
+        );
+
+        // Policy survived, in both directions.
+        assert!(
+            mgr.orphan_cleanup_proof_reclaim_enabled(),
+            "an ARMED orphan-proof reclaim must not silently disarm on reset",
+        );
+        assert!(
+            !mgr.weak_veto_arbitration_enabled(),
+            "a DISARMED weak-veto arbitration must not silently RE-ARM on reset",
+        );
+        assert!(
+            mgr.vetoed_reduction_enabled(),
+            "vetoed-reduction arming must survive a reset",
+        );
+        // No accessor for the replica-abort policy: assert its behaviour —
+        // a disabled policy records no arm.
+        mgr.arm_replica_abort_resync();
+        assert!(
+            !mgr.take_replica_abort_resync_arm(),
+            "a DISABLED replica-abort forced resync must not silently re-enable \
+             on reset",
+        );
+    }
 
     /// W13 CONTAINMENT — a freshly constructed manager carries the
     /// proof-of-elsewhere orphan reclaim DISARMED, so every code path that

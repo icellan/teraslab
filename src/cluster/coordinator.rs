@@ -2658,7 +2658,12 @@ fn install_active_routing_snapshot(
         if has_inflight {
             false
         } else {
-            *mgr = MigrationManager::new();
+            // W13 review item 4 — clears the same TRANSIENT state the old
+            // `*mgr = MigrationManager::new()` did, but keeps the node's
+            // config-carried arming bits: a routing snapshot is not a config
+            // reload, and the old form silently re-armed / disarmed policy
+            // flags in both directions with no log line.
+            mgr.reset_transient_state();
             if let Some(path) = inbound_state_path {
                 crate::cluster::migration::persist_inbound_state(path, &mgr);
             }
@@ -7299,7 +7304,9 @@ impl ClusterCoordinator {
                 *shard_table.write() = new_table;
                 {
                     let mut mgr = migration.lock();
-                    *mgr = MigrationManager::new();
+                    // W13 review item 4 — same transient wipe, policy flags
+                    // preserved (see `MigrationManager::reset_transient_state`).
+                    mgr.reset_transient_state();
                 }
                 fenced_bm.clear_all();
                 migrating_bm.clear_all();
