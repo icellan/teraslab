@@ -9034,27 +9034,30 @@ impl Engine {
     /// The primary-index removal, the durable commit record, the on-device
     /// tombstone, and the allocator free MUST happen in the order:
     ///
-    /// 1. Unregister the key from the primary index.
-    /// 2. Journal + fsync the `RedoOp::FreeRegion` — the delete's COMMIT POINT.
-    /// 3. Tombstone the metadata header (so any rebuild-from-device can no
+    /// 2. Unregister the key from the primary index.
+    /// 3. Journal + fsync the `RedoOp::FreeRegion` — the delete's COMMIT POINT.
+    /// 4. Tombstone the metadata header (so any rebuild-from-device can no
     ///    longer parse the record).
-    /// 4. `sync()` the device so the tombstone is durable before any future
+    /// 5. `sync()` the device so the tombstone is durable before any future
     ///    overwrite of the same region (strict durability only).
-    /// 5. Return the region to the allocator's in-memory state.
+    /// 6. Return the region to the allocator's in-memory state.
     ///
-    /// Step 1 comes first for two reasons. A concurrent reader that holds an
+    /// (Numbering matches the `Step N` labels in `Self::delete_inner`, whose
+    /// step 1 is the locked lookup + re-validation.)
+    ///
+    /// Step 2 comes first among the mutations for two reasons. A concurrent reader that holds an
     /// offset obtained from the primary index could otherwise see the region
     /// after it has been re-allocated and rewritten by a parallel
     /// `create_at_offset`, and would return an unrelated transaction's metadata
     /// as if it belonged to the deleted key; it could equally observe the
-    /// half-zeroed header of step 3. Unregistering BEFORE both closes the
+    /// half-zeroed header of step 4. Unregistering BEFORE both closes the
     /// window — any subsequent `lookup(key)` returns `None`. Even if the
     /// ordering ever regresses, `read_metadata_for_key` verifies
     /// `meta.tx_id == key.txid` and surfaces a mismatch as `TxNotFound`.
     ///
-    /// Step 2 comes before step 3 because step 3 DESTROYS the record and step 2
+    /// Step 3 comes before step 4 because step 4 DESTROYS the record and step 3
     /// is the only durable evidence that the destruction was intended; and step
-    /// 5 comes last so the offset is never allocatable while step 3 is still
+    /// 6 comes last so the offset is never allocatable while step 4 is still
     /// zeroing it. See `Self::delete_inner` for the full argument.
     ///
     /// # Errors
@@ -9062,10 +9065,12 @@ impl Engine {
     /// [`SpendError::TxNotFound`] if the key is absent;
     /// [`SpendError::StorageError`] on an index-backend or device failure.
     ///
-    /// A `StorageError` raised BEFORE step 2 means the delete did not happen
+    /// A `StorageError` raised BEFORE step 3 means the delete did not happen
     /// (the record is left intact and indexed). A `StorageError` raised AFTER
-    /// step 2 reports a device failure on a delete that nonetheless COMMITTED:
+    /// step 3 reports a device failure on a delete that nonetheless COMMITTED:
     /// every bookkeeping step still ran, and a retry resolves to `TxNotFound`.
+    /// The two are distinguished in metrics by
+    /// `deletes_committed_with_device_error`, which ticks only for the latter.
     ///
     /// # External blob reclamation is DEFERRED (IJ-LOW)
     ///
@@ -9154,19 +9159,18 @@ impl Engine {
     /// drop the master's copy — see `server::dispatch::handle_delete_batch`).
     /// This method itself replicates nothing.
     ///
-    /// Durability of the DELETE is not enforced here: a crash before the
-    /// physical cleanup just leaves the record present (and consistent —
-    /// record + parent-spent slots + allocated region all still agree), and the
-    /// pruner re-deletes it on its next pass (self-healing). For the replicated
-    /// client path that revert is one-sided — the replica journals its own
-    /// `RedoOp::Delete` before ACKing — so a master crash before its next
-    /// checkpoint can leave master-live / replica-absent; see spec §3.18 and
-    /// `docs/DURABILITY_CONTRACT.md` for why that is eventually consistent and
-    /// not a lost UTXO. Physically identical to [`Self::delete`] (RAM-index
-    /// unregister + header zero via the write-back cache + region free); the
-    /// distinct name documents the pruner's intent at the call site.
-    /// Returns `Ok(())` on success or when the record is already gone
-    /// (idempotent).
+    /// Physically identical to [`Self::delete`] — same ordering, same commit
+    /// point, same deferred-error contract; the distinct name documents the
+    /// pruner's intent at the call site.
+    ///
+    /// Crash behaviour is [`Self::delete`]'s: the fsynced `RedoOp::FreeRegion`
+    /// is the commit point, written BEFORE the record's header is destroyed. A
+    /// crash before it leaves the record present and consistent (record +
+    /// parent-spent slots + allocated region all still agree) and the pruner
+    /// re-deletes it on its next pass (self-healing); a crash after it resolves
+    /// DELETE-WINS and does not revert. See spec §3.18 and
+    /// `docs/DURABILITY_CONTRACT.md`. What IS deferred to the next checkpoint is
+    /// the deletion tombstone, not the delete — see `ops::tombstone` (TS-1).
     ///
     /// Two things this does NOT mean, both previously mis-stated here:
     ///
@@ -9183,6 +9187,25 @@ impl Engine {
     ///   [`delete_inner`](Self::delete_inner) records a generation-aware
     ///   deletion tombstone whenever a tombstone log is attached — which is the
     ///   default for RF > 1. Only [`Self::reclaim_held_copy`] skips it.
+    ///
+    /// # Errors
+    ///
+    /// [`SpendError::TxNotFound`] when the record is absent. NOTE: this is NOT
+    /// `Ok(())` — an earlier version of this doc claimed it was. Callers that
+    /// treat an already-gone record as success (the DAH sweep and the orphan
+    /// reclaim both do, since delete is idempotent GC) must match on
+    /// `TxNotFound` explicitly.
+    ///
+    /// [`SpendError::NotDue`] when `req.due_guard` is set and the record
+    /// re-validates as not sweep-eligible under the stripe lock — the record is
+    /// left completely untouched and NO tombstone is written.
+    ///
+    /// [`SpendError::StorageError`] on an index-backend or device failure, and
+    /// on a write-unhealthy (redo-poisoned) node for a guarded sweep delete
+    /// (fail-closed). As in [`Self::delete`], a `StorageError` raised after the
+    /// commit point reports a device failure on a delete that nonetheless
+    /// COMMITTED — the record IS gone; the
+    /// `deletes_committed_with_device_error` counter distinguishes the two.
     pub fn prune_delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
         self.delete_inner(req, RemovalAuthority::Authoritative, None, None)
     }
@@ -9231,12 +9254,14 @@ impl Engine {
     /// delete it emits a fsynced `RedoOp::FreeRegion` and a
     /// `RedoOp::SecondaryDahUpdate` intent (see [`Self::prune_delete`]). Neither
     /// names the key, so neither can leak into a migration delta.
-    /// Returns `Ok(())` on success or when the record is already gone
-    /// (idempotent).
     ///
     /// # Errors
     ///
-    /// Same contract as [`Self::prune_delete`]:
+    /// Same contract as [`Self::prune_delete`]. In particular an already-gone
+    /// record is `TxNotFound`, NOT `Ok(())` — this doc used to claim otherwise
+    /// two lines above its own error list. Delete is idempotent GC, so callers
+    /// that want "already gone is fine" must match on `TxNotFound` themselves.
+    ///
     /// [`SpendError::TxNotFound`] when the key is absent,
     /// [`SpendError::NotDue`] when `req.due_guard` is set and the under-lock
     /// re-validation finds the record no longer sweep-due, and
@@ -9288,25 +9313,30 @@ impl Engine {
     ///
     /// # Ordering (F-G2-001, W14 commit-before-destroy)
     ///
-    /// 1. Unregister the key from the primary index (RAM). Precedes every
+    /// The numbers below are the `Step N` labels in the body, so this block and
+    /// the code read as one sequence:
+    ///
+    /// 1. Take the per-tx stripe lock, resolve the index entry, and re-validate
+    ///    the delete under it (`due_guard` sweep predicate, `expected_generation`).
+    /// 2. Unregister the key from the primary index (RAM). Precedes every
     ///    device write so a lock-free reader can never resolve this key to the
     ///    about-to-be-zeroed header (it sees the intact record, or nothing).
-    /// 2. `journal_free` — append + fsync the `RedoOp::FreeRegion`. This is the
+    /// 3. `journal_free` — append + fsync the `RedoOp::FreeRegion`. This is the
     ///    delete's ONLY durable commit record (production journals no
-    ///    `RedoOp::Delete`) and it MUST precede step 3: see below.
-    /// 3. Zero the on-device metadata header (device-scan rebuild skip-guard).
-    /// 4. `sync()` the data device so the zeroed header is durable before any
+    ///    `RedoOp::Delete`) and it MUST precede step 4: see below.
+    /// 4. Zero the on-device metadata header (device-scan rebuild skip-guard).
+    /// 5. `sync()` the data device so the zeroed header is durable before any
     ///    future overwrite of the freed region (strict durability only;
     ///    buffered defers to the checkpoint barrier).
-    /// 5. `apply_journaled_free` — return the region to the allocator's
+    /// 6. `apply_journaled_free` — return the region to the allocator's
     ///    in-memory state. Last, so (a) no `lookup(key)` can reach a
     ///    freed-and-reused offset (F-G2-001) and (b) no concurrent `create` can
-    ///    claim the offset before step 3 zeroes it.
+    ///    claim the offset before step 4 zeroes it.
     ///
-    /// ## Why 2 must precede 3 (W14 / CI scenario 09)
+    /// ## Why 3 must precede 4 (W14 / CI scenario 09)
     ///
-    /// Step 3 DESTROYS the record. Step 2 is the only evidence that the
-    /// destruction was intended. Pre-fix the order was 3-4-2, so a crash in
+    /// Step 4 DESTROYS the record. Step 3 is the only evidence that the
+    /// destruction was intended. Pre-fix the order was 4-5-3, so a crash in
     /// between made the destruction durable while the commit record was never
     /// written. Recovery then restored the key from the pre-delete index
     /// snapshot, no `FreeRegion` replay could evict it
@@ -9317,10 +9347,15 @@ impl Engine {
     /// first makes the window resolve DELETE-WINS instead: replay evicts the
     /// entry whether or not the header write survived.
     ///
+    /// It also repairs backup/restore, which is teed off the redo tail: any cut
+    /// that captures the destruction now necessarily contains the commit record
+    /// that explains it, so a restored image can no longer carry a phantom the
+    /// live node never had.
+    ///
     /// The fix errs toward LOSING an uncommitted delete, never toward losing a
-    /// record: a crash before step 2 reverts the whole delete (the client was
-    /// never acked, since step 2 has not returned), while any delete that WAS
-    /// acked is durable at step 2 — strictly earlier than before, so the
+    /// record: a crash before step 3 reverts the whole delete (the client was
+    /// never acked, since step 3 has not returned), while any delete that WAS
+    /// acked is durable at step 3 — strictly earlier than before, so the
     /// acked-delete-survives guarantee is preserved, not weakened.
     fn delete_inner(
         &self,
@@ -9608,9 +9643,14 @@ impl Engine {
         // finished zeroing the header, so a successor's record cannot be
         // clobbered by it.
         //
-        // The `FreeRegion` is already durable, so a failure here leaks the
-        // region in memory only — the next boot's replay reinstates it — and
-        // must NOT abort the (committed) delete.
+        // The `FreeRegion` is already durable, so a failure here must NOT abort
+        // the (committed) delete; it is deferred like every other post-commit
+        // error. The region is then leaked in memory until a boot whose replayed
+        // tail still carries the `FreeRegion` — NOT unconditionally "the next
+        // boot": if a checkpoint fences and reclaims the redo prefix past this
+        // entry first, the leak is permanent (space on the in-place engine,
+        // short dead-byte accounting on the segment engine). See
+        // `RecordAllocator::journal_free`.
         {
             let mut alloc = self.allocator_for(entry.device_id).lock();
             if let Err(e) = alloc.apply_journaled_free(journaled_free) {
@@ -9621,9 +9661,13 @@ impl Engine {
                     record_offset = entry.record_offset,
                     error = %e,
                     "delete could not apply its already-durable FreeRegion to the \
-                     allocator; the region is leaked in memory until the next boot \
-                     replays the journal",
+                     allocator; the region is leaked until a boot replays the \
+                     journal entry (permanently, if a checkpoint reclaims that \
+                     redo prefix first)",
                 );
+                deferred.get_or_insert(SpendError::StorageError {
+                    detail: format!("{e}"),
+                });
             }
         }
 
@@ -9736,8 +9780,18 @@ impl Engine {
         // ran, but the caller is told the node hit a device failure — the
         // compensating-delete path reports that as a non-clean rollback, and a
         // retry of the delete resolves benignly to `TxNotFound`.
+        //
+        // Neither consumer can distinguish this from "the delete did not
+        // happen" (the client maps it to `ERR_STORAGE_IO`), so it is counted
+        // separately: `deletes_committed_with_device_error` is the only signal
+        // that the record IS gone and the DEVICE is what is failing.
         match deferred {
-            Some(e) => Err(e),
+            Some(e) => {
+                if let Some(m) = crate::server::dispatch::dispatch_metrics_handle() {
+                    m.deletes_committed_with_device_error.inc();
+                }
+                Err(e)
+            }
             None => Ok(()),
         }
     }

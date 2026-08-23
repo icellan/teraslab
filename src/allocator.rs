@@ -265,24 +265,42 @@ pub struct AllocatedRegion {
 /// on-device metadata header there, with the delete's durable commit record
 /// already written (so a crash resolves DELETE-WINS) and no concurrent `create`
 /// able to claim the offset (so the header write cannot clobber a successor).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[must_use = "a journaled free that is never applied leaks the region in memory until the next boot"]
+/// Deliberately NOT `Copy`/`Clone`: the token is a one-shot capability for one
+/// specific release on one specific store. Copying it would let the same
+/// already-durable `FreeRegion` be applied twice, and the two engines fail that
+/// asymmetrically — [`SlotAllocator::apply_journaled_free`] catches it as
+/// [`AllocatorError::DoubleFree`], but the segment engine's `validate_free` has
+/// no overlap check, so a double-apply would silently double-count `dead` and
+/// that feeds whole-segment reclaim eligibility. Move-only makes a second apply
+/// require a second `journal_free`, i.e. a second durable `FreeRegion`, which is
+/// exactly what a second apply is allowed to mean.
+///
+/// `device_id` carries the owning store so a token can never be applied to a
+/// different store's allocator — where it would put an unrelated live record's
+/// extent on that store's freelist. Both `apply_journaled_free` impls
+/// `debug_assert_eq!` it.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "a journaled free that is never applied leaks the region in memory until the redo entry is reclaimed"]
 pub struct JournaledFree {
     /// Device byte offset of the released region.
     offset: u64,
     /// The release size AFTER `align_reservation` — the value journaled in the
     /// `FreeRegion` entry, so the applied free covers exactly the durable one.
     aligned_size: u64,
+    /// The store this release belongs to — the same tag stamped on the
+    /// journaled `RedoOp::FreeRegion` (`RecordAllocator::redo_device_id`).
+    device_id: u8,
 }
 
 impl JournaledFree {
     /// Build a token for an already-journaled release. Crate-internal: only an
     /// allocator's `journal_free` may mint one, because the token asserts the
     /// `FreeRegion` is durable.
-    pub(crate) fn new(offset: u64, aligned_size: u64) -> Self {
+    pub(crate) fn new(offset: u64, aligned_size: u64, device_id: u8) -> Self {
         Self {
             offset,
             aligned_size,
+            device_id,
         }
     }
 
@@ -294,6 +312,11 @@ impl JournaledFree {
     /// The journaled (post-`align_reservation`) release size.
     pub(crate) fn aligned_size(&self) -> u64 {
         self.aligned_size
+    }
+
+    /// The store the release was journaled against.
+    pub(crate) fn device_id(&self) -> u8 {
+        self.device_id
     }
 }
 
@@ -1065,10 +1088,11 @@ impl SlotAllocator {
             crate::fault_injection::check(crate::fault_injection::SyncPoint::MidAllocatorPersist);
         }
 
-        Ok(JournaledFree {
+        Ok(JournaledFree::new(
             offset,
             aligned_size,
-        })
+            self.redo_device_id,
+        ))
     }
 
     /// Make a [`JournaledFree`]'s region allocatable again, merging with
@@ -1077,15 +1101,20 @@ impl SlotAllocator {
     /// # Errors
     /// Re-runs the range + double-free validation and returns the same errors
     /// as [`Self::journal_free`] if state changed underneath (it cannot in the
-    /// delete path, which holds the record's stripe lock and this allocator's
-    /// mutex around both halves). The `FreeRegion` is already durable at this
-    /// point, so an error here leaks the region in memory only — recovery's
-    /// replay reinstates it — and never double-counts it.
+    /// delete path, which holds the record's stripe lock and re-takes this
+    /// allocator's mutex for each half). The `FreeRegion` is already durable at
+    /// this point, so an error here leaks the region rather than double-counting
+    /// it — see [`RecordAllocator::journal_free`] for how long the leak lasts.
     pub fn apply_journaled_free(&mut self, journaled: JournaledFree) -> Result<()> {
-        let JournaledFree {
-            offset,
-            aligned_size,
-        } = journaled;
+        debug_assert_eq!(
+            journaled.device_id(),
+            self.redo_device_id,
+            "JournaledFree applied to the wrong store's allocator: the token was \
+             journaled against store {} but this allocator is store {}",
+            journaled.device_id(),
+            self.redo_device_id,
+        );
+        let (offset, aligned_size) = (journaled.offset(), journaled.aligned_size());
         self.validate_free(offset, aligned_size)?;
 
         let mut final_offset = offset;
@@ -2186,6 +2215,20 @@ pub trait RecordAllocator: Send {
     /// Same contract as [`Self::free`]; additionally
     /// [`AllocatorError::RedoLogFailure`] when the journal append/flush fails
     /// (no state is mutated in that case).
+    /// # NOT the delete path — use the two halves
+    ///
+    /// This has NO production callers and must not acquire one. It exists as
+    /// the named, tested composition of [`Self::journal_free`] +
+    /// [`Self::apply_journaled_free`] — the reference for what the pair means,
+    /// and the shape the allocator's own unit tests exercise when the split is
+    /// irrelevant to what they are testing.
+    ///
+    /// A record DELETION must call the two halves separately and do its
+    /// destructive header write BETWEEN them. Reaching for this instead
+    /// collapses the split and silently reintroduces the CI scenario-09 phantom
+    /// (destruction durable, commit record not) plus the concurrent-create
+    /// clobber. `journaled_free_region_stays_unallocatable_until_applied` pins
+    /// the property this would break.
     fn free_durable(&mut self, offset: u64, size: u64) -> Result<()> {
         let journaled = self.journal_free(offset, size)?;
         self.apply_journaled_free(journaled)
@@ -2206,6 +2249,22 @@ pub trait RecordAllocator: Send {
     /// the header write, so no concurrent `create` can claim the offset and
     /// have its fresh record zeroed by this delete's tombstone.
     ///
+    /// # The two halves are no longer atomic under the allocator mutex
+    ///
+    /// A checkpoint can interleave: it may persist an allocator header that
+    /// does NOT yet reflect an already-committed free, then fence and reclaim
+    /// the redo prefix past that `FreeRegion`. After a crash the entry is gone
+    /// from the tail, so nothing reinstates the free — the in-place engine
+    /// leaks the region's space permanently, and the segment engine's `dead` is
+    /// permanently short by `record_size`, which can strand a segment that
+    /// would otherwise have drained.
+    ///
+    /// This is a space/accounting leak only: no record is lost, no record is
+    /// resurrected, and nothing consensus-visible changes (the index entry was
+    /// removed before the commit and stays removed). Do NOT describe an
+    /// unapplied `JournaledFree` as recoverable "at the next boot" — that holds
+    /// only while the journal still carries the entry.
+    ///
     /// # Errors
     /// Same contract as [`Self::free`], plus
     /// [`AllocatorError::RedoLogFailure`] when the journal append/flush fails.
@@ -2219,8 +2278,9 @@ pub trait RecordAllocator: Send {
     ///
     /// # Errors
     /// Same range/overlap errors as [`Self::journal_free`] if state changed
-    /// underneath. The `FreeRegion` is already durable, so an error here leaks
-    /// the region in memory only (recovery's replay reinstates it).
+    /// underneath. The `FreeRegion` is already durable, so an error here never
+    /// corrupts state — it leaks the region. See [`Self::journal_free`] for how
+    /// long that leak can last.
     fn apply_journaled_free(&mut self, journaled: JournaledFree) -> Result<()>;
 
     /// Persist allocator state to the device header and fsync.
@@ -3713,6 +3773,51 @@ mod tests {
             alloc.free_region_count(),
             0,
             "coalesce_adjacent must remove both neighbours (caller re-inserts)",
+        );
+    }
+
+    /// P2-5: the OTHER half of the split free. `journal_free` makes the release
+    /// DURABLE but must leave the region UN-ALLOCATABLE until
+    /// `apply_journaled_free` runs — that gap is the only thing stopping a
+    /// concurrent `create` from being handed the offset `Engine::delete_inner`
+    /// is about to overwrite with the deleted-record marker, which would zero a
+    /// brand-new record's header.
+    ///
+    /// A refactor hoisting `apply_journaled_free` back up next to `journal_free`
+    /// keeps every commit-before-destroy test green while silently reintroducing
+    /// that clobber, so the property needs its own pin.
+    #[test]
+    fn journaled_free_region_stays_unallocatable_until_applied() {
+        let data_dev = test_device(16);
+        let mut alloc = SlotAllocator::new(data_dev).unwrap();
+
+        let victim = alloc.allocate(4096).unwrap();
+        let journaled = alloc.journal_free(victim, 4096).unwrap();
+
+        // The release is durable, but the freelist must not know about it yet.
+        assert!(
+            alloc.free_region_containing(victim).is_none(),
+            "a journaled-but-unapplied free must not be on the freelist"
+        );
+        let during = alloc.allocate(4096).unwrap();
+        assert_ne!(
+            during, victim,
+            "the region a delete is about to zero must NOT be handed to a \
+             concurrent create — its header write would clobber the new record"
+        );
+
+        // Applying it is what makes the region reusable, and it really does.
+        alloc.apply_journaled_free(journaled).unwrap();
+        assert_eq!(
+            alloc.free_region_containing(victim),
+            Some((victim, 4096)),
+            "apply_journaled_free must return the region to the freelist"
+        );
+        let after = alloc.allocate(4096).unwrap();
+        assert_eq!(
+            after, victim,
+            "once applied, the freed region is reused — proving the assertion \
+             above pinned an ordering, not an allocator that never reuses"
         );
     }
 

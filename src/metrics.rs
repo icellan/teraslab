@@ -504,6 +504,21 @@ pub struct ThreadMetrics {
     /// copies, and this counter staying at zero on a busy clustered node means
     /// that share is not being reclaimed.
     pub deletes_held_copy_reclaimed: PaddedCounter,
+    /// Deletes that COMMITTED (their `RedoOp::FreeRegion` is durable) but hit a
+    /// device error afterwards — the on-device deleted-record marker, its fsync,
+    /// or a secondary-index removal.
+    ///
+    /// These are the only errors in the codebase that mean "the operation
+    /// SUCCEEDED and the device is failing". `Engine::delete_inner` completes
+    /// every bookkeeping step and then returns the error, so the caller sees an
+    /// ordinary `StorageError`: the client maps it to `ERR_STORAGE_IO` and the
+    /// replication-compensation path keeps the intent PENDING (both safe and
+    /// convergent — a retry resolves to `TxNotFound`). Neither consumer can tell
+    /// this apart from "the delete did not happen", so during an incident this
+    /// counter is the only signal that the record IS gone and the device — not
+    /// the delete path — is what needs attention. A non-zero value should be
+    /// read as a failing device, never as lost deletes.
+    pub deletes_committed_with_device_error: PaddedCounter,
     /// Total preserve_until operations attempted.
     pub preserve_until_attempted: PaddedCounter,
     /// preserve_until operations that succeeded.
@@ -638,6 +653,7 @@ impl ThreadMetrics {
             deletes_succeeded: PaddedCounter::new(),
             deletes_failed: PaddedCounter::new(),
             deletes_held_copy_reclaimed: PaddedCounter::new(),
+            deletes_committed_with_device_error: PaddedCounter::new(),
             preserve_until_attempted: PaddedCounter::new(),
             preserve_until_succeeded: PaddedCounter::new(),
             preserve_until_failed: PaddedCounter::new(),

@@ -252,14 +252,10 @@ it is garbage collection of a record the retention policy has already released,
 and it is exempt from the WAL-first, replicate-then-ack discipline. Full
 behavioural contract: spec §3.18 / §3.18.1. The durability-relevant parts:
 
-- **No redo entry names the deletion on the node that removes locally.** There
-  is no `RedoOp::Delete` on that path, so recovery can never replay a local
-  removal, and `redo_entry_to_replica_op` maps every entry this path *does*
-  write to `None`, so none can leak into a migration delta. A crash before the
-  physical cleanup leaves the record present and internally consistent (record +
-  parent-spent slots + allocated region all still agree); the pruner re-deletes
-  it on its next pass. "Lost" delete = "delete has not happened yet", which is a
-  legal state, not corruption.
+- **No redo entry NAMES the deletion, but one COMMITS it.** There is no
+  `RedoOp::Delete` on the local-removal path, so recovery can never replay a
+  removal by txid, and `redo_entry_to_replica_op` maps every entry this path
+  *does* write to `None`, so none can leak into a migration delta.
 
   This is NOT the same as "a delete writes nothing to the WAL", which is false:
   freeing the record's region emits a fsynced `RedoOp::FreeRegion` (offset +
@@ -267,6 +263,30 @@ behavioural contract: spec §3.18 / §3.18.1. The durability-relevant parts:
   `RedoOp::SecondaryDahUpdate` intent. Recovery's create-scrub identifies a
   deleted record by OFFSET precisely because no txid is journalled, so the
   `FreeRegion` entry is load-bearing.
+
+  **That `FreeRegion` fsync is the delete's COMMIT POINT, and it is what decides
+  a crash.** `Engine::delete_inner` writes it BEFORE it overwrites the record's
+  on-device header with the deleted-record marker, so there are exactly two
+  outcomes and no third:
+
+  - **Crash BEFORE the commit point** — nothing was destroyed and nothing was
+    journalled. The record is present and internally consistent (record +
+    parent-spent slots + allocated region all still agree) and the pruner
+    re-deletes it on its next pass. "Lost" delete = "delete has not happened
+    yet", which is a legal state, not corruption. Nothing was ACKed either.
+  - **Crash AFTER the commit point** — the delete WINS. `FreeRegion` replay
+    evicts any index entry still pointing at the freed slot, whether or not the
+    header write, the index removal, or the deletion tombstone survived. The
+    delete does not revert.
+
+  Ordering these the other way round is what caused CI scenario 09: the
+  destruction could become durable while the commit record did not, and the
+  pre-delete index snapshot then restored the key over zeroed bytes — a phantom
+  no replay could evict, failing every read with
+  `CRC mismatch: expected 0x00000000` and NACKing every migration baseline into
+  its shard. It also affects backup/restore, which is teed off the redo tail:
+  any cut that captures the destruction now necessarily contains the commit
+  record that explains it.
 - **A CLIENT delete IS replicated; a DAH-sweep delete is not.** A client
   `OP_DELETE_BATCH` at the key's master ships `ReplicaOp::Delete` to every other
   holder before it frees its own copy, and the ACK policy is enforced exactly as
@@ -277,18 +297,22 @@ behavioural contract: spec §3.18 / §3.18.1. The durability-relevant parts:
   the outcome is known); the caller retries, which converges because delete is
   idempotent on both sides. The DAH sweep replicates nothing: each holder
   reclaims its own copy under its own re-validation.
-- **Asymmetric crash durability, one direction only.** The replica journals its
-  own `RedoOp::Delete` (sentinel offsets = index unregister) and fsyncs it
-  before ACKing, so the replica's half survives a crash; the master's half does
-  not become durable until its next checkpoint. A master crash between the ACK
-  and that checkpoint therefore reverts the master's half only, leaving
-  **master-live / replica-absent**. That is the replica-missing-record condition
-  the master's own re-ship repair (`repair_missing_record_target`) closes on the
-  next mutation of the key, and which a client retry of the delete closes
-  outright. The authority never loses a record a holder still has, so this is an
-  eventual-consistency window, not a lost UTXO. `OP_PROCESS_EXPIRED_PRESERVATIONS`
-  is unchanged: `STATUS_OK` there still means "removed from this node's live
-  index" only.
+- **Both halves are durable at ACK time.** The replica journals its own
+  `RedoOp::Delete` (sentinel offsets = index unregister) and fsyncs it before
+  ACKing. The master's half is durable at its own `FreeRegion` fsync — the
+  commit point above — which runs before it returns `STATUS_OK`. So a master
+  crash after the ACK does NOT revert the master's half: replay resolves it
+  delete-wins, and both sides stay absent.
+
+  What is still deferred to the master's next checkpoint is the DELETION
+  TOMBSTONE (`ops::tombstone`, Invariant TS-1), not the delete. A master crash
+  in that window leaves the record durably gone with no local tombstone, so the
+  master has no frozen generation to veto a reverse-heal pull against and a
+  stale peer image can heal back in — see the TS-1 durability model for the
+  exposure and its bounds. `repair_missing_record_target` and a client retry of
+  the delete both close it, and delete is idempotent on both sides.
+  `OP_PROCESS_EXPIRED_PRESERVATIONS` is unchanged: `STATUS_OK` there still means
+  "removed from this node's live index" only.
 - **Still not a cluster-wide delete barrier.** Neither path blocks or orders
   against a concurrent checkpoint on another node, and a `FLAG_LOCAL_READ`
   against a holder can observe either side of the window above.
