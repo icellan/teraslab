@@ -2380,7 +2380,12 @@ fn complete_migration_task_current_epoch_with_midpoint(
             // completion that did NOT commit (replica-only fan-out that does not
             // transfer the master, or a stale-epoch discard that returned early
             // above) leaves no such evidence, so the last copy is retained.
-            mgr.record_committed_handoff(task.shard, topology_epoch);
+            //
+            // W15 — recorded against THIS task's target. The evidence used to be
+            // keyed by shard alone, so this one commit also authorized deleting
+            // copies that a sibling handoff of the same shard had terminally
+            // aborted on; see `MigrationManager::has_committed_handoff`.
+            mgr.record_committed_handoff(task.shard, task.to_node, topology_epoch);
         }
         if !mgr.is_shard_fenced(task.shard) {
             fenced_bm.clear(task.shard);
@@ -17466,6 +17471,19 @@ fn terminally_abort_unshippable_task(
         let mut mgr = migration.lock();
         let retired = mgr.fail_and_retire_task(task);
         if retired {
+            // W15 data-loss guard — the target just proved it does NOT hold at
+            // least one record this node is shipping, so this node may be the
+            // last holder. Record the abort against `(shard, target)` so orphan
+            // cleanup cannot shed the shard at this epoch on the strength of a
+            // SIBLING committed handoff of the same shard. This record is the
+            // only trace left: `fail_and_retire_task` above REMOVES the tracking
+            // entry, which is exactly what both cleanup gates key their
+            // unresolved-task skip off. (An ordinary
+            // `fail_migration_task_current_epoch` leaves its `Failed` entry in
+            // place and needs no record.) See
+            // `MigrationManager::has_committed_handoff` for the CI chain and for
+            // why the veto cannot wedge the legitimate shed shut.
+            mgr.record_aborted_handoff(task.shard, task.to_node, topology_epoch);
             if !mgr.is_shard_fenced(task.shard) {
                 fenced_bm.clear(task.shard);
             }
@@ -29069,9 +29087,11 @@ mod tests {
         // Data-loss guard (task #28): reclamation requires positive
         // committed-handoff evidence. Record it so this models a genuinely
         // completed handoff whose stale source copy is now safe to drop.
-        migration
-            .lock()
-            .record_committed_handoff(shard, new_table.version);
+        migration.lock().record_committed_handoff(
+            shard,
+            new_table.target_assignment(shard).master,
+            new_table.version,
+        );
 
         cleanup_orphaned_shard_if_settled(
             NodeId(1),
@@ -29195,9 +29215,11 @@ mod tests {
 
         let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
-        migration
-            .lock()
-            .record_committed_handoff(shard, new_table.version);
+        migration.lock().record_committed_handoff(
+            shard,
+            new_table.target_assignment(shard).master,
+            new_table.version,
+        );
 
         run_orphan_cleanup(
             NodeId(1),
@@ -30410,9 +30432,11 @@ mod tests {
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
         // Evidence present, cluster settled, NO further batch completion will
         // ever run — only the event-driven pass can reclaim.
-        migration
-            .lock()
-            .record_committed_handoff(shard, new_table.version);
+        migration.lock().record_committed_handoff(
+            shard,
+            new_table.target_assignment(shard).master,
+            new_table.version,
+        );
 
         let mut last_fired: Option<std::time::Instant> = None;
         let now = std::time::Instant::now();
@@ -30499,9 +30523,11 @@ mod tests {
         );
 
         // Evidence arrives → reclaimed, gauge drops to zero.
-        migration
-            .lock()
-            .record_committed_handoff(shard, new_table.version);
+        migration.lock().record_committed_handoff(
+            shard,
+            new_table.target_assignment(shard).master,
+            new_table.version,
+        );
         run_orphan_cleanup(
             NodeId(1),
             &engine,
@@ -30565,9 +30591,11 @@ mod tests {
 
         let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
-        migration
-            .lock()
-            .record_committed_handoff(shard, new_table.version);
+        migration.lock().record_committed_handoff(
+            shard,
+            new_table.target_assignment(shard).master,
+            new_table.version,
+        );
 
         cleanup_orphaned_shard_if_settled(
             NodeId(1),
@@ -30648,8 +30676,16 @@ mod tests {
             let mgr = &mut migration.lock();
             // Both shards have the #28 evidence that would otherwise authorize
             // reclaim, so the FENCE is the only difference between them.
-            mgr.record_committed_handoff(fenced, new_table.version);
-            mgr.record_committed_handoff(unfenced, new_table.version);
+            mgr.record_committed_handoff(
+                fenced,
+                new_table.target_assignment(fenced).master,
+                new_table.version,
+            );
+            mgr.record_committed_handoff(
+                unfenced,
+                new_table.target_assignment(unfenced).master,
+                new_table.version,
+            );
             // A #74 parked no-source heal fence on a shard this node no longer
             // owns — the restored-fence / boot-G3 shape.
             mgr.mark_heal_fence_active(fenced);
@@ -30824,9 +30860,11 @@ mod tests {
 
         let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
-        migration
-            .lock()
-            .record_committed_handoff(shard, new_table.version);
+        migration.lock().record_committed_handoff(
+            shard,
+            new_table.target_assignment(shard).master,
+            new_table.version,
+        );
 
         run_orphan_cleanup(
             NodeId(1),
@@ -30892,8 +30930,16 @@ mod tests {
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
         {
             let mut mgr = migration.lock();
-            mgr.record_committed_handoff(failed_shard, new_table.version);
-            mgr.record_committed_handoff(settled_shard, new_table.version);
+            mgr.record_committed_handoff(
+                failed_shard,
+                new_table.target_assignment(failed_shard).master,
+                new_table.version,
+            );
+            mgr.record_committed_handoff(
+                settled_shard,
+                new_table.target_assignment(settled_shard).master,
+                new_table.version,
+            );
             let task = MigrationTask {
                 shard: failed_shard,
                 from_node: NodeId(1),
@@ -31311,7 +31357,9 @@ mod tests {
     #[test]
     fn committed_handoff_cleared_on_reacquisition() {
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
-        migration.lock().record_committed_handoff(300, 10);
+        migration
+            .lock()
+            .record_committed_handoff(300, NodeId(2), 10);
         assert!(migration.lock().has_committed_handoff(300, 10));
 
         let inbound = MigrationTask {
@@ -31339,7 +31387,9 @@ mod tests {
     #[test]
     fn committed_handoff_is_stale_after_epoch_bump() {
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
-        migration.lock().record_committed_handoff(400, 10);
+        migration
+            .lock()
+            .record_committed_handoff(400, NodeId(2), 10);
         assert!(
             migration.lock().has_committed_handoff(400, 10),
             "evidence is valid at the epoch it was recorded",
@@ -31423,9 +31473,11 @@ mod tests {
 
         let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
-        migration
-            .lock()
-            .record_committed_handoff(shard, new_table.version);
+        migration.lock().record_committed_handoff(
+            shard,
+            new_table.target_assignment(shard).master,
+            new_table.version,
+        );
         let task = MigrationTask {
             shard: other_shard,
             from_node: NodeId(1),
@@ -31452,6 +31504,157 @@ mod tests {
             0,
             "an active task on shard {other_shard} must not block per-shard \
              cleanup of settled shard {shard}",
+        );
+    }
+
+    /// W15 — a SHARD-KEYED committed-handoff record let ONE committed handoff
+    /// authorize deleting EVERY local copy of that shard, including copies a
+    /// SECOND, DISTINCT handoff of the same shard had just proved the cluster
+    /// still needs.
+    ///
+    /// CI run 32637576348 scenario 05, shard 959 at epoch 4: node1's completion
+    /// to node3 was REJECTED (node3 held a `PruneReplace gen=0` tombstone for a
+    /// key node1 was shipping), the task terminally aborted logging *"source
+    /// keeps authority"* — and ten seconds later node1's per-shard orphan
+    /// cleanup deleted its copies anyway (`{shard: 959, deleted: 2}`), on the
+    /// strength of an UNRELATED committed handoff of the same shard. Five acked
+    /// records ended that run with `holders=[n1:N, n2:N, n3:N]`.
+    ///
+    /// A terminal abort is positive evidence that the TARGET does not hold at
+    /// least one record this node holds, so it must veto the shed of that shard
+    /// at that epoch. It is also the ONLY failure disposition that needs its own
+    /// record: `fail_migration_task_current_epoch` leaves a `Failed` tracking
+    /// entry that both cleanup gates already refuse to reclaim under, whereas
+    /// `terminally_abort_unshippable_task` RETIRES the entry
+    /// (`fail_and_retire_task`) and so erases the only trace the gates could
+    /// see — asserted below.
+    ///
+    /// The CONTROL shard in the same pass pins the opposite direction: a shard
+    /// with clean committed-handoff evidence and no abort is still reclaimed, so
+    /// the veto can never be mistaken for "orphan cleanup stopped firing" (the
+    /// over-replication this campaign has been fighting).
+    #[test]
+    fn terminal_abort_vetoes_orphan_cleanup_under_a_sibling_committed_handoff() {
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let lost: Vec<u16> = (0..NUM_SHARDS as u16)
+            .filter(|&s| {
+                let old = old_table.target_assignment(s);
+                let new = new_table.target_assignment(s);
+                (old.master == NodeId(1) || old.replicas.contains(&NodeId(1)))
+                    && new.master != NodeId(1)
+                    && !new.replicas.contains(&NodeId(1))
+            })
+            .take(2)
+            .collect();
+        assert_eq!(
+            lost.len(),
+            2,
+            "the fixture needs two shards node1 lost: one to abort on, one control",
+        );
+        let (aborted_shard, control_shard) = (lost[0], lost[1]);
+
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(aborted_shard, 71));
+        create_test_record(&engine, tx_key_for_shard(control_shard, 72));
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let epoch = new_table.version;
+
+        // Both shards earn committed-handoff evidence through the PRODUCTION
+        // wiring (`complete_migration_task_current_epoch` with `commit`), not a
+        // hand-poked map entry.
+        for shard in [aborted_shard, control_shard] {
+            let task = make_outbound_master_task(shard, NodeId(1), NodeId(2));
+            migration.lock().start_outbound(
+                std::slice::from_ref(&task),
+                NodeId(1),
+                &std::collections::HashSet::from([shard]),
+            );
+            assert!(
+                complete_migration_task_current_epoch(
+                    &migration,
+                    &shard_table,
+                    &fenced,
+                    &migrating,
+                    &task,
+                    epoch,
+                    true,
+                ),
+                "shard {shard}: the committed handoff must be recorded at epoch {epoch}",
+            );
+        }
+
+        // The second, DISTINCT handoff of `aborted_shard` — to a different
+        // target — terminally aborts. The source keeps authority.
+        let doomed = MigrationTask {
+            shard: aborted_shard,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: false,
+        };
+        migration.lock().start_outbound(
+            std::slice::from_ref(&doomed),
+            NodeId(1),
+            &std::collections::HashSet::from([aborted_shard]),
+        );
+        assert!(
+            terminally_abort_unshippable_task(
+                &migration,
+                &shard_table,
+                &fenced,
+                &migrating,
+                &doomed,
+                epoch,
+            ),
+            "the doomed task must be tracked and retired at the current epoch",
+        );
+        assert!(
+            !migration
+                .lock()
+                .active_migrations()
+                .iter()
+                .any(|p| p.shard == aborted_shard && !p.is_complete()),
+            "the terminal abort RETIRES the entry, so the per-shard task gate \
+             cannot see it — the abort must be recorded somewhere else or the \
+             shed is unguarded",
+        );
+
+        for shard in [aborted_shard, control_shard] {
+            let table = shard_table.read();
+            let assignment = table.effective_assignment(shard);
+            assert!(
+                assignment.master != NodeId(1) && !assignment.replicas.contains(&NodeId(1)),
+                "shard {shard}: the fixture must leave node1 a non-owner, or the \
+                 cleanup skips for the wrong reason",
+            );
+            drop(table);
+            cleanup_orphaned_shard_if_settled(
+                NodeId(1),
+                &engine,
+                &shard_table,
+                &migration,
+                shard,
+                epoch,
+            );
+        }
+
+        assert_eq!(
+            engine.shard_record_count(aborted_shard),
+            1,
+            "shard {aborted_shard}: a handoff that terminally aborted at epoch \
+             {epoch} must veto the shed — the target just proved it does NOT \
+             hold this record",
+        );
+        assert_eq!(
+            engine.shard_record_count(control_shard),
+            0,
+            "shard {control_shard}: a clean committed handoff with no abort must \
+             still be reclaimed — the veto must not disable orphan cleanup",
         );
     }
 
