@@ -248,6 +248,50 @@ pub async fn http_migration_status(
 }
 
 /// Wait until all nodes report the expected cluster size via HTTP /status.
+/// W16 — wait until ONE node's HTTP listener answers, and return how long that
+/// took.
+///
+/// This is the earliest instant a restarting node is observable at all, and it
+/// is a real phase boundary rather than a convenient one: `src/bin/server.rs`
+/// starts the HTTP listener only AFTER synchronous recovery — redo replay,
+/// mined-index recovery, DAH rebuild, tombstone replay — and flips the
+/// readiness flag immediately before spawning it. So a `/status` that answers
+/// means "this process finished recovering", and a `/status` that does not is
+/// "still booting", NOT "wedged".
+///
+/// Separating the two is what stops a recovery-time budget from being smuggled
+/// into a membership SLA: how long recovery takes scales with how much redo the
+/// previous phase happened to generate, while how long membership takes after
+/// that does not. Scenario 05 asserted the sum and failed in armed CI
+/// (run 32644353574) on a node2 that was booting normally — zero ERROR lines,
+/// no `FormatError`, no CRC-zero signature — but had 3375 redo entries to
+/// replay first.
+pub async fn wait_node_http_ready(
+    docker: &DockerHelpers,
+    node_num: u32,
+    timeout: Duration,
+) -> Result<Duration, ClientError> {
+    let start = std::time::Instant::now();
+    let port = docker.http_port(node_num);
+    let url = format!("http://127.0.0.1:{port}/status");
+    loop {
+        match poll_json(&url).await {
+            Ok(_) => return Ok(start.elapsed()),
+            // The deadline is checked HERE so the failing poll's own error can
+            // be quoted without keeping it in a binding that is dead on the
+            // success path.
+            Err(e) if start.elapsed() >= timeout => {
+                return Err(ClientError::Connection(format!(
+                    "wait_node_http_ready: node{node_num} did not bind its HTTP listener \
+                     within {timeout:?} (last: {e})"
+                )));
+            }
+            Err(_) => {}
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 pub async fn wait_cluster_ready(
     docker: &DockerHelpers,
     node_count: u32,

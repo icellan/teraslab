@@ -21,6 +21,47 @@ macro_rules! tlog {
 /// Scenario ID for unique Docker ports and container names.
 const SID: u16 = 6;
 
+/// Measured cost of the 3→4 rebalance's STREAMING phase in an armed run
+/// (CI 32644353574): the shard data actually moving, with no waiting-on-a-gate
+/// time in it.
+const ARMED_STREAMING_SECS: u64 = 107;
+
+/// Pacing the rebalance cannot avoid: a member rebalance is deliberately
+/// excluded from the fast re-drive cadence and stays on the 30 s same-term
+/// reactivation cooldown (`SAME_TERM_REACTIVATION_COOLDOWN` in
+/// `src/cluster/coordinator.rs`), because re-driving it sooner floods the
+/// receivers' bounded redo logs. One activation sheds only a fraction of the
+/// shards, so a second wave is routine and costs one full window.
+const MEMBER_REBALANCE_COOLDOWN_SECS: u64 = 30;
+
+/// Budget for the 3→4 rebalance in test 6.2.
+///
+/// # The arithmetic
+///
+/// ```text
+/// ARMED_STREAMING_SECS + MEMBER_REBALANCE_COOLDOWN_SECS (one re-drive wave)
+///   + 43 s CI headroom  =  107 + 30 + 43  =  180 s
+/// ```
+///
+/// The default run does the same rebalance in 82 s (38 s of margin under the
+/// old 120 s); the armed configuration's streaming alone exceeds 107 s, so the
+/// old budget could not contain it and expired mid-transfer.
+///
+/// # Why 180 and not 240
+///
+/// 240 s is what it takes for this gate to pass while the redo-truncation
+/// defect is live — a truncation cascade forces repeated re-streams, and each
+/// costs another cooldown window. Budgeting for that would PAPER OVER the
+/// defect: the test would go green and stop reporting it. 180 s is the budget
+/// for a cluster whose only cost is physics (streaming + pacing), so this gate
+/// keeps failing while the truncation cascade is live and starts passing when
+/// it is fixed — which is what a timeout is for.
+///
+/// If this gate times out at ~180 s with the migration still moving records,
+/// read it as the truncation defect, not as a budget to raise.
+const REBALANCE_BUDGET: Duration =
+    Duration::from_secs(ARMED_STREAMING_SECS + MEMBER_REBALANCE_COOLDOWN_SECS + 43);
+
 /// Format a txid as a short hex prefix for assertion messages.
 fn txid_hex(txid: &[u8; 32]) -> String {
     txid.iter()
@@ -29,9 +70,23 @@ fn txid_hex(txid: &[u8; 32]) -> String {
         .collect::<String>()
 }
 
+/// Whole-scenario timeout.
+///
+/// It has to LEAVE ROOM for [`REBALANCE_BUDGET`], or the outer timeout fires
+/// first and the run reports "scenario timed out" instead of the gate that
+/// actually overran — with its per-node master/handoff/inbound census. At 300 s
+/// it did not: 300 - 180 = 120 s is less than the ~150 s the armed run spends
+/// on formation, seeding 10 000 records at the armed pace, the pre-scale
+/// verification sweep and the post-rebalance checks.
+///
+/// ```text
+/// REBALANCE_BUDGET (180 s) + 150 s of surrounding work + 90 s headroom = 420 s
+/// ```
+const SCENARIO_TIMEOUT: Duration = Duration::from_secs(420);
+
 #[tokio::test(flavor = "multi_thread")]
 async fn scenario_06_scale_up() {
-    let result = tokio::time::timeout(Duration::from_secs(300), run_scenario()).await;
+    let result = tokio::time::timeout(SCENARIO_TIMEOUT, run_scenario()).await;
     match result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -42,7 +97,7 @@ async fn scenario_06_scale_up() {
         Err(_) => {
             common::collect_failure_diagnostics(SID).await;
             common::teardown_all(SID).await;
-            panic!("scenario timed out after 300s");
+            panic!("scenario timed out after {SCENARIO_TIMEOUT:?}");
         }
     }
 }
@@ -219,7 +274,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     // -- Test 6.2: Wait for migrations, check balance --
     tlog!(t0, "test 6.2: wait for migrations");
     eprintln!("[6.2] Waiting for migrations to complete, then checking balance");
-    common::wait_migrations_complete(&docker5, 4, Duration::from_secs(120)).await?;
+    common::wait_migrations_complete(&docker5, 4, REBALANCE_BUDGET).await?;
     eprintln!("[6.2] OK -- all migrations complete");
 
     // Stop the background workload
@@ -554,4 +609,71 @@ async fn run_scenario() -> Result<(), ClientError> {
     tlog!(t0, "=== SCENARIO COMPLETE ===");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// W16 — the rebalance budget must exceed what the armed configuration
+    /// costs in PHYSICS (streaming + one pacing window), and must NOT be
+    /// stretched to cover the redo-truncation defect.
+    ///
+    /// This is the check the old hard-coded 120 s failed: armed streaming alone
+    /// measured 107 s, so a 120 s budget left 13 s for the 30 s cooldown a
+    /// second re-drive wave costs — an arithmetic impossibility, not a slow
+    /// machine.
+    #[test]
+    fn the_rebalance_budget_covers_streaming_plus_one_pacing_window() {
+        let physics = Duration::from_secs(ARMED_STREAMING_SECS + MEMBER_REBALANCE_COOLDOWN_SECS);
+        assert_eq!(
+            physics,
+            Duration::from_secs(137),
+            "107s streaming + 30s cooldown"
+        );
+        assert!(
+            Duration::from_secs(120) < physics,
+            "the old 120s budget must be recognisable as impossible, not merely tight",
+        );
+        assert!(
+            REBALANCE_BUDGET > physics,
+            "budget {REBALANCE_BUDGET:?} must EXCEED the unavoidable {physics:?}",
+        );
+        assert_eq!(REBALANCE_BUDGET, Duration::from_secs(180));
+    }
+
+    /// W16 — the budget must stay BELOW the 240 s that would make this gate
+    /// pass while the redo-truncation defect is live.
+    ///
+    /// Sizing for 240 s would turn a truncation cascade — repeated re-streams,
+    /// each costing another cooldown window — into a green test that says
+    /// nothing. This pins the deliberate gap: while that defect is live this
+    /// gate FAILS, and it starts passing when the defect is fixed.
+    #[test]
+    fn the_rebalance_budget_does_not_absorb_the_truncation_cascade() {
+        const OBSERVED_WITH_TRUNCATION_DEFECT: Duration = Duration::from_secs(240);
+        assert!(
+            REBALANCE_BUDGET < OBSERVED_WITH_TRUNCATION_DEFECT,
+            "raising the budget to {OBSERVED_WITH_TRUNCATION_DEFECT:?} would paper over the \
+             truncation cascade instead of reporting it",
+        );
+    }
+
+    /// W16 — the whole-scenario timeout must leave room for the gate inside it,
+    /// or a gate overrun is reported as an opaque scenario timeout and the
+    /// per-node census the gate would have printed is lost.
+    #[test]
+    fn the_scenario_timeout_leaves_room_for_the_rebalance_gate() {
+        assert!(
+            SCENARIO_TIMEOUT > REBALANCE_BUDGET,
+            "the outer timeout must not fire before the gate it contains",
+        );
+        let surrounding = SCENARIO_TIMEOUT - REBALANCE_BUDGET;
+        assert!(
+            surrounding >= Duration::from_secs(150),
+            "only {surrounding:?} left for formation, seeding 10 000 records at the armed pace, \
+             the pre-scale sweep and the post-rebalance checks — the old 300s timeout left 120s \
+             and would have fired first",
+        );
+    }
 }

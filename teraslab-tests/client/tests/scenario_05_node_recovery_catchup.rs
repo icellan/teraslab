@@ -21,6 +21,74 @@ macro_rules! tlog {
 /// Scenario ID for unique Docker ports and container names.
 const SID: u16 = 5;
 
+/// Records seeded before node2 is killed. Named because the recovery budget
+/// below is derived from it — seeding more must raise the budget, not silently
+/// eat its headroom.
+const SEED_RECORDS: u32 = 5000;
+
+/// Nodes in this scenario's cluster, and the replication factor its Docker
+/// configs set (`teraslab-tests/docker/config/node*.toml`).
+const NODE_COUNT: u64 = 3;
+const REPLICATION_FACTOR: u64 = 2;
+
+/// Redo entries node2 has to replay at boot after the kill.
+///
+/// Each seeded create is written on the shard's master AND on its replica, so
+/// at RF=2 over 3 nodes a given node receives `2/3` of them:
+///
+/// ```text
+/// SEED_RECORDS * REPLICATION_FACTOR / NODE_COUNT = 5000 * 2 / 3 = 3333
+/// ```
+///
+/// Armed CI (run 32644353574) measured `recovery complete {replayed: 3375}` —
+/// within 1.3% of the model, which is why the model is used rather than a
+/// hard-coded observation.
+const EXPECTED_REPLAYED_REDO_ENTRIES: u64 = SEED_RECORDS as u64 * REPLICATION_FACTOR / NODE_COUNT;
+
+/// Cost of replaying ONE redo entry at boot, in microseconds.
+///
+/// Recovery makes two O(redo) passes over the tail (the replay itself, then the
+/// mined-index full-redo branch when no index snapshot is found), measured at
+/// 1.37 ms/entry each in armed CI — so 2.74 ms per entry of backlog.
+const REPLAY_MICROS_PER_ENTRY: u64 = 2_740;
+
+/// Boot cost that does not scale with the redo backlog: `docker start`
+/// (~0.9 s) plus device + index open (~0.1 s).
+const FIXED_BOOT_MILLIS: u64 = 1_000;
+
+/// How long node2 may take to bind its HTTP listener after `docker start` —
+/// i.e. the whole boot + RECOVERY phase, which is over before membership is
+/// even attempted.
+///
+/// ```text
+/// (FIXED_BOOT_MILLIS + EXPECTED_REPLAYED_REDO_ENTRIES * REPLAY_MICROS_PER_ENTRY / 1000) * 3/2
+///   = (1000 ms + 3333 * 2.74 ms) * 1.5 = (1.0 s + 9.13 s) * 1.5 = 15.2 s
+/// ```
+///
+/// The 50% is CI headroom, not slack for a defect: this budget covers a node
+/// that is booting normally, and a node that is genuinely wedged overruns any
+/// budget rather than creeping past a tight one.
+///
+/// This was 10 s and it was NOT a recovery budget at all — it was the
+/// membership SLA below, doing double duty. The armed sweep makes seeding ~4.4x
+/// slower (default seeds 5000 records in 3 s, armed 13 s), so node2 accrued ~4x
+/// the redo before the kill and the 10 s gate expired while it was still
+/// replaying — reported as `UNREACHABLE`, which reads like a crash and was not.
+const NODE_BOOT_BUDGET: Duration = Duration::from_millis(
+    (FIXED_BOOT_MILLIS + EXPECTED_REPLAYED_REDO_ENTRIES * REPLAY_MICROS_PER_ENTRY / 1_000) * 3 / 2,
+);
+
+/// How long the cluster may take to agree that node2 is back, measured from the
+/// instant node2's listener answers.
+///
+/// This is the actual SLA of test 5.7 and it is now independent of the redo
+/// backlog: SWIM detection plus the topology-term agreement the three nodes
+/// have to reach. Armed CI measured the SWIM leg at ~0.9 s; the default run's
+/// whole `time_to_membership` (boot + recovery + SWIM) was 3.02 s. 10 s is the
+/// bound this scenario has always asserted — kept, not loosened, because
+/// removing the recovery term from the measurement is what makes it meaningful.
+const MEMBERSHIP_SLA: Duration = Duration::from_secs(10);
+
 /// Format a txid as a short hex prefix for assertion messages.
 fn txid_hex(txid: &[u8; 32]) -> String {
     txid.iter()
@@ -62,9 +130,13 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     let verifier = StateVerifier::new();
 
-    eprintln!("[5.0] Seeding 5000 records with 10 UTXOs each");
-    let initial_txids = common::seed_records(&client, &verifier, 5000, 10).await?;
-    assert_eq!(initial_txids.len(), 5000, "expected 5000 seeded records");
+    eprintln!("[5.0] Seeding {SEED_RECORDS} records with 10 UTXOs each");
+    let initial_txids = common::seed_records(&client, &verifier, SEED_RECORDS, 10).await?;
+    assert_eq!(
+        initial_txids.len(),
+        SEED_RECORDS as usize,
+        "expected {SEED_RECORDS} seeded records"
+    );
 
     // Wait for redo sequences to converge before killing node2
     eprintln!("[5.0] Waiting for replication to settle...");
@@ -91,24 +163,60 @@ async fn run_scenario() -> Result<(), ClientError> {
     // -- Test 5.1: Restart node2 --
     tlog!(t0, "test 5.1 start");
     eprintln!("[5.1] Starting node2");
-    let membership_start = std::time::Instant::now();
+    let restart_start = std::time::Instant::now();
     docker.start_node("node2").await?;
 
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(10))
+    // W16 — TWO measurements, because they are two different things and only
+    // one of them is an SLA.
+    //
+    // Leg 1 (boot + RECOVERY) ends when node2's HTTP listener answers, which
+    // the server binds only after replay/mined-index/DAH/tombstone recovery has
+    // finished. Its cost scales with the redo backlog the previous phase
+    // generated. Leg 2 (MEMBERSHIP) starts there and does not.
+    //
+    // Asserting the SUM against a 10 s bound made the SLA depend on how much
+    // redo the seeding phase happened to produce — and in armed CI, where
+    // seeding is ~4.4x slower and the backlog ~4x bigger, it expired on a node2
+    // that was booting normally and reported it as `UNREACHABLE`.
+    let time_to_listening = common::wait_node_http_ready(&docker, 2, NODE_BOOT_BUDGET)
         .await
         .map_err(|e| {
-            eprintln!("Test 5.1: cluster did not reach size 3 within 10s: {e}");
+            eprintln!(
+                "Test 5.1: node2 did not finish booting within {NODE_BOOT_BUDGET:?} \
+                 ({EXPECTED_REPLAYED_REDO_ENTRIES} expected redo entries x \
+                 {REPLAY_MICROS_PER_ENTRY}us + {FIXED_BOOT_MILLIS}ms, +50% CI headroom): {e}"
+            );
+            e
+        })?;
+    let membership_start = std::time::Instant::now();
+    // The wait budget IS the SLA: a membership leg that overruns it fails here,
+    // with the per-node status dump, rather than at the bare assert in 5.7. The
+    // assert is kept anyway — it is the statement of intent, and it is what a
+    // reader greps for.
+    common::wait_cluster_ready(&docker, 3, MEMBERSHIP_SLA)
+        .await
+        .map_err(|e| {
+            eprintln!(
+                "Test 5.1: cluster did not reach size 3 within {MEMBERSHIP_SLA:?} of node2's \
+                 listener answering (node2 booted in {time_to_listening:?}): {e}"
+            );
             e
         })?;
     let time_to_membership = membership_start.elapsed();
-    eprintln!("[5.1] OK -- all 3 nodes report cluster_size=3");
+    eprintln!(
+        "[5.1] OK -- all 3 nodes report cluster_size=3 (boot+recovery {time_to_listening:?}, \
+         membership {time_to_membership:?})"
+    );
     tlog!(t0, "test 5.1 done");
 
     // -- Test 5.2: Wait for migrations --
     tlog!(t0, "test 5.2 start");
     eprintln!("[5.2] Waiting for migrations to complete");
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
-    let time_to_caught_up = membership_start.elapsed();
+    // From `docker start`, deliberately: the catch-up budget below is a
+    // whole-recovery number and must not silently shed the boot leg now that
+    // `membership_start` means "node2 is listening".
+    let time_to_caught_up = restart_start.elapsed();
     eprintln!("[5.2] OK -- all migrations complete");
     tlog!(t0, "test 5.2 done");
 
@@ -303,17 +411,26 @@ async fn run_scenario() -> Result<(), ClientError> {
     tlog!(t0, "test 5.7 start");
     eprintln!("[5.7] Recovery timing measurements:");
     eprintln!(
-        "[5.7]   Time to membership (cluster_size=3): {:?}",
-        time_to_membership
+        "[5.7]   Time to boot + recover (HTTP listener answers): {time_to_listening:?} \
+         (budget {NODE_BOOT_BUDGET:?} for ~{EXPECTED_REPLAYED_REDO_ENTRIES} redo entries)"
     );
     eprintln!(
-        "[5.7]   Time to fully caught up (migrations complete): {:?}",
-        time_to_caught_up
+        "[5.7]   Time to membership (cluster_size=3, from listening): {time_to_membership:?}"
     );
+    eprintln!(
+        "[5.7]   Time to fully caught up (migrations complete, from docker start): \
+         {time_to_caught_up:?}"
+    );
+    // W16 — the SLA, now measured from the instant node2 is observable rather
+    // than from `docker start`. It states something about the cluster's
+    // membership machinery and nothing about how big the redo backlog was; the
+    // recovery leg has its own budget (`NODE_BOOT_BUDGET`), derived from that
+    // backlog, and already failed above if it was overrun.
     assert!(
-        time_to_membership <= Duration::from_secs(10),
-        "Test 5.7: time to membership was {:?}, expected <= 10s",
-        time_to_membership
+        time_to_membership <= MEMBERSHIP_SLA,
+        "Test 5.7: time to membership was {time_to_membership:?} measured from node2's listener \
+         answering (boot+recovery took {time_to_listening:?} before that), expected <= \
+         {MEMBERSHIP_SLA:?}"
     );
     // The bound has to admit the server's OWN pacing, not an aspiration.
     //
@@ -480,4 +597,70 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     tlog!(t0, "=== SCENARIO COMPLETE ===");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// W16 — the recovery budget must cover the redo backlog this scenario's
+    /// OWN seeding phase creates, so raising `SEED_RECORDS` cannot silently eat
+    /// the headroom.
+    ///
+    /// This is the check the old hard-coded 10 s failed. It was never a
+    /// recovery budget: it was the membership SLA doing double duty, and in
+    /// armed CI (run 32644353574) it expired at 10 s on a node2 that was
+    /// booting normally — `recovery complete {replayed: 3375}` landed at
+    /// +4.63 s and the listener bound after the mined-index full-redo branch,
+    /// the DAH rebuild and the tombstone replay on top of that.
+    #[test]
+    fn the_boot_budget_covers_the_redo_backlog_this_scenario_creates() {
+        assert_eq!(
+            EXPECTED_REPLAYED_REDO_ENTRIES, 3_333,
+            "5000 seeded records x RF 2 / 3 nodes; armed CI measured 3375"
+        );
+        let modelled_recovery =
+            Duration::from_micros(EXPECTED_REPLAYED_REDO_ENTRIES * REPLAY_MICROS_PER_ENTRY);
+        let modelled_boot = Duration::from_millis(FIXED_BOOT_MILLIS) + modelled_recovery;
+        assert!(
+            modelled_boot >= Duration::from_secs(10),
+            "the model must REPRODUCE the failure: a 10s gate cannot contain a \
+             {modelled_boot:?} boot, which is why the old bound could not pass",
+        );
+        assert!(
+            NODE_BOOT_BUDGET > modelled_boot,
+            "budget {NODE_BOOT_BUDGET:?} must EXCEED the modelled boot {modelled_boot:?}, not \
+             merely reach it",
+        );
+        let headroom = NODE_BOOT_BUDGET - modelled_boot;
+        assert!(
+            headroom >= modelled_boot / 3,
+            "headroom is only {headroom:?} over a {modelled_boot:?} model; CI variance on the \
+             replay leg alone is larger than that",
+        );
+    }
+
+    /// W16 — the membership SLA must NOT have been loosened while splitting the
+    /// measurement.
+    ///
+    /// The whole point of measuring from "node2 is listening" is that the SLA
+    /// gets tighter in meaning, not looser in value: it now covers SWIM
+    /// detection plus topology agreement (~0.9 s measured) and nothing else. If
+    /// a future run needs this raised, the thing to question is the membership
+    /// machinery — not, as before, how much redo the seeding phase produced.
+    #[test]
+    fn the_membership_sla_is_unchanged_and_independent_of_the_backlog() {
+        assert_eq!(
+            MEMBERSHIP_SLA,
+            Duration::from_secs(10),
+            "the bound scenario 05 has always asserted",
+        );
+        // Independence, stated as a computation rather than a comment: the SLA
+        // is not a function of any of the redo-backlog inputs.
+        assert!(
+            MEMBERSHIP_SLA < NODE_BOOT_BUDGET,
+            "if the SLA ever exceeds the boot budget it has started absorbing recovery time \
+             again, which is exactly the conflation this split removed",
+        );
+    }
 }
