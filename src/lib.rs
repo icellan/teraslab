@@ -48,4 +48,8 @@ pub mod server;
 pub mod storage;
 pub mod streaming;
 pub mod subdevice;
+/// Test-only `tracing` capture shared by the tests that pin the log lines a
+/// deleting path owes its operator. Compiled only under `cfg(test)`.
+#[cfg(test)]
+mod test_log_capture;
 pub mod visibility;

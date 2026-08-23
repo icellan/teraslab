@@ -15543,7 +15543,7 @@ const ORPHAN_RECLAIM_LOGGED_TXIDS: usize = 16;
 /// Log-only rendering: the wire protocol never hex-encodes (raw bytes, the
 /// client decides). A txid that identifies a DESTROYED record has to be
 /// copy-pasteable into a query, which raw `Debug` bytes are not.
-fn hex_txid(txid: &[u8; 32]) -> String {
+pub(crate) fn hex_txid(txid: &[u8; 32]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(64);
     for b in txid {
@@ -29446,72 +29446,10 @@ mod tests {
         );
     }
 
-    /// Capture every `tracing` event at exactly `level` emitted by `f` on THIS
-    /// thread, flattened to one `message field=value ...` line per event.
-    ///
-    /// Thread-scoped (`with_default`), so concurrent tests do not interfere.
-    /// Used by the W13 tests that pin the two log lines a deleting path owes
-    /// its operator: the per-shard reclaim announcement and the boot warning
-    /// that the reclaim is armed at all.
-    fn capture_tracing_lines(level: tracing::Level, f: impl FnOnce()) -> Vec<String> {
-        use std::sync::Mutex as StdMutex;
-        use tracing::Event;
-        use tracing::field::{Field, Visit};
-        use tracing_subscriber::Layer;
-        use tracing_subscriber::layer::Context;
-        use tracing_subscriber::prelude::*;
-        use tracing_subscriber::registry::LookupSpan;
-
-        #[derive(Default)]
-        struct LineVisitor {
-            rendered: String,
-        }
-
-        impl Visit for LineVisitor {
-            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "message" {
-                    self.rendered.insert_str(0, &format!("{value:?} "));
-                } else {
-                    self.rendered
-                        .push_str(&format!("{}={value:?} ", field.name()));
-                }
-            }
-        }
-
-        struct CaptureLayer {
-            want: tracing::Level,
-            lines: Arc<StdMutex<Vec<String>>>,
-        }
-
-        impl<S> Layer<S> for CaptureLayer
-        where
-            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
-        {
-            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-                if event.metadata().level() != &self.want {
-                    return;
-                }
-                let mut visitor = LineVisitor::default();
-                event.record(&mut visitor);
-                self.lines
-                    .lock()
-                    .expect("capture lock")
-                    .push(visitor.rendered);
-            }
-        }
-
-        let lines = Arc::new(StdMutex::new(Vec::new()));
-        // TRACE lets the filter pass everything through to the level test above.
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_subscriber::EnvFilter::new("trace"))
-            .with(CaptureLayer {
-                want: level,
-                lines: lines.clone(),
-            });
-        tracing::subscriber::with_default(subscriber, f);
-        let captured = lines.lock().expect("capture lock");
-        captured.clone()
-    }
+    /// Capture `tracing` events at exactly `level` emitted by `f` on this
+    /// thread. Shared with `server::dispatch`'s prune-audit tests — both
+    /// modules pin the log line a DELETING path owes its operator.
+    use crate::test_log_capture::capture_tracing_lines;
 
     /// A `ClusterConfig` whose cluster-policy flags are all at their SHIPPED
     /// defaults except the ones a test names. Mirrors the production
