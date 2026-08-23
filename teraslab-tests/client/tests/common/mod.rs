@@ -528,12 +528,19 @@ pub async fn wait_specific_nodes_alive(
 }
 
 /// W12 TAIL 2 — the entries a node's `/admin/migration_status` reports as
-/// TERMINALLY REFUSED by their own source and retained only as a fail-closed
-/// fence over local orphan records.
+/// TERMINALLY REFUSED by their own source and retained anyway as a fail-closed
+/// fence: over local orphan records (a non-holder), or — W16 — over an
+/// unproven local copy on a HOLDER whose source has refused the transfer for
+/// `REFUSED_HOLDER_TERMINAL_ROUNDS` consecutive rounds.
 ///
 /// Zero for a server that predates the field, which is the fail-closed
 /// reading: an answer that cannot express the distinction is treated as
 /// "everything is potentially in flight".
+///
+/// A non-zero count is NOT "fine". Every entry it counts is a shard still
+/// FENCED — client-invisible on that node — that no transfer will ever
+/// un-fence. It is discounted from the convergence gate because the gate asks
+/// "is a migration still running?", and the answer there is genuinely no.
 pub fn refused_retained_inbound(json: &serde_json::Value) -> u64 {
     json["inbound_refused_retained"].as_u64().unwrap_or(0)
 }
@@ -543,11 +550,13 @@ pub fn refused_retained_inbound(json: &serde_json::Value) -> u64 {
 /// `inbound_pending` counts two opposite things. A plain pending entry is
 /// waiting on data that a source is sending. A `refused_by_source` entry has
 /// been answered `ERR_MIGRATION_NO_TASKS` by the only node that could ever
-/// satisfy it and was RETAINED by `inbound_entry_must_be_kept` because the
-/// shard still has local records — records only the committed-handoff-gated
-/// orphan cleanup may reclaim. The second kind is a fixpoint: re-polling it
-/// for 300 s produces the identical answer 300 s later (armed scenario 08 @
-/// fc5e5f7: `dropped:0, kept:2` on all 29 refusal rounds).
+/// satisfy it and was RETAINED by `inbound_entry_must_be_kept` — because the
+/// shard still has local records only the committed-handoff-gated orphan
+/// cleanup may reclaim, or (W16) because this node is the shard's holder and
+/// its copy is unproven. The second kind is a fixpoint: re-polling it for
+/// 300 s produces the identical answer 300 s later (armed scenario 08 @
+/// fc5e5f7: `dropped:0, kept:2` on all 29 refusal rounds; armed scenario 09 @
+/// CI 32644353574: `shards: 9, dropped: 0` on eight consecutive sweeps).
 ///
 /// A convergence gate asks "is a migration still running?", so it must use
 /// this. It must NOT be read as "the condition is fine" — the count is
@@ -557,6 +566,39 @@ pub fn refused_retained_inbound(json: &serde_json::Value) -> u64 {
 pub fn in_flight_inbound_pending(json: &serde_json::Value) -> u64 {
     let pending = json["inbound_pending"].as_u64().unwrap_or(0);
     pending.saturating_sub(refused_retained_inbound(json))
+}
+
+/// W16 — say out loud, on the SUCCESS path, that the gate was let through with
+/// terminally-refused inbound entries outstanding.
+///
+/// Discounting them is what stops a fixpoint from hanging every scenario
+/// (armed 09 sat at nine forever), but the discount must not be silent: each
+/// one is a shard left FENCED and client-invisible on that node, and a run
+/// that converges "cleanly" with a non-zero count has a residue worth reading.
+/// The timeout path already names them; without this the passing path did not.
+fn report_refused_retained_on_convergence(total_refused_retained: u64, node_details: &[String]) {
+    if total_refused_retained == 0 {
+        return;
+    }
+    let refused_details: Vec<&String> = node_details
+        .iter()
+        .filter(|d| d.contains("inbound-refused-retained"))
+        .collect();
+    eprintln!(
+        "  wait_migrations: CONVERGED WITH RESIDUE — {total_refused_retained} inbound \
+         entr{} terminally refused by their source and still FENCED (the shard(s) stay \
+         client-invisible on that node; no transfer will ever un-fence them) [{}]",
+        if total_refused_retained == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        refused_details
+            .iter()
+            .map(|d| d.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
 }
 
 /// Wait until migrations complete on specific nodes (by node number).
@@ -581,6 +623,7 @@ pub async fn wait_specific_migrations_complete(
         let mut all_idle = true;
         let mut total_masters: u64 = 0;
         let mut total_inbound_pending: u64 = 0;
+        let mut total_refused_retained: u64 = 0;
         let mut total_pending_handoffs: u64 = 0;
         let mut status_details = Vec::new();
         for &n in node_nums {
@@ -594,6 +637,7 @@ pub async fn wait_specific_migrations_complete(
                 inbound_pending = in_flight_inbound_pending(&json);
                 let refused = refused_retained_inbound(&json);
                 total_inbound_pending += inbound_pending;
+                total_refused_retained += refused;
                 if refused > 0 {
                     status_details.push(format!("node{n}:inbound-refused-retained={refused}"));
                 }
@@ -646,6 +690,7 @@ pub async fn wait_specific_migrations_complete(
                     status_details.join(", ")
                 );
             }
+            report_refused_retained_on_convergence(total_refused_retained, &status_details);
             return Ok(());
         }
         ready_polls = 0;
@@ -1078,6 +1123,7 @@ pub async fn wait_migrations_complete(
         let mut total_masters: u64 = 0;
         let mut total_pending_handoffs: u64 = 0;
         let mut total_inbound_pending: u64 = 0;
+        let mut total_refused_retained: u64 = 0;
         let mut node_details = Vec::new();
         let mut shard_views: Vec<NodeShardView> = Vec::new();
         let mut complete_status_answers: u32 = 0;
@@ -1093,6 +1139,7 @@ pub async fn wait_migrations_complete(
                 let inbound_pending = in_flight_inbound_pending(&json);
                 let refused = refused_retained_inbound(&json);
                 total_inbound_pending += inbound_pending;
+                total_refused_retained += refused;
                 if let Some(count) = json["active_count"].as_u64()
                     && count > 0
                 {
@@ -1216,6 +1263,7 @@ pub async fn wait_migrations_complete(
                     mig_start.elapsed().as_secs_f64() * 1000.0
                 );
             }
+            report_refused_retained_on_convergence(total_refused_retained, &node_details);
             return Ok(());
         }
         ready_polls = 0;

@@ -1594,10 +1594,19 @@ pub struct MigrationMetrics {
     /// fail-closed record guard RETAINED, so they can never progress. The
     /// counter above records the entries a refusal removed; this records the
     /// ones it could not. A non-zero, non-decreasing value means this node is
-    /// sitting on orphan records for shards it does not hold, waiting on an
-    /// orphan cleanup that the #28 committed-handoff evidence gate will not
-    /// authorize. Armed scenario 08 @ fc5e5f7 sat at 2 for 300 s with no
-    /// signal anywhere.
+    /// sitting on a shard it cannot un-fence, on one of two grounds:
+    ///
+    /// * orphan records for a shard it does NOT hold, waiting on an orphan
+    ///   cleanup that the #28 committed-handoff evidence gate will not
+    ///   authorize (armed scenario 08 @ fc5e5f7 sat at 2 for 300 s with no
+    ///   signal anywhere); or
+    /// * W16 — a shard it DOES hold whose local copy no completion handshake
+    ///   ever proved, after `REFUSED_HOLDER_TERMINAL_ROUNDS` consecutive
+    ///   refusals from the only source that could prove it (armed scenario 09 @
+    ///   CI 32644353574 sat at nine such shards).
+    ///
+    /// Either way the shard stays FENCED — client-invisible on this node — so a
+    /// non-zero value is an availability fact, not merely a bookkeeping one.
     pub migration_inbound_refused_retained: AtomicU32,
     /// W11 FIX 4(b) — gauge: shards the LAST orphan-cleanup pass skipped
     /// before it could even reach the #28 evidence check, because they still

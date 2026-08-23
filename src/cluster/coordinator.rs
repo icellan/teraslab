@@ -1389,6 +1389,37 @@ fn snapshot_under_replication_inputs(
 
 const SAME_TERM_REACTIVATION_COOLDOWN: Duration = Duration::from_secs(30);
 
+/// W16 — how many CONSECUTIVE `ERR_MIGRATION_NO_TASKS` refusals a pending
+/// inbound entry for a shard THIS NODE HOLDS must collect before
+/// [`MigrationManager::drop_refused_inbound`] believes the source and
+/// reclassifies it as terminal (retained, still fenced, no longer counted as a
+/// transfer in flight).
+///
+/// # The arithmetic, so the number cannot drift from what it compensates for
+///
+/// A holder's inbound is kept in the in-flight count because the refusal may be
+/// a transient artefact of a source table `terminally_abort_unshippable_task`
+/// diverged without a version bump, and the SAME-TERM re-heal re-plans that
+/// handoff. That re-heal is paced by [`SAME_TERM_REACTIVATION_COOLDOWN`], and
+/// the refusals arrive one per [`TRANSFER_REQUEST_INTERVAL`], so one re-heal
+/// round is worth `30 s / 10 s = 3` refusals. Waiting TWO full rounds before
+/// believing the source:
+///
+/// ```text
+/// 2 * SAME_TERM_REACTIVATION_COOLDOWN / TRANSFER_REQUEST_INTERVAL
+///   = 2 * 30 s / 10 s = 6 refusals (60 s)
+/// ```
+///
+/// Two rounds rather than one because the first round's cooldown clock does not
+/// start at the refusal — it runs from the last activation, so a re-plan can
+/// legitimately land most of a cooldown after the streak begins.
+///
+/// CI 32644353574 (armed 09) sat at NINE consecutive refusals for the same nine
+/// shards and would have sat there forever; six is the point past which
+/// "the re-heal will re-plan it" has stopped being a prediction.
+const REFUSED_HOLDER_TERMINAL_ROUNDS: u32 =
+    (2 * SAME_TERM_REACTIVATION_COOLDOWN.as_secs() / TRANSFER_REQUEST_INTERVAL.as_secs()) as u32;
+
 const DRAIN_REACTIVATION_INTERVAL: Duration = Duration::from_secs(2);
 
 /// W9 FIX 1 — cadence on which the exchange phase RE-QUERIES a peer whose
@@ -6863,6 +6894,7 @@ impl ClusterCoordinator {
                                         return crate::cluster::migration::RefusedInboundOutcome {
                                             dropped: 0,
                                             kept_holder: Vec::new(),
+                                            kept_holder_terminal: Vec::new(),
                                             kept_orphan: Vec::new(),
                                         };
                                     }
@@ -6870,14 +6902,19 @@ impl ClusterCoordinator {
                                         // LOCK ORDER (W8): table before migration.
                                         let table = refusal_st.read();
                                         let mut mgr = refusal_mig.lock();
-                                        mgr.drop_refused_inbound(refused, source, |s| {
-                                            inbound_entry_retention(
-                                                &table,
-                                                self_id,
-                                                s,
-                                                refusal_eng.shard_record_count(s),
-                                            )
-                                        })
+                                        mgr.drop_refused_inbound(
+                                            refused,
+                                            source,
+                                            REFUSED_HOLDER_TERMINAL_ROUNDS,
+                                            |s| {
+                                                inbound_entry_retention(
+                                                    &table,
+                                                    self_id,
+                                                    s,
+                                                    refusal_eng.shard_record_count(s),
+                                                )
+                                            },
+                                        )
                                     };
                                     if outcome.dropped > 0
                                         && let Some(m) = crate::metrics::migration_metrics()
@@ -6887,6 +6924,31 @@ impl ClusterCoordinator {
                                     }
                                     outcome
                                 };
+                                // W16 — the mirror of `retire`: the shards the
+                                // source MATCHED this round. A holder entry is
+                                // reclassified as terminal only on
+                                // CONSECUTIVE refusals, so a round the source
+                                // answered "I have a task for that shard" must
+                                // reset its streak; otherwise a source that
+                                // re-plans a handoff every re-heal round and
+                                // rolls it back in between would accumulate
+                                // its way to a terminal mark it never earned.
+                                let note_matched =
+                                    |requested: &[u16], refused: &[u16], source: NodeId| {
+                                        let refused_set: std::collections::HashSet<u16> =
+                                            refused.iter().copied().collect();
+                                        let matched: Vec<u16> = requested
+                                            .iter()
+                                            .copied()
+                                            .filter(|s| !refused_set.contains(s))
+                                            .collect();
+                                        if matched.is_empty() {
+                                            return;
+                                        }
+                                        refusal_mig
+                                            .lock()
+                                            .note_transfer_request_matched(&matched, source);
+                                    };
                                 // Bound the shard list a single log line can
                                 // carry — a refusal can name thousands.
                                 const MAX_NAMED_KEPT_SHARDS: usize = 32;
@@ -6939,6 +7001,7 @@ impl ClusterCoordinator {
                                             // nothing.
                                             let refused =
                                                 parse_transfer_request_unmatched(&resp.payload);
+                                            note_matched(&shards, &refused, source);
                                             let outcome = retire(&refused, source);
                                             if refused.is_empty() {
                                                 tracing::info!(
@@ -6959,6 +7022,12 @@ impl ClusterCoordinator {
                                                     kept_holder = outcome.kept_holder.len(),
                                                     kept_holder_shards =
                                                         %name_shards(&outcome.kept_holder),
+                                                    kept_holder_terminal =
+                                                        outcome.kept_holder_terminal.len(),
+                                                    kept_holder_terminal_shards =
+                                                        %name_shards(&outcome.kept_holder_terminal),
+                                                    terminal_after_rounds =
+                                                        REFUSED_HOLDER_TERMINAL_ROUNDS,
                                                     epoch = committed_term,
                                                     "cluster: shard transfer request PARTIALLY \
                                                      refused — the source will never send the \
@@ -6966,8 +7035,14 @@ impl ClusterCoordinator {
                                                      dropped (entries whose records are still \
                                                      local stay fenced for orphan cleanup; \
                                                      entries for shards THIS NODE HOLDS stay \
-                                                     in-flight — the source's table may have \
-                                                     diverged and the re-heal re-plans them)",
+                                                     in-flight until the same source has refused \
+                                                     them `terminal_after_rounds` times in a row \
+                                                     — the source's table may have diverged and \
+                                                     the re-heal re-plans them, but a STREAK is \
+                                                     not a transient divergence and \
+                                                     kept_holder_terminal names the entries that \
+                                                     stay FENCED while no longer counting as \
+                                                     transfers in flight)",
                                                 );
                                             }
                                         }
@@ -6991,14 +7066,25 @@ impl ClusterCoordinator {
                                                 kept_holder = outcome.kept_holder.len(),
                                                 kept_holder_shards =
                                                     %name_shards(&outcome.kept_holder),
+                                                kept_holder_terminal =
+                                                    outcome.kept_holder_terminal.len(),
+                                                kept_holder_terminal_shards =
+                                                    %name_shards(&outcome.kept_holder_terminal),
+                                                terminal_after_rounds =
+                                                    REFUSED_HOLDER_TERMINAL_ROUNDS,
                                                 epoch = committed_term,
                                                 "cluster: shard transfer request REFUSED — the \
                                                  source has no tasks for us; dangling inbound \
                                                  entries dropped (entries whose records are \
                                                  still local stay fenced for orphan cleanup; \
                                                  entries for shards THIS NODE HOLDS stay \
-                                                 in-flight — the source's table may have \
-                                                 diverged and the re-heal re-plans them)",
+                                                 in-flight until the same source has refused \
+                                                 them `terminal_after_rounds` times in a row — \
+                                                 the source's table may have diverged and the \
+                                                 re-heal re-plans them, but a STREAK is not a \
+                                                 transient divergence and kept_holder_terminal \
+                                                 names the entries that stay FENCED while no \
+                                                 longer counting as transfers in flight)",
                                             );
                                         }
                                         Ok(resp) => tracing::warn!(
@@ -38374,9 +38460,15 @@ mod tests {
         }
     }
 
-    /// W12 review P1-1 (RED→GREEN) — a refusal that retains an entry because
-    /// THIS NODE IS THE SHARD'S TARGET HOLDER must NOT be marked as
+    /// W12 review P1-1 (RED→GREEN) — a SINGLE refusal that retains an entry
+    /// because THIS NODE IS THE SHARD'S TARGET HOLDER must NOT be marked as
     /// terminally refused.
+    ///
+    /// W16 — "not on the first refusal" is the claim this test pins, and it
+    /// still holds. What changed is that it is no longer "never": a source that
+    /// answers the same way for `REFUSED_HOLDER_TERMINAL_ROUNDS` CONSECUTIVE
+    /// rounds is believed, because "never" is a fixpoint (see
+    /// `a_holder_entry_refused_every_round_stops_holding_the_convergence_gate`).
     ///
     /// `inbound_entry_must_be_kept` returns true on two opposite grounds and
     /// the mark was applied to both. The holder ground is satisfiable work:
@@ -38414,9 +38506,10 @@ mod tests {
 
         let mut mgr = MigrationManager::new();
         assert!(mgr.register_inbound_source(held, source));
-        let outcome = mgr.drop_refused_inbound(&[held], source, |s| {
-            inbound_entry_retention(&holder_table, NodeId(1), s, 0)
-        });
+        let outcome =
+            mgr.drop_refused_inbound(&[held], source, REFUSED_HOLDER_TERMINAL_ROUNDS, |s| {
+                inbound_entry_retention(&holder_table, NodeId(1), s, 0)
+            });
         assert_eq!(outcome.dropped, 0, "a holder's inbound is never dropped");
         assert_eq!(outcome.kept_holder, vec![held]);
         assert!(outcome.kept_orphan.is_empty());
@@ -38450,9 +38543,10 @@ mod tests {
 
         let mut mgr = MigrationManager::new();
         assert!(mgr.register_inbound_source(orphaned, source));
-        let outcome = mgr.drop_refused_inbound(&[orphaned], source, |s| {
-            inbound_entry_retention(&orphan_table, NodeId(1), s, 4)
-        });
+        let outcome =
+            mgr.drop_refused_inbound(&[orphaned], source, REFUSED_HOLDER_TERMINAL_ROUNDS, |s| {
+                inbound_entry_retention(&orphan_table, NodeId(1), s, 4)
+            });
         assert_eq!(outcome.dropped, 0);
         assert!(outcome.kept_holder.is_empty());
         assert_eq!(outcome.kept_orphan, vec![orphaned]);
@@ -38460,6 +38554,101 @@ mod tests {
             mgr.refused_retained_inbound_entries(),
             vec![(orphaned, source)],
             "the non-holder-with-records entry IS the fixpoint the mark exists for",
+        );
+    }
+
+    /// W16 (RED→GREEN) — a HOLDER entry the same source refuses EVERY round
+    /// must stop holding the convergence gate open, without being dropped and
+    /// without lowering the fence.
+    ///
+    /// CI 32644353574, armed scenario 09: nine shards (772, 1816, 1906, 2224,
+    /// 2644, 2974, 2986, 3550, 3958) failed their completion handshake with
+    /// "record count mismatch: expected N, got N+1", node2 terminally aborted
+    /// the tasks, and node1 — the shards' target holder at that epoch — then
+    /// re-asked every 10 s. Eight consecutive sweeps logged the identical
+    /// `shards: 9, dropped: 0`, every entry carrying `refused_by_source: false`
+    /// and `inbound_refused_retained: 0`. `in_flight_inbound_pending` therefore
+    /// counted nine live transfers and `total_inbound_pending == 0` could never
+    /// be reached — a hard fixpoint, immune to everything else converging.
+    ///
+    /// This drives the REAL `inbound_entry_retention` against real assignments
+    /// and the REAL threshold, because the abstract `|_| KeepHolder` predicate
+    /// the manager-level test uses is exactly what let the previous "never
+    /// mark a holder" rule look safe.
+    ///
+    /// The compensating half is asserted here too and is not optional: the
+    /// entry is RETAINED and the shard stays FENCED. `resolve_shard_ownership`
+    /// answers `ERR_MIGRATION_IN_PROGRESS` for a pending inbound, so the shard
+    /// remains client-invisible on this node — reclassifying the TRANSFER as
+    /// terminal says nothing about the shard's availability, and the operator
+    /// still sees it in `inbound_refused_retained`, in the status JSON's
+    /// `refused_by_source` flag and in the
+    /// `teraslab_migration_inbound_refused_retained` gauge.
+    #[test]
+    fn a_holder_entry_refused_every_round_stops_holding_the_convergence_gate() {
+        let source = NodeId(2);
+        let holder_table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 7, 1);
+        let held = 772u16;
+        assert_eq!(
+            inbound_entry_retention(&holder_table, NodeId(1), held, 0),
+            InboundRetention::KeepHolder,
+            "fixture: node 1 must be a target holder of shard {held}",
+        );
+
+        let mut mgr = MigrationManager::new();
+        assert!(mgr.register_inbound_source(held, source));
+        // The CI shape: the same request, the same answer, round after round.
+        // Node1 had LOCAL RECORDS for these shards (that is what the count
+        // mismatch means), so the retention judgement is fed a non-zero count
+        // and must still answer KeepHolder — the holder ground outranks the
+        // orphan one.
+        let mut rounds = 0u32;
+        while mgr.refused_retained_inbound_entries().is_empty() {
+            rounds += 1;
+            assert!(
+                rounds <= REFUSED_HOLDER_TERMINAL_ROUNDS,
+                "the streak must terminate within {REFUSED_HOLDER_TERMINAL_ROUNDS} rounds; \
+                 armed-09 ran nine and would have run forever",
+            );
+            let outcome =
+                mgr.drop_refused_inbound(&[held], source, REFUSED_HOLDER_TERMINAL_ROUNDS, |s| {
+                    inbound_entry_retention(&holder_table, NodeId(1), s, 9)
+                });
+            assert_eq!(
+                outcome.dropped, 0,
+                "round {rounds}: a holder is never dropped"
+            );
+        }
+        assert_eq!(
+            rounds, REFUSED_HOLDER_TERMINAL_ROUNDS,
+            "and not one round earlier — a shorter streak is still consistent with a \
+             transiently-diverged source table",
+        );
+
+        assert_eq!(
+            mgr.refused_retained_inbound_entries(),
+            vec![(held, source)],
+            "the entry the gate must stop waiting on",
+        );
+        assert_eq!(
+            mgr.pending_inbound_entries(),
+            vec![(held, source)],
+            "RETAINED: believing the source is not a licence to forget the entry",
+        );
+        assert!(
+            mgr.has_pending_inbound(held),
+            "FENCED: this node holds an unproven copy, so the shard stays \
+             client-invisible here — the un-healed-authority P0",
+        );
+        // What the harness gate actually computes, over the same numbers the
+        // `/admin/migration_status` handler renders.
+        let pending = mgr.inbound_count();
+        let refused = mgr.refused_retained_inbound_entries().len();
+        assert_eq!(pending, 1, "still a pending inbound");
+        assert_eq!(
+            pending - refused,
+            0,
+            "in_flight_inbound_pending = inbound_pending - inbound_refused_retained",
         );
     }
 
@@ -42526,6 +42715,46 @@ mod tests {
             reactivation_repair_shard_count(0, 0, 0, mgr.parked_no_source_heal_shards().len()),
             0,
         ));
+    }
+
+    /// W16 — the holder-refusal threshold is DERIVED from the two cadences it
+    /// compensates for, and this pins the derivation so neither can be retuned
+    /// without the number following.
+    ///
+    /// A holder's inbound stays in the in-flight count because the SAME-TERM
+    /// re-heal may still re-plan the handoff; that re-heal is paced by
+    /// `SAME_TERM_REACTIVATION_COOLDOWN` and the refusals arrive one per
+    /// `TRANSFER_REQUEST_INTERVAL`. The threshold must therefore cover whole
+    /// re-heal rounds, not a round number someone liked.
+    #[test]
+    fn the_holder_refusal_threshold_covers_two_reheal_rounds() {
+        let refusals_per_reheal_round =
+            SAME_TERM_REACTIVATION_COOLDOWN.as_secs() / TRANSFER_REQUEST_INTERVAL.as_secs();
+        assert_eq!(
+            refusals_per_reheal_round, 3,
+            "30s cooldown / 10s request interval"
+        );
+        assert_eq!(
+            u64::from(REFUSED_HOLDER_TERMINAL_ROUNDS),
+            2 * refusals_per_reheal_round,
+            "two full re-heal rounds — the first cooldown clock runs from the last \
+             ACTIVATION, not from the refusal, so one round can elapse without the \
+             re-plan having had a full window",
+        );
+        // Armed-09 (CI 32644353574) observed nine consecutive refusals for the
+        // same nine shards across eight sweeps. A threshold at or above that
+        // would not have unwedged the run it exists for.
+        let threshold = u64::from(REFUSED_HOLDER_TERMINAL_ROUNDS);
+        let armed_09_observed_streak = 9;
+        assert!(
+            threshold < armed_09_observed_streak,
+            "the threshold must fire INSIDE the streak CI actually observed",
+        );
+        assert!(
+            threshold >= 2,
+            "a holder must never be reclassified on one or two refusals — that is the \
+             transiently-diverged source table W12 review P1-1 protected",
+        );
     }
 
     /// #74 (re-review, item 2) — the park-armed cadence bound: each fruitless
