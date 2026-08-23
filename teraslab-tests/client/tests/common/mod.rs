@@ -583,8 +583,10 @@ pub async fn wait_specific_nodes_alive(
 ///
 /// A non-zero count is NOT "fine". Every entry it counts is a shard still
 /// FENCED — client-invisible on that node — that no transfer will ever
-/// un-fence. It is discounted from the convergence gate because the gate asks
-/// "is a migration still running?", and the answer there is genuinely no.
+/// un-fence. It is discounted from [`in_flight_inbound_pending`] because THAT
+/// question ("is a migration still running?") genuinely answers no; it is FATAL
+/// to the convergence gates, which ask the other question. See
+/// [`refused_residue_error`].
 pub fn refused_retained_inbound(json: &serde_json::Value) -> u64 {
     json["inbound_refused_retained"].as_u64().unwrap_or(0)
 }
@@ -602,47 +604,101 @@ pub fn refused_retained_inbound(json: &serde_json::Value) -> u64 {
 /// fc5e5f7: `dropped:0, kept:2` on all 29 refusal rounds; armed scenario 09 @
 /// CI 32644353574: `shards: 9, dropped: 0` on eight consecutive sweeps).
 ///
-/// A convergence gate asks "is a migration still running?", so it must use
-/// this. It must NOT be read as "the condition is fine" — the count is
-/// reported in the per-node detail and in the timeout message, and the
-/// server publishes it as the `teraslab_migration_inbound_refused_retained`
-/// gauge.
+/// "Is a migration still running?" must use this. It must NOT be read as "the
+/// condition is fine": the refused count is a separate, FATAL gate condition
+/// (see [`refused_residue_error`]), it is named in the per-node detail and in
+/// the timeout message, and the server publishes it as the
+/// `teraslab_migration_inbound_refused_retained` gauge.
+///
+/// The two must stay separate rather than being folded back into one number.
+/// Counting a refused entry as in-flight is what wedged armed 09 for the whole
+/// budget with no explanation; not counting it at all is what would have let a
+/// run go green over nine permanently-fenced shards.
 pub fn in_flight_inbound_pending(json: &serde_json::Value) -> u64 {
     let pending = json["inbound_pending"].as_u64().unwrap_or(0);
     pending.saturating_sub(refused_retained_inbound(json))
 }
 
-/// W16 — say out loud, on the SUCCESS path, that the gate was let through with
-/// terminally-refused inbound entries outstanding.
+/// W16 — how long a terminally-refused residue may persist before a convergence
+/// gate calls it FATAL.
 ///
-/// Discounting them is what stops a fixpoint from hanging every scenario
-/// (armed 09 sat at nine forever), but the discount must not be silent: each
-/// one is a shard left FENCED and client-invisible on that node, and a run
-/// that converges "cleanly" with a non-zero count has a residue worth reading.
-/// The timeout path already names them; without this the passing path did not.
-fn report_refused_retained_on_convergence(total_refused_retained: u64, node_details: &[String]) {
+/// Mirrors `SAME_TERM_REACTIVATION_COOLDOWN` (`src/cluster/coordinator.rs`,
+/// private to that module): one full same-term re-heal window, which is the
+/// only window in which a late re-plan could still clear the mark — a re-planned
+/// handoff's first batch calls `mark_inbound_active`, which clears mark and
+/// streak together. Waiting exactly one such window is therefore the difference
+/// between "the source refused six times in a row" (what the mark proves) and
+/// "and nothing re-planned it afterwards either" (what makes it terminal).
+///
+/// The server-side mark already costs six consecutive refusals — 60 s at the
+/// 10 s `TRANSFER_REQUEST_INTERVAL` — so a gate can only fail on this after
+/// ~90 s of a shard being fenced with nothing coming for it. It cannot fire on a
+/// transient source-table divergence.
+const REFUSED_RESIDUE_GRACE: Duration = Duration::from_secs(30);
+
+/// W16 — track how long a terminally-refused residue has been continuously
+/// observed: `Some(first_seen)` while it stands, `None` the moment it clears.
+///
+/// Clearing on zero is what keeps the grace window honest. The mark is
+/// revocable by design (a batch arriving, a task or re-registration, a re-park,
+/// or the source matching the request in a later round all clear it), so a
+/// residue that comes back later starts a NEW window rather than resuming a
+/// half-spent one.
+fn note_refused_residue(
+    seen_since: Option<std::time::Instant>,
+    total_refused_retained: u64,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
     if total_refused_retained == 0 {
-        return;
+        return None;
     }
-    let refused_details: Vec<&String> = node_details
+    Some(seen_since.unwrap_or(now))
+}
+
+/// W16 — has an observed residue outlasted [`REFUSED_RESIDUE_GRACE`]?
+fn refused_residue_is_fatal(
+    seen_since: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    seen_since.is_some_and(|since| now.saturating_duration_since(since) >= REFUSED_RESIDUE_GRACE)
+}
+
+/// W16 — the diagnostic a fatal residue fails with.
+///
+/// This is NOT convergence. Every entry it counts is a shard left FENCED and
+/// client-invisible on its own node, that no transfer will ever un-fence — and
+/// in the armed-09 shape it is not even slow-but-completable: the source's
+/// completion handshake failed the strict `actual == expected_records` check
+/// against a target holding a SUPERSET, which retrying cannot satisfy. A gate
+/// that went green there would be reporting something false about the cluster.
+///
+/// The count is discounted from `in_flight_inbound_pending` because the question
+/// THAT asks — "is a migration still running?" — genuinely answers no. This is
+/// the separate question, asked separately.
+fn refused_residue_error(total_refused_retained: u64, node_details: &[String]) -> String {
+    let refused_details: Vec<&str> = node_details
         .iter()
         .filter(|d| d.contains("inbound-refused-retained"))
+        .map(|d| d.as_str())
         .collect();
-    eprintln!(
-        "  wait_migrations: CONVERGED WITH RESIDUE — {total_refused_retained} inbound \
-         entr{} terminally refused by their source and still FENCED (the shard(s) stay \
-         client-invisible on that node; no transfer will ever un-fence them) [{}]",
+    format!(
+        "TERMINALLY REFUSED INBOUND RESIDUE — {total_refused_retained} inbound entr{} \
+         refused by {} own source for `REFUSED_HOLDER_TERMINAL_ROUNDS` consecutive rounds and \
+         still FENCED after a further {REFUSED_RESIDUE_GRACE:?}: the shard(s) stay \
+         client-invisible on that node and no transfer will ever un-fence them. This is not \
+         convergence [{}]",
         if total_refused_retained == 1 {
             "y"
         } else {
             "ies"
         },
-        refused_details
-            .iter()
-            .map(|d| d.as_str())
-            .collect::<Vec<_>>()
-            .join(", "),
-    );
+        if total_refused_retained == 1 {
+            "its"
+        } else {
+            "their"
+        },
+        refused_details.join(", "),
+    )
 }
 
 /// Wait until migrations complete on specific nodes (by node number).
@@ -663,6 +719,7 @@ pub async fn wait_specific_migrations_complete(
 ) -> Result<(), ClientError> {
     let start = std::time::Instant::now();
     let mut ready_polls = 0u32;
+    let mut refused_since: Option<std::time::Instant> = None;
     loop {
         let mut all_idle = true;
         let mut total_masters: u64 = 0;
@@ -717,9 +774,24 @@ pub async fn wait_specific_migrations_complete(
                 ));
             }
         }
+        // W16 — a terminally-refused residue is NOT convergence, so it holds
+        // the gate exactly like live work does, and after one re-heal window it
+        // ends the wait outright: nothing will clear it, and burning the rest of
+        // the budget only delays a failure that is already decided.
+        let now = std::time::Instant::now();
+        refused_since = note_refused_residue(refused_since, total_refused_retained, now);
+        if refused_residue_is_fatal(refused_since, now) {
+            return Err(ClientError::Connection(format!(
+                "{} [masters={total_masters}/4096, handoffs={total_pending_handoffs}, \
+                 inbound={total_inbound_pending}] [{}]",
+                refused_residue_error(total_refused_retained, &status_details),
+                status_details.join(", "),
+            )));
+        }
         if total_masters == 4096
             && total_pending_handoffs == 0
             && total_inbound_pending == 0
+            && total_refused_retained == 0
             && all_idle
         {
             ready_polls += 1;
@@ -734,7 +806,6 @@ pub async fn wait_specific_migrations_complete(
                     status_details.join(", ")
                 );
             }
-            report_refused_retained_on_convergence(total_refused_retained, &status_details);
             return Ok(());
         }
         ready_polls = 0;
@@ -755,8 +826,16 @@ pub async fn wait_specific_migrations_complete(
             } else {
                 String::new()
             };
+            let residue = if total_refused_retained > 0 {
+                format!(
+                    " [{}]",
+                    refused_residue_error(total_refused_retained, &status_details)
+                )
+            } else {
+                String::new()
+            };
             return Err(ClientError::Connection(format!(
-                "migrations still active on specific nodes after {timeout:?} [masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}] [{}]{overlap_detail}",
+                "migrations still active on specific nodes after {timeout:?} [masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}] [{}]{overlap_detail}{residue}",
                 status_details.join(", ")
             )));
         }
@@ -1162,6 +1241,10 @@ pub async fn wait_migrations_complete(
     // Retained divergence verdict for the timeout dump (diagnostic only —
     // see the demotion note at the check site).
     let mut divergence_note: Option<String> = None;
+    // W16 — when a terminally-refused residue was FIRST seen, cleared whenever
+    // a poll sees none (the mark is revocable, so a residue that returns starts
+    // a fresh window). See `note_refused_residue`.
+    let mut refused_since: Option<std::time::Instant> = None;
     loop {
         let mut all_idle = true;
         let mut total_masters: u64 = 0;
@@ -1295,7 +1378,27 @@ pub async fn wait_migrations_complete(
         }
         let activation_reason = shard_activation_gate_reason(&shard_views, node_count);
         let masters_ok = total_masters == 4096 && activation_reason.is_none();
-        if masters_ok && total_pending_handoffs == 0 && total_inbound_pending == 0 && all_idle {
+        // W16 — a terminally-refused residue is NOT convergence, so it holds the
+        // gate exactly like live work does, and after one re-heal window it ends
+        // the wait outright: nothing will clear it, and burning the rest of the
+        // budget only delays a failure that is already decided.
+        let now = std::time::Instant::now();
+        refused_since = note_refused_residue(refused_since, total_refused_retained, now);
+        if refused_residue_is_fatal(refused_since, now) {
+            return Err(ClientError::Connection(format!(
+                "{} [masters={total_masters}/4096, handoffs={total_pending_handoffs}, \
+                 inbound={total_inbound_pending}, activation={}] [{}]",
+                refused_residue_error(total_refused_retained, &node_details),
+                activation_reason.as_deref().unwrap_or("ok"),
+                node_details.join(", "),
+            )));
+        }
+        if masters_ok
+            && total_pending_handoffs == 0
+            && total_inbound_pending == 0
+            && total_refused_retained == 0
+            && all_idle
+        {
             ready_polls += 1;
             if ready_polls < 3 {
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1307,7 +1410,6 @@ pub async fn wait_migrations_complete(
                     mig_start.elapsed().as_secs_f64() * 1000.0
                 );
             }
-            report_refused_retained_on_convergence(total_refused_retained, &node_details);
             return Ok(());
         }
         ready_polls = 0;
@@ -1338,8 +1440,16 @@ pub async fn wait_migrations_complete(
             // The activation reason carries the per-node serving/target dump,
             // so a gate held ONLY by an unactivated table names the nodes
             // holding it instead of leaving `masters=4096` looking settled.
+            let residue = if total_refused_retained > 0 {
+                format!(
+                    " [{}]",
+                    refused_residue_error(total_refused_retained, &node_details)
+                )
+            } else {
+                String::new()
+            };
             return Err(ClientError::Connection(format!(
-                "migrations still active after {timeout:?} [masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}, activation={}] [{}]{overlap_detail}{}",
+                "migrations still active after {timeout:?} [masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}, activation={}] [{}]{overlap_detail}{}{residue}",
                 activation_reason.as_deref().unwrap_or("ok"),
                 node_details.join(", "),
                 divergence_note.as_deref().unwrap_or("")
@@ -3795,6 +3905,11 @@ mod migration_gate_tests {
     /// first poll. This is NOT a licence to ignore them — the count is still
     /// reported in the per-node detail and in the timeout message, and the
     /// server gauges it as `teraslab_migration_inbound_refused_retained`.
+    ///
+    /// W16 — "does not hold the gate" is scoped to the IN-FLIGHT question this
+    /// test drives, and only to it. The refused count is now a separate and
+    /// FATAL gate condition; see
+    /// `a_refused_residue_fails_the_gate_after_one_reheal_window`.
     #[test]
     fn a_terminally_refused_inbound_entry_does_not_hold_the_gate() {
         let refused = serde_json::json!({
@@ -3848,6 +3963,136 @@ mod migration_gate_tests {
             "inbound_refused_retained": 9,
         });
         assert_eq!(in_flight_inbound_pending(&inconsistent), 0);
+    }
+
+    /// W16 (RED→GREEN) — a terminally-refused residue that survives one full
+    /// re-heal window FAILS the convergence gate. It is not convergence.
+    ///
+    /// Discounting it from `in_flight_inbound_pending` is right — no migration
+    /// is running — and it is what stops armed 09's nine entries from wedging
+    /// every scenario for the whole budget. But letting the gate then return
+    /// `Ok` would be reporting something false: those nine shards are FENCED
+    /// and client-invisible on their own master, and the transfer is not slow,
+    /// it is UNCOMPLETABLE — the source's handshake failed the strict
+    /// `actual == expected_records` check against a target holding a SUPERSET
+    /// (`expected N, got N+1`), which no retry can satisfy.
+    ///
+    /// The grace window is what makes the verdict safe rather than merely
+    /// strict: the server-side mark already costs six consecutive refusals
+    /// (60 s), and the mark is revocable by any evidence of real work, so a
+    /// late re-plan clears it. Failing only after a further
+    /// `REFUSED_RESIDUE_GRACE` means the gate fails on "refused six times AND
+    /// nothing re-planned it for a whole re-heal window after that".
+    #[test]
+    fn a_refused_residue_fails_the_gate_after_one_reheal_window() {
+        let t0 = std::time::Instant::now();
+
+        // Nothing observed: no window, never fatal.
+        assert_eq!(note_refused_residue(None, 0, t0), None);
+        assert!(!refused_residue_is_fatal(
+            None,
+            t0 + REFUSED_RESIDUE_GRACE * 10
+        ));
+
+        // First observation opens the window and does NOT fail immediately —
+        // the mark is revocable, so an instant verdict would fail a run whose
+        // re-heal was about to re-plan the handoff.
+        let opened = note_refused_residue(None, 9, t0).expect("a residue opens a window");
+        assert_eq!(
+            opened, t0,
+            "the window starts when the residue is FIRST seen"
+        );
+        assert!(
+            !refused_residue_is_fatal(Some(opened), t0),
+            "an instant verdict would leave no room for a late re-plan",
+        );
+        assert!(
+            !refused_residue_is_fatal(Some(opened), t0 + REFUSED_RESIDUE_GRACE / 2),
+            "half a re-heal window is not a full one",
+        );
+
+        // A later poll that still sees the residue must NOT restart the clock,
+        // or the gate could never reach a verdict at a 50 ms poll cadence.
+        let still = note_refused_residue(Some(opened), 9, t0 + REFUSED_RESIDUE_GRACE / 2);
+        assert_eq!(still, Some(opened), "a continuing residue keeps its window");
+
+        assert!(
+            refused_residue_is_fatal(still, t0 + REFUSED_RESIDUE_GRACE),
+            "refused six consecutive rounds AND unchanged for a further \
+             {REFUSED_RESIDUE_GRACE:?} is terminal",
+        );
+    }
+
+    /// W16 (RED→GREEN) — a residue that CLEARS closes its window, so a later
+    /// one starts a fresh full grace period.
+    ///
+    /// The mark is revoked by any evidence of real work (a batch arriving, a
+    /// task or re-registration, a re-park, or the source matching the request
+    /// in a later round). Carrying a half-spent window across that revocation
+    /// would let a cluster that demonstrably recovered be failed by the ghost
+    /// of an earlier residue.
+    #[test]
+    fn a_residue_that_clears_starts_a_fresh_window() {
+        let t0 = std::time::Instant::now();
+        let opened = note_refused_residue(None, 2, t0);
+        assert_eq!(opened, Some(t0));
+
+        // The re-heal re-planned it and a batch arrived: the server cleared the
+        // mark, so the gate must forget the window.
+        let cleared = note_refused_residue(opened, 0, t0 + REFUSED_RESIDUE_GRACE / 2);
+        assert_eq!(cleared, None, "zero residue closes the window");
+        assert!(!refused_residue_is_fatal(
+            cleared,
+            t0 + REFUSED_RESIDUE_GRACE * 5
+        ));
+
+        // A residue appearing again later is judged on its OWN window.
+        let reopened_at = t0 + REFUSED_RESIDUE_GRACE;
+        let reopened = note_refused_residue(cleared, 2, reopened_at);
+        assert_eq!(reopened, Some(reopened_at));
+        assert!(
+            !refused_residue_is_fatal(reopened, reopened_at + REFUSED_RESIDUE_GRACE / 2),
+            "the new residue must get a full window, not the remainder of the old one",
+        );
+        assert!(refused_residue_is_fatal(
+            reopened,
+            reopened_at + REFUSED_RESIDUE_GRACE
+        ));
+    }
+
+    /// W16 — the failure has to EXPLAIN itself. The `CONVERGED WITH RESIDUE`
+    /// wording moved from a note on a passing run (which nobody reads) into the
+    /// error that fails the run, and it must still name which nodes hold the
+    /// residue and why it can never clear.
+    #[test]
+    fn the_residue_diagnostic_names_the_nodes_and_the_condition() {
+        let details = vec![
+            "node1:size=3,ver=7,masters=1365".to_string(),
+            "node1:inbound-refused-retained=9".to_string(),
+            "node2:inbound-refused-retained=1".to_string(),
+        ];
+        let msg = refused_residue_error(10, &details);
+        assert!(msg.contains("node1:inbound-refused-retained=9"), "{msg}");
+        assert!(msg.contains("node2:inbound-refused-retained=1"), "{msg}");
+        assert!(
+            !msg.contains("masters=1365"),
+            "unrelated per-node detail belongs to the surrounding dump, not to \
+             the residue block: {msg}",
+        );
+        assert!(
+            msg.contains("FENCED"),
+            "the availability fact must be stated: {msg}"
+        );
+        assert!(
+            msg.contains("This is not convergence"),
+            "the verdict must be explicit, not inferable: {msg}",
+        );
+        // Singular/plural, because a one-entry residue is the common case and
+        // "1 inbound entries ... their own source" reads like a formatting bug
+        // in a failure message someone has to trust.
+        let one = refused_residue_error(1, &["node3:inbound-refused-retained=1".to_string()]);
+        assert!(one.contains("1 inbound entry"), "{one}");
+        assert!(one.contains("its own source"), "{one}");
     }
 
     /// Task #75 — a degraded `/status` payload renders the wedge
