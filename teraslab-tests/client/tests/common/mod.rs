@@ -2692,11 +2692,20 @@ pub async fn collect_failure_diagnostics(scenario_id: u16) {
                 let _ = std::fs::write(dir.join(format!("node{n}_{fname}.json")), json.to_string());
             }
         }
-        // Prometheus text, not JSON — and the only place the replication /
-        // under-replication counters are exposed.
+        // W15 — the Prometheus scrape, which this dump omitted entirely.
+        // collect_logs.sh writes `*_final_metrics.txt` from the same
+        // `/metrics` route, but it only runs AFTER the harness teardown, and
+        // the in-test failure path destroys the containers first — so on every
+        // in-test failure the counters were simply unavailable. Triaging the
+        // scenario-05 acked-loss chain (CI run 32637576348) needed exactly
+        // these: the migration prune / orphan-cleanup counters that say
+        // whether a deleting path ran at all.
+        //
+        // Same filename shape and the same "an absent file is honest, an empty
+        // one is not" rule as collect_logs.sh.
         let metrics_url = format!("http://127.0.0.1:{port}/metrics");
-        if let Ok(text) = poll_text(&metrics_url).await {
-            let _ = std::fs::write(dir.join(format!("node{n}_final_metrics.txt")), text);
+        if let Ok(body) = poll_text(&metrics_url).await {
+            let _ = std::fs::write(dir.join(format!("node{n}_final_metrics.txt")), body);
         }
     }
     eprintln!(

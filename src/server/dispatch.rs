@@ -1645,14 +1645,25 @@ pub(crate) fn handle_request(
             {
                 m.migration_prune_skipped_cutoff_gate.inc();
             }
+            // NOTE the `completion_from_node` binding narrows nothing:
+            // `source_is_authoritative_complete` is already
+            // `completion_from_node.is_some_and(..)`, so it is `Some` on every
+            // path that reaches here. It exists to name the source in the audit
+            // line below without an `unwrap`.
             if source_is_authoritative_complete
                 && prune_safe_at_cutoff
+                && let Some(source_node) = completion_from_node
                 && let Some(entries) = source_entries.as_ref()
                 && !entries.is_empty()
                 && entries.len() as u64 == expected_records
             {
                 let expected_keys: std::collections::HashSet<TxKey> =
                     entries.iter().map(|(key, _)| *key).collect();
+                // W15 — the audit trail this path owed and never kept. The
+                // guard announces ONCE (never per record) on EVERY exit from
+                // this block, including the error arm's early `return` below
+                // (review P2-4).
+                let mut audit = PruneAudit::new(shard, source_node.0, migration_epoch);
                 for key in engine.keys_for_shard(shard) {
                     if expected_keys.contains(&key) {
                         continue;
@@ -1701,8 +1712,14 @@ pub(crate) fn handle_request(
                         tx_key: key,
                         due_guard: None,
                     }) {
-                        Ok(()) | Err(crate::ops::error::SpendError::TxNotFound) => {}
+                        Ok(()) => audit.record(&key.txid),
+                        // Already gone — nothing was destroyed, so it does not
+                        // belong in the audit line.
+                        Err(crate::ops::error::SpendError::TxNotFound) => {}
                         Err(e) => {
+                            // `audit` drops HERE and emits — the records this
+                            // loop already destroyed are named even though the
+                            // prune is aborting (review P2-4).
                             return error_response(
                                 request.request_id,
                                 ERR_MIGRATION_IN_PROGRESS,
@@ -5932,6 +5949,94 @@ fn repl_slot_for(addr: SocketAddr) -> std::sync::Arc<Mutex<PerAddrSlot>> {
             }))
         })
         .clone()
+}
+
+/// W15 — how many pruned txids the #29 audit line renders before it starts
+/// reporting a `txids_omitted` COUNT instead.
+///
+/// Deliberately the same bound as `cluster::coordinator`'s
+/// `ORPHAN_RECLAIM_LOGGED_TXIDS`, for the same reason: a shard can hold
+/// thousands of records, and one flooding line per pruned shard would be as
+/// unusable as the silence it replaced. Ids beyond the cap are never dropped
+/// without saying so.
+const MIGRATION_PRUNE_LOGGED_TXIDS: usize = 16;
+
+/// The #29 completion prune's audit trail: what it destroyed, emitted on EVERY
+/// exit from the prune block.
+///
+/// W15 review P2-4 — the emission was originally a plain `tracing::info!` after
+/// the delete loop, and the loop's error arm `return`s an
+/// `ERR_MIGRATION_IN_PROGRESS` response from inside the loop. A prune that
+/// destroyed k records and then hit a storage error therefore named NONE of
+/// them — the half-completed prune being exactly the case an operator most
+/// needs the txids for. Carrying the emission in `Drop` makes it
+/// unconditional: normal fall-through, the early return, and an unwinding
+/// panic all run it, and no future edit can add a third exit that skips it.
+///
+/// The counter rides along for the same reason (review P2-5): a partial prune
+/// must still be countable from a `/metrics` scrape.
+struct PruneAudit {
+    shard: u16,
+    source_node: u64,
+    migration_epoch: u64,
+    /// Records actually destroyed — `TxNotFound` is not counted, nothing died.
+    pruned: u64,
+    /// Rendered txids, capped at [`MIGRATION_PRUNE_LOGGED_TXIDS`]; the excess
+    /// is reported as a count by [`Self::drop`], never dropped in silence.
+    txids: Vec<String>,
+}
+
+impl PruneAudit {
+    fn new(shard: u16, source_node: u64, migration_epoch: u64) -> Self {
+        Self {
+            shard,
+            source_node,
+            migration_epoch,
+            pruned: 0,
+            txids: Vec::new(),
+        }
+    }
+
+    /// Note one destroyed record.
+    fn record(&mut self, txid: &[u8; 32]) {
+        self.pruned += 1;
+        if self.txids.len() < MIGRATION_PRUNE_LOGGED_TXIDS {
+            self.txids.push(crate::cluster::coordinator::hex_txid(txid));
+        }
+    }
+}
+
+impl Drop for PruneAudit {
+    fn drop(&mut self) {
+        if self.pruned == 0 {
+            return;
+        }
+        if let Some(m) = crate::metrics::migration_metrics() {
+            m.migration_prune_records_deleted.add(self.pruned);
+        }
+        // W15 — a path that DELETES must never be silent. This prune destroyed
+        // live, RF-acked copies in CI run 32637576348 scenario 05 (five records
+        // ending at `holders=[N,N,N]`) and emitted nothing at all, so the loss
+        // chain had to be reconstructed from `dead_bytes` arithmetic. Same
+        // policy and shape as the orphan reclaim's audit line
+        // (`cluster::coordinator`'s `run_orphan_cleanup`): ONE INFO line per
+        // pruned shard, never per record, naming the source whose manifest
+        // authorised the deletion — a stale source is precisely the failure
+        // mode.
+        tracing::info!(
+            shard = self.shard,
+            records_pruned = self.pruned,
+            source_node = self.source_node,
+            migration_epoch = self.migration_epoch,
+            txids = ?self.txids,
+            txids_omitted = self.pruned.saturating_sub(self.txids.len() as u64),
+            "cluster: migration completion PRUNED local keys the \
+             authoritative source's manifest omitted — these records \
+             are GONE from this node (PruneReplace tombstone: an \
+             at-or-behind copy stays vetoed, a strictly-newer one \
+             can still heal in)",
+        );
+    }
 }
 
 /// W10 FIX 1 — may the #29 completion prune run, given the source's
@@ -28252,6 +28357,373 @@ mod tests {
         assert_eq!(h.engine.shard_record_count(shard), 1);
         assert!(h.engine.read_metadata(&key_a).is_ok());
         assert!(h.engine.read_metadata(&TxKey { txid: txid_b }).is_err());
+    }
+
+    /// W15 — the #29 prune DESTROYS records and logged NOTHING but counter
+    /// bumps.
+    ///
+    /// This repo already learned the rule once: after a wave-13 proof reclaim
+    /// deleted four acked records invisibly, `run_orphan_cleanup` grew its
+    /// per-shard INFO audit line and the rule became *"a path that deletes data
+    /// must never be silent."* The prune is the same kind of path and had no
+    /// line at all, which is why the scenario-05 acked-loss chain (CI run
+    /// 32637576348, five records ending at `holders=[N,N,N]`) had to be
+    /// reconstructed from `dead_bytes` arithmetic.
+    ///
+    /// One line per pruned SHARD (never per record), naming the shard, the
+    /// count, the source whose manifest authorised it, and the txids.
+    #[test]
+    fn migration_complete_prune_logs_the_destroyed_keys_at_info() {
+        let h = DispatchTestHarness::new();
+        let shard = 137u16;
+        let txid_a = txid_for_shard(shard, 7);
+        let txid_b = txid_for_shard(shard, 8);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_b, 1).status, STATUS_OK);
+
+        let key_a = TxKey { txid: txid_a };
+        let meta_a = h.engine.read_metadata(&key_a).unwrap();
+        let entries = vec![(key_a, meta_a.generation)];
+
+        let epoch = 49u64;
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4718".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        let payload = build_migration_complete_payload(
+            1,
+            0,
+            epoch,
+            None,
+            Some(&entries),
+            Some(crate::cluster::shards::NodeId(1)),
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let captured = crate::test_log_capture::capture_tracing_lines(tracing::Level::INFO, || {
+            let resp = handle_request(
+                &req,
+                &h.engine,
+                8192,
+                Some(&cluster),
+                None,
+                &mut conn_state,
+                None,
+            );
+            assert_eq!(resp.status, STATUS_OK);
+        });
+
+        assert!(
+            h.engine.read_metadata(&TxKey { txid: txid_b }).is_err(),
+            "the fixture must actually prune, or the log assertion is vacuous",
+        );
+
+        let prune_lines: Vec<&String> = captured
+            .iter()
+            .filter(|l| l.contains("migration completion PRUNED"))
+            .collect();
+        assert_eq!(
+            prune_lines.len(),
+            1,
+            "exactly ONE INFO line per pruned shard (never per record); \
+             captured INFO events: {captured:?}",
+        );
+        let line = prune_lines[0];
+        assert!(
+            line.contains(&format!("shard={shard}")),
+            "the prune line must name the shard: {line}",
+        );
+        assert!(
+            line.contains("records_pruned=1"),
+            "the prune line must state how many records went: {line}",
+        );
+        assert!(
+            line.contains("source_node=1"),
+            "the prune line must name the source whose manifest authorised the \
+             deletion — that source being stale is the whole failure mode: {line}",
+        );
+        let txid = crate::cluster::coordinator::hex_txid(&txid_b);
+        assert!(
+            line.contains(&txid),
+            "the prune line must name the txids it destroyed ({txid}): {line}",
+        );
+        assert!(
+            !line.contains(&crate::cluster::coordinator::hex_txid(&txid_a)),
+            "the RETAINED key must not appear in the destroyed list: {line}",
+        );
+        assert!(
+            line.contains("txids_omitted=0"),
+            "a fully-listed prune must say so explicitly: {line}",
+        );
+    }
+
+    /// W15 review P2-5 — the prune must be answerable from a `/metrics` scrape,
+    /// not only by grepping archived container logs.
+    ///
+    /// Its two existing counters (`migration_prune_weak_declared_retained`,
+    /// `migration_prune_skipped_cutoff_gate`) count what the prune DECLINED to
+    /// do; nothing counted what it did. This diff adds `/metrics` collection to
+    /// the in-test failure diagnostics precisely to answer "did a deleting path
+    /// run at all?", and without this counter the prune still could not answer
+    /// it. Runs the REAL completion path, not a mimic.
+    #[test]
+    fn migration_complete_prune_counts_the_records_it_destroyed() {
+        let _metrics_guard = crate::test_metrics::migration_metrics_test_guard();
+        let metrics = crate::test_metrics::install_test_migration_metrics();
+        // The harness holds `metrics_test_lock`, which is what serializes the
+        // OTHER prune tests — snapshot the counter only once we own it, or
+        // their bumps land inside our delta window.
+        let h = DispatchTestHarness::new();
+        let before = metrics.migration_prune_records_deleted.get();
+        let shard = 139u16;
+        let txid_a = txid_for_shard(shard, 7);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        for salt in 0..3u8 {
+            assert_eq!(
+                h.create_tx(txid_for_shard(shard, 20 + salt), 1).status,
+                STATUS_OK
+            );
+        }
+
+        let key_a = TxKey { txid: txid_a };
+        let meta_a = h.engine.read_metadata(&key_a).unwrap();
+        let entries = vec![(key_a, meta_a.generation)];
+
+        let epoch = 49u64;
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4720".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+        let payload = build_migration_complete_payload(
+            1,
+            0,
+            epoch,
+            None,
+            Some(&entries),
+            Some(crate::cluster::shards::NodeId(1)),
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(
+            h.engine.shard_record_count(shard),
+            1,
+            "the fixture must actually prune three records",
+        );
+        assert_eq!(
+            metrics.migration_prune_records_deleted.get() - before,
+            3,
+            "the counter must record exactly the records destroyed",
+        );
+    }
+
+    /// W15 review P2-4 — the audit line must survive the delete loop's EARLY
+    /// RETURN.
+    ///
+    /// The loop's error arm returns an `ERR_MIGRATION_IN_PROGRESS` response
+    /// from inside the loop, so a prune that destroyed k records and then hit a
+    /// storage error used to name none of them — the half-completed prune being
+    /// exactly the case an operator most needs the txids for. `PruneAudit`
+    /// carries the emission in `Drop`, so it is unconditional.
+    ///
+    /// This drives the guard through the same control flow the production error
+    /// arm uses: a `return` out of a scope that owns it. The NORMAL path through
+    /// the real `handle_request` is covered by the two integration tests above,
+    /// which fail if the guard stops being what the prune uses.
+    #[test]
+    fn prune_audit_names_destroyed_records_when_the_loop_returns_early() {
+        let _metrics_guard = crate::test_metrics::migration_metrics_test_guard();
+        // No harness here, so take `metrics_test_lock` directly: it is what
+        // keeps the sibling prune tests from bumping the counter under us.
+        let _dispatch_lock = metrics_test_lock();
+        let metrics = crate::test_metrics::install_test_migration_metrics();
+        let before = metrics.migration_prune_records_deleted.get();
+        let shard = 141u16;
+        let killed = [txid_for_shard(shard, 1), txid_for_shard(shard, 2)];
+
+        /// Mirrors the prune block's shape: destroy some records, then bail out
+        /// of the scope via `return` exactly as the `Err(e)` arm does.
+        fn destroy_then_bail(shard: u16, killed: &[[u8; 32]]) -> &'static str {
+            let mut audit = PruneAudit::new(shard, 7, 49);
+            for txid in killed {
+                audit.record(txid);
+            }
+            // The production early return. `audit` is dropped here.
+            "aborted"
+        }
+
+        let captured = crate::test_log_capture::capture_tracing_lines(tracing::Level::INFO, || {
+            assert_eq!(destroy_then_bail(shard, &killed), "aborted");
+        });
+
+        let line = captured
+            .iter()
+            .find(|l| l.contains("migration completion PRUNED"))
+            .expect(
+                "a prune that destroyed records and then aborted must STILL name \
+                 them — that is the case the txids are most needed for",
+            );
+        assert!(
+            line.contains(&format!("shard={shard}")) && line.contains("records_pruned=2"),
+            "the aborted prune's line must carry the real count: {line}",
+        );
+        for txid in &killed {
+            let hex = crate::cluster::coordinator::hex_txid(txid);
+            assert!(
+                line.contains(&hex),
+                "the aborted prune must name every already-destroyed txid ({hex}): {line}",
+            );
+        }
+        assert_eq!(
+            metrics.migration_prune_records_deleted.get() - before,
+            2,
+            "and the counter must include the partial prune's records too",
+        );
+    }
+
+    /// W15 — the prune's txid list must be BOUNDED, matching
+    /// `ORPHAN_RECLAIM_LOGGED_TXIDS`: a shard-sized prune must not flood the log
+    /// with thousands of ids, and the operator must be able to tell a truncated
+    /// list from a complete one.
+    #[test]
+    fn migration_complete_prune_caps_the_logged_txid_list() {
+        let h = DispatchTestHarness::new();
+        let shard = 138u16;
+        let txid_a = txid_for_shard(shard, 7);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        let doomed = MIGRATION_PRUNE_LOGGED_TXIDS + 5;
+        for salt in 0..doomed {
+            assert_eq!(
+                h.create_tx(txid_for_shard(shard, 100 + salt as u8), 1)
+                    .status,
+                STATUS_OK,
+            );
+        }
+        assert_eq!(h.engine.shard_record_count(shard), doomed as u64 + 1);
+
+        let key_a = TxKey { txid: txid_a };
+        let meta_a = h.engine.read_metadata(&key_a).unwrap();
+        let entries = vec![(key_a, meta_a.generation)];
+
+        let epoch = 49u64;
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4719".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        let payload = build_migration_complete_payload(
+            1,
+            0,
+            epoch,
+            None,
+            Some(&entries),
+            Some(crate::cluster::shards::NodeId(1)),
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let captured = crate::test_log_capture::capture_tracing_lines(tracing::Level::INFO, || {
+            let resp = handle_request(
+                &req,
+                &h.engine,
+                8192,
+                Some(&cluster),
+                None,
+                &mut conn_state,
+                None,
+            );
+            assert_eq!(resp.status, STATUS_OK);
+        });
+        assert_eq!(
+            h.engine.shard_record_count(shard),
+            1,
+            "every undeclared key must be pruned, or the cap assertion is vacuous",
+        );
+
+        let line = captured
+            .iter()
+            .find(|l| l.contains("migration completion PRUNED"))
+            .expect("the prune must be announced at INFO");
+        assert!(
+            line.contains(&format!("records_pruned={doomed}")),
+            "the count must be the FULL count, not the capped list length: {line}",
+        );
+        let rendered = (0..doomed)
+            .filter(|salt| {
+                line.contains(&crate::cluster::coordinator::hex_txid(&txid_for_shard(
+                    shard,
+                    100 + *salt as u8,
+                )))
+            })
+            .count();
+        assert_eq!(
+            rendered, MIGRATION_PRUNE_LOGGED_TXIDS,
+            "the txid list must be capped at {MIGRATION_PRUNE_LOGGED_TXIDS}: {line}",
+        );
+        assert!(
+            line.contains(&format!(
+                "txids_omitted={}",
+                doomed - MIGRATION_PRUNE_LOGGED_TXIDS
+            )),
+            "a truncated list must state how many ids it omitted: {line}",
+        );
     }
 
     /// W9 P1-1 (third producer) — the #29 prune deletes a local key the

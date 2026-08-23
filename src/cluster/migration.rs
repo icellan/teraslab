@@ -674,6 +674,27 @@ enum DualWriteOrigin {
     Resync,
 }
 
+/// How one outbound handoff of a shard to ONE target node resolved, stamped
+/// with the topology epoch it resolved at.
+///
+/// Recorded per `(shard, target)` in [`MigrationManager::handoff_outcomes`] and
+/// read by the #28 data-loss guard ([`MigrationManager::has_committed_handoff`]).
+/// The last outcome for a given target WINS: a re-drive that finally commits
+/// supersedes its own earlier abort, which is what keeps the retry path from
+/// wedging the shed shut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandoffOutcome {
+    /// The master move was written to the shard table after the target passed
+    /// the count+manifest handshake — positive evidence the data is durably
+    /// installed elsewhere.
+    Committed(u64),
+    /// The transfer TERMINALLY aborted (`terminally_abort_unshippable_task`):
+    /// the target refused a record this node was shipping, so the SOURCE keeps
+    /// authority. Negative evidence — this node may hold the only copy of at
+    /// least one of the shard's records.
+    Aborted(u64),
+}
+
 /// Manages active migrations for this node.
 pub struct MigrationManager {
     active: Vec<MigrationProgress>,
@@ -701,19 +722,32 @@ pub struct MigrationManager {
     /// new side" write invariant must not name them. See
     /// [`Self::dual_write_targets_with_origin_for_shard`].
     resync_dual_write: std::collections::HashMap<u16, std::collections::HashSet<NodeId>>,
-    /// Data-loss guard (task #28): shards this node has POSITIVELY,
-    /// COMMITTED-ly handed off as the outbound source, mapped to the
-    /// topology epoch at which the master move was committed to the
-    /// shard table. Orphan cleanup may delete a non-owned shard's local
-    /// records ONLY if it appears here — i.e. there is positive evidence
-    /// the data is durably installed on the new owner.
+    /// Data-loss guard (task #28): the outcome of every outbound handoff this
+    /// node has RESOLVED, keyed by `(shard, target)` and epoch-stamped. Orphan
+    /// cleanup consults it through [`Self::has_committed_handoff`].
     ///
-    /// A shard that became non-owned WITHOUT a committed handoff from
-    /// this node (e.g. the topology advanced while an in-flight handoff
-    /// was discarded as stale) is deliberately ABSENT, so cleanup
-    /// retains its last copy rather than stranding it. Cleared when this
-    /// node re-acquires the shard as an inbound migration target.
-    committed_handoffs: std::collections::HashMap<u16, u64>,
+    /// Stored as `shard -> [(target, outcome)]` rather than a flat
+    /// `(shard, target)` key because the consumer asks a PER-SHARD question
+    /// ("may I shed shard S?") once per shard across all
+    /// [`crate::cluster::shards::NUM_SHARDS`] — a flat map would make that
+    /// sweep quadratic. Targets per shard are bounded by the replication
+    /// factor plus in-flight re-homes, so the inner scan is a handful of
+    /// entries.
+    ///
+    /// W15 — the map used to be keyed by SHARD ALONE, holding only committed
+    /// handoffs. One committed handoff of shard S at epoch E then authorized
+    /// deleting EVERY local copy of S at E, including copies a second,
+    /// DISTINCT handoff of the same shard had just proved were still needed:
+    /// CI run 32637576348 scenario 05 aborted the handoff of shard 959 to
+    /// node3 (*"source keeps authority"*) and deleted node1's two copies ten
+    /// seconds later anyway, ending the run with those records held by NO node.
+    ///
+    /// A shard that became non-owned WITHOUT a committed handoff from this node
+    /// (e.g. the topology advanced while an in-flight handoff was discarded as
+    /// stale) is deliberately ABSENT, so cleanup retains its last copy rather
+    /// than stranding it. Cleared wholesale when this node re-acquires the
+    /// shard as an inbound migration target.
+    handoff_outcomes: std::collections::HashMap<u16, Vec<(NodeId, HandoffOutcome)>>,
     /// W4 review P1 — monotonic source for [`MigrationProgress::attempt`]
     /// stamps. Bumped once per stamp so every (re-)drive of an entry gets a
     /// unique generation; starts at 1 so a stamp of 0 (the `from_task`
@@ -807,7 +841,7 @@ impl MigrationManager {
             fenced_shards: ShardBitmap::new(),
             dual_write_targets: std::collections::HashMap::new(),
             resync_dual_write: std::collections::HashMap::new(),
-            committed_handoffs: std::collections::HashMap::new(),
+            handoff_outcomes: std::collections::HashMap::new(),
             next_attempt: 1,
             failed_batch_retry_arm: false,
             replica_abort_resync_arm: false,
@@ -963,7 +997,7 @@ impl MigrationManager {
                 fenced_shards: _,
                 dual_write_targets: _,
                 resync_dual_write: _,
-                committed_handoffs: _,
+                handoff_outcomes: _,
                 next_attempt: _,
                 failed_batch_retry_arm: _,
                 replica_abort_resync_arm: _,
@@ -1032,20 +1066,47 @@ impl MigrationManager {
         a
     }
 
-    /// Record that this node has COMMITTED-ly handed off `shard` as the
-    /// outbound source at topology `epoch` (the master move was written to
+    /// Upsert the outcome of the `(shard, target)` handoff. The last outcome
+    /// for a target replaces its predecessor — a re-drive that finally commits
+    /// supersedes its own earlier abort, and vice versa.
+    fn record_handoff_outcome(&mut self, shard: u16, target: NodeId, outcome: HandoffOutcome) {
+        let entry = self.handoff_outcomes.entry(shard).or_default();
+        match entry.iter_mut().find(|(node, _)| *node == target) {
+            Some(slot) => slot.1 = outcome,
+            None => entry.push((target, outcome)),
+        }
+    }
+
+    /// Record that this node has COMMITTED-ly handed off `shard` to `target` as
+    /// the outbound source at topology `epoch` (the master move was written to
     /// the shard table). This is the positive evidence orphan cleanup
     /// requires before deleting the shard's local records.
     ///
     /// Called from the migration-completion path only after `commit_shard`
     /// has transferred ownership to the new master.
-    pub fn record_committed_handoff(&mut self, shard: u16, epoch: u64) {
-        self.committed_handoffs.insert(shard, epoch);
+    pub fn record_committed_handoff(&mut self, shard: u16, target: NodeId, epoch: u64) {
+        self.record_handoff_outcome(shard, target, HandoffOutcome::Committed(epoch));
+    }
+
+    /// Record that this node's handoff of `shard` to `target` TERMINALLY
+    /// aborted at topology `epoch` — the source keeps authority
+    /// ([`crate::cluster::coordinator`]'s `terminally_abort_unshippable_task`).
+    ///
+    /// This is NEGATIVE evidence and it VETOES the shed of `shard` at `epoch`
+    /// (see [`Self::has_committed_handoff`]). Only the TERMINAL disposition
+    /// needs its own record: an ordinary failure
+    /// (`fail_migration_task_current_epoch`) leaves a `Failed` tracking entry
+    /// that both orphan-cleanup gates already refuse to reclaim under, whereas
+    /// the terminal abort RETIRES the entry ([`Self::fail_and_retire_task`])
+    /// and so erases the only trace those gates could see.
+    pub fn record_aborted_handoff(&mut self, shard: u16, target: NodeId, epoch: u64) {
+        self.record_handoff_outcome(shard, target, HandoffOutcome::Aborted(epoch));
     }
 
     /// Whether this node has positive committed-handoff evidence for `shard`
-    /// that is STILL VALID at `current_epoch`. Orphan cleanup deletes a
-    /// non-owned shard ONLY when this returns true.
+    /// that is STILL VALID at `current_epoch`, AND no handoff of `shard`
+    /// terminally aborted at that epoch. Orphan cleanup deletes a non-owned
+    /// shard ONLY when this returns true.
     ///
     /// The match is epoch-EXACT: a handoff verified at epoch N authorizes
     /// deletion only while the table is still at epoch N — the epoch where
@@ -1059,16 +1120,123 @@ impl MigrationManager {
     /// is exactly the data-loss bug. Stale entries cause retain-until-verified:
     /// the bytes linger until a fresh same-epoch handoff completes (or this
     /// node re-acquires the shard, which clears the entry).
+    ///
+    /// # W15 — why one committed handoff is not enough
+    ///
+    /// The evidence used to be keyed by SHARD ALONE, so a single committed
+    /// handoff of shard S at epoch E authorized deleting every local copy of S
+    /// — including copies a second, DISTINCT handoff of the same shard had just
+    /// proved the cluster still needs. That is the step that converted "one
+    /// copy left" into "zero copies" in CI run 32637576348 scenario 05: shard
+    /// 959's completion to node3 was rejected and terminally aborted at
+    /// 12:00:04 (*"source keeps authority"*), and at 12:00:14 node1 deleted its
+    /// two copies on the strength of an unrelated committed handoff of 959 at
+    /// the same epoch.
+    ///
+    /// A terminal abort means the TARGET does not hold at least one record this
+    /// node holds, so it vetoes the shed regardless of any sibling commit. Both
+    /// directions stay live:
+    ///
+    /// * The veto is EPOCH-SCOPED exactly like the positive evidence, so it
+    ///   cannot wedge the shed permanently — a fresh committed handoff at a
+    ///   later epoch is judged on its own.
+    /// * A re-drive whose completion the target VERIFIES retires that target's
+    ///   abort ([`Self::clear_handoff_abort`]) whether or not the completion
+    ///   commits, so the ordinary retry path re-opens the shed within the same
+    ///   epoch. That the clear is separate from
+    ///   [`Self::record_committed_handoff`] is load-bearing: a replica-only
+    ///   completion from a node the new table makes a non-owner has
+    ///   `should_commit == false`, so it never reaches the recorder — and it is
+    ///   exactly the shape the veto bites on (review P2-1).
+    ///
+    /// # What is NOT an escape (review P2-1)
+    ///
+    /// The proof-of-elsewhere phase is NOT a general escape hatch. It is behind
+    /// `run_orphan_cleanup`'s `proof_armed`, whose committed
+    /// `orphan_cleanup_proof_reclaim_enabled` policy DEFAULTS TO FALSE, so in
+    /// the shipped configuration it does not run at all; and
+    /// `cleanup_orphaned_shard_if_settled` — the per-shard path this veto was
+    /// written for — has no proof phase whatsoever. On shipped defaults a
+    /// vetoed shard is retained until a verified completion, a re-acquisition,
+    /// or an epoch bump resolves it. That is the intended trade, not an
+    /// oversight.
     pub fn has_committed_handoff(&self, shard: u16, current_epoch: u64) -> bool {
-        self.committed_handoffs.get(&shard) == Some(&current_epoch)
+        let Some(outcomes) = self.handoff_outcomes.get(&shard) else {
+            return false;
+        };
+        let mut committed = false;
+        for (_, outcome) in outcomes {
+            match *outcome {
+                // A same-epoch abort is decisive: the shed is vetoed even if a
+                // sibling handoff of the same shard committed.
+                HandoffOutcome::Aborted(epoch) if epoch == current_epoch => return false,
+                HandoffOutcome::Committed(epoch) if epoch == current_epoch => committed = true,
+                // Stale-epoch outcomes (either kind) neither authorize nor veto.
+                _ => {}
+            }
+        }
+        committed
     }
 
-    /// Drop any committed-handoff record for `shard`. Called when this
-    /// node re-acquires the shard (becomes an inbound target again), so a
-    /// stale record cannot authorize deleting freshly re-homed data after
-    /// a subsequent un-assignment that lacks its own committed handoff.
-    pub fn clear_committed_handoff(&mut self, shard: u16) {
-        self.committed_handoffs.remove(&shard);
+    /// Whether a handoff of `shard` TERMINALLY ABORTED at `current_epoch` —
+    /// i.e. [`Self::has_committed_handoff`] is false because the shed is
+    /// VETOED, not merely because no evidence was ever earned.
+    ///
+    /// The two are materially different states and the census must be able to
+    /// tell them apart (W11 FIX 4(b)'s rule: a retention must be attributable
+    /// to the gate that caused it). "No evidence" is the SIGKILL /
+    /// never-handed-off case that the proof-of-elsewhere phase exists to earn
+    /// its way out of; an abort veto is positive knowledge that a target
+    /// refused a record this node holds, and no probe should talk it out of
+    /// that.
+    pub fn has_aborted_handoff(&self, shard: u16, current_epoch: u64) -> bool {
+        self.handoff_outcomes.get(&shard).is_some_and(|outcomes| {
+            outcomes
+                .iter()
+                .any(|(_, o)| matches!(*o, HandoffOutcome::Aborted(e) if e == current_epoch))
+        })
+    }
+
+    /// Retire any ABORT record for `(shard, target)`, leaving a `Committed`
+    /// record for that target untouched and never creating one.
+    ///
+    /// Called on a completion the TARGET VERIFIED (count+manifest handshake
+    /// passed), which is the moment the abort's negative evidence becomes
+    /// obsolete: the target has just confirmed it holds what this node
+    /// streamed. Deliberately separate from
+    /// [`Self::record_committed_handoff`] — see the P2-1 note on
+    /// [`Self::has_committed_handoff`] for why a replica-only completion, which
+    /// never commits and so never records evidence, must still be able to
+    /// retire the veto.
+    ///
+    /// Only an `Aborted` slot is removed. Erasing a `Committed` slot here would
+    /// silently withdraw positive evidence and strand the shard.
+    pub fn clear_handoff_abort(&mut self, shard: u16, target: NodeId) {
+        let Some(entry) = self.handoff_outcomes.get_mut(&shard) else {
+            return;
+        };
+        entry.retain(|(node, outcome)| {
+            *node != target || !matches!(outcome, HandoffOutcome::Aborted(_))
+        });
+        if entry.is_empty() {
+            self.handoff_outcomes.remove(&shard);
+        }
+    }
+
+    /// Drop every recorded handoff outcome for `shard`, committed and aborted
+    /// alike.
+    ///
+    /// Two callers, both meaning "everything previously known about this
+    /// shard's transfers is superseded":
+    ///
+    /// * this node RE-ACQUIRES the shard as an inbound migration target
+    ///   ([`Self::start_outbound`]), so a stale committed record cannot
+    ///   authorize deleting freshly re-homed data and a stale abort cannot
+    ///   block a shed the fresh migration is entitled to authorize;
+    /// * the periodic prune REAPS a `Failed` outbound entry for the shard
+    ///   ([`Self::cleanup_completed`]) — see there for why.
+    pub fn clear_handoff_outcomes(&mut self, shard: u16) {
+        self.handoff_outcomes.remove(&shard);
     }
 
     /// Phase E: NodeIds (new master + new replicas) that must additionally
@@ -1217,10 +1385,12 @@ impl MigrationManager {
                 }
             }
             if task.to_node == self_id {
-                // Re-acquiring this shard: drop any prior committed-handoff
-                // record so a stale entry cannot later authorize deleting the
-                // data we are now receiving back (task #28).
-                self.committed_handoffs.remove(&task.shard);
+                // Re-acquiring this shard: drop every prior handoff outcome
+                // (committed AND aborted) so a stale entry cannot later
+                // authorize deleting the data we are now receiving back
+                // (task #28), and a stale abort veto cannot block a shed the
+                // fresh migration is entitled to authorize (W15).
+                self.clear_handoff_outcomes(task.shard);
                 // C8 — a fresh migration re-acquiring this shard SUPERSEDES any
                 // prior orphaned/lost attempt (possibly from a now-dead
                 // source): clear the `lost` mark on every existing entry for
@@ -2315,8 +2485,46 @@ impl MigrationManager {
             }
         }
 
+        // W15 review P1-1 — DATA-LOSS GUARD. A `Failed` entry is not just
+        // bookkeeping: it is the block both orphan-cleanup gates key their
+        // unresolved-task skip off (`run_orphan_cleanup`'s `unsettled` set and
+        // `cleanup_orphaned_shard_if_settled`'s `shard_failed` test). Reaping
+        // it here removes that block, and if a SIBLING handoff of the same
+        // shard committed, `has_committed_handoff` then authorizes deleting
+        // every local record of the shard — including the ones the failed task
+        // was still trying to deliver.
+        //
+        // That is the scenario-05 chain one step over: master handoff S:n1→n2
+        // commits (`Committed(E)`), the replica push S:n1→n3 fails ORDINARILY
+        // (connection reset / target-not-ready budget exhausted / abandoned-batch
+        // park) leaving a `Failed` entry, the event loop's periodic prune reaps
+        // it once `failed_retry_hold` drops, and the steady-state sweep deletes
+        // the shard. Loss iff n2's manifest did not cover those records —
+        // precisely the scenario-05 condition.
+        //
+        // The fix is NOT to record an `Aborted` veto for an ordinary failure: a
+        // connection reset is no evidence the target lacks a record, and
+        // vetoing on it would be the over-conservatism this design avoids. It
+        // is to keep the protection the reaped entry was providing — drop the
+        // shard's evidence with it. Fail-closed, no new state, and it
+        // self-heals on the next committing handoff, which re-earns the
+        // evidence from scratch.
+        //
+        // `cleanup_completed_keep_failed` deliberately does NOT do this: it
+        // PRESERVES the `Failed` entries, so the block is still standing.
+        let reaped_failed_shards: Vec<u16> = self
+            .active
+            .iter()
+            .filter(|p| p.state == MigrationState::Failed)
+            .map(|p| p.shard)
+            .collect();
+
         self.active
             .retain(|p| !p.is_complete() && p.state != MigrationState::Failed);
+
+        for shard in reaped_failed_shards {
+            self.clear_handoff_outcomes(shard);
+        }
 
         // Unfence shards that no longer have any fenced task.
         for shard in maybe_unfence {
@@ -3494,6 +3702,264 @@ impl Default for MigrationManager {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// W15 — the #28 evidence is per-`(shard, target)`, and a TERMINAL ABORT of
+    /// any one target vetoes the shard's shed at that epoch even when a sibling
+    /// handoff of the SAME shard committed.
+    ///
+    /// Shard-keyed evidence is what let CI run 32637576348 scenario 05 delete
+    /// node1's last two copies of shard 959 ten seconds after node3 refused
+    /// them.
+    #[test]
+    fn terminal_abort_of_one_target_vetoes_a_sibling_committed_handoff() {
+        let mut mgr = MigrationManager::new();
+        mgr.record_committed_handoff(959, NodeId(2), 4);
+        assert!(
+            mgr.has_committed_handoff(959, 4),
+            "a committed handoff at the current epoch is the #28 evidence",
+        );
+
+        mgr.record_aborted_handoff(959, NodeId(3), 4);
+        assert!(
+            !mgr.has_committed_handoff(959, 4),
+            "a DISTINCT handoff of the same shard that terminally aborted at the \
+             same epoch must veto the shed — node3 just proved it does not hold \
+             what node1 holds",
+        );
+
+        // The veto is per-SHARD-and-EPOCH, not global: an unrelated shard with
+        // its own clean evidence is untouched.
+        mgr.record_committed_handoff(960, NodeId(2), 4);
+        assert!(
+            mgr.has_committed_handoff(960, 4),
+            "an abort on shard 959 must not block the shed of shard 960",
+        );
+    }
+
+    /// W15, other direction — the veto must not wedge the legitimate shed shut,
+    /// or it reintroduces the over-replication this campaign has been fighting.
+    ///
+    /// Two escapes, both pinned here: a re-drive that finally COMMITS to the
+    /// same target supersedes its own abort within the epoch, and the veto is
+    /// epoch-scoped exactly like the positive evidence, so a fresh handoff at a
+    /// later epoch is judged on its own.
+    #[test]
+    fn abort_veto_is_superseded_by_a_later_commit_and_expires_with_the_epoch() {
+        let mut mgr = MigrationManager::new();
+
+        // Re-drive to the SAME target that aborted.
+        mgr.record_aborted_handoff(700, NodeId(2), 4);
+        assert!(
+            !mgr.has_committed_handoff(700, 4),
+            "the abort alone leaves no positive evidence at all",
+        );
+        mgr.record_committed_handoff(700, NodeId(2), 4);
+        assert!(
+            mgr.has_committed_handoff(700, 4),
+            "a re-drive that commits to the aborted target must re-open the shed \
+             in the SAME epoch — the ordinary retry path must not be wedged",
+        );
+
+        // Epoch scoping: an abort at epoch 4 says nothing about epoch 5.
+        let mut mgr = MigrationManager::new();
+        mgr.record_aborted_handoff(701, NodeId(3), 4);
+        mgr.record_committed_handoff(701, NodeId(2), 5);
+        assert!(
+            mgr.has_committed_handoff(701, 5),
+            "a stale-epoch abort must not veto a fresh committed handoff",
+        );
+        assert!(
+            !mgr.has_committed_handoff(701, 4),
+            "and the stale-epoch commit still does not apply to the old epoch",
+        );
+    }
+
+    /// W15 — re-acquiring the shard as an inbound target supersedes EVERY prior
+    /// transfer of it, aborts included: a retained veto would block a shed the
+    /// fresh migration is entitled to authorize on its own.
+    #[test]
+    fn reacquiring_the_shard_clears_the_abort_veto_too() {
+        let mut mgr = MigrationManager::new();
+        mgr.record_aborted_handoff(702, NodeId(3), 4);
+        mgr.record_committed_handoff(702, NodeId(2), 4);
+        assert!(
+            !mgr.has_committed_handoff(702, 4),
+            "precondition: the abort is vetoing the shed",
+        );
+
+        let inbound = MigrationTask {
+            shard: 702,
+            from_node: NodeId(2),
+            to_node: NodeId(1),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&inbound),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+
+        // Everything is gone — no evidence AND no veto.
+        assert!(
+            !mgr.has_committed_handoff(702, 4),
+            "re-acquisition drops the committed evidence (task #28)",
+        );
+        mgr.record_committed_handoff(702, NodeId(2), 4);
+        assert!(
+            mgr.has_committed_handoff(702, 4),
+            "re-acquisition must also drop the stale abort veto, or a fresh \
+             committed handoff can never authorize a shed again",
+        );
+    }
+
+    /// W15 review P1-1 — reaping a `Failed` OUTBOUND entry must take the
+    /// shard's handoff evidence with it.
+    ///
+    /// A `Failed` entry is not bookkeeping: it is the block both orphan-cleanup
+    /// gates key their unresolved-task skip off. Reaping it removes the block,
+    /// so if a sibling handoff of the same shard committed, the shed is
+    /// authorized over records the failed task was still trying to deliver —
+    /// the scenario-05 chain one step over. Recording an `Aborted` for an
+    /// ordinary failure would be wrong (a connection reset is no evidence the
+    /// target lacks a record); dropping the evidence with the block is the
+    /// fail-closed equivalent.
+    #[test]
+    fn reaping_a_failed_outbound_task_drops_the_shards_handoff_evidence() {
+        let mut mgr = MigrationManager::new();
+        // Master handoff S:n1→n2 commits — the #28 evidence.
+        mgr.record_committed_handoff(800, NodeId(2), 4);
+        // Replica push S:n1→n3 fails ORDINARILY (not a terminal abort).
+        let replica = MigrationTask {
+            shard: 800,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: false,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&replica),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        mgr.mark_failed(&replica);
+        assert!(
+            mgr.has_committed_handoff(800, 4),
+            "precondition: the commit IS the evidence — what stops the shed \
+             right now is the Failed entry, not the evidence check",
+        );
+        assert!(
+            mgr.active_migrations()
+                .iter()
+                .any(|p| p.shard == 800 && p.state == MigrationState::Failed),
+            "precondition: the Failed entry is the standing block",
+        );
+
+        // The event loop's periodic prune reaps it once the retry hold drops.
+        mgr.cleanup_completed();
+
+        assert!(
+            !mgr.active_migrations().iter().any(|p| p.shard == 800),
+            "precondition: the prune really reaped the entry",
+        );
+        assert!(
+            !mgr.has_committed_handoff(800, 4),
+            "reaping the Failed entry removed the only thing blocking the shed, \
+             so the evidence must go with it — otherwise the next sweep deletes \
+             every local record of shard 800",
+        );
+    }
+
+    /// The other half of P1-1: while the retry HOLD is raised, the `Failed`
+    /// entry is PRESERVED, so the block is still standing and the evidence must
+    /// NOT be dropped. Pins that the drop is tied to the reap and not to
+    /// `cleanup_completed` being called at all.
+    #[test]
+    fn preserving_a_failed_entry_keeps_the_shards_handoff_evidence() {
+        let mut mgr = MigrationManager::new();
+        mgr.record_committed_handoff(801, NodeId(2), 4);
+        let replica = MigrationTask {
+            shard: 801,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: false,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&replica),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        mgr.mark_failed(&replica);
+        mgr.arm_failed_batch_retry(); // raises the hold
+
+        mgr.cleanup_completed();
+
+        assert!(
+            mgr.active_migrations()
+                .iter()
+                .any(|p| p.shard == 801 && p.state == MigrationState::Failed),
+            "the hold must preserve the Failed entry (W8 P0-2)",
+        );
+        assert!(
+            mgr.has_committed_handoff(801, 4),
+            "the block is still standing, so the evidence must survive — \
+             dropping it here would be pointless churn",
+        );
+    }
+
+    /// W15 review P2-1 — a VERIFIED completion retires that target's abort even
+    /// when it does not commit, and that is the case that matters.
+    ///
+    /// `should_commit` is `is_master || target_assignment names from_node`, so a
+    /// replica push from a node the new table makes a NON-OWNER completes with
+    /// `commit == false` and never reaches `record_committed_handoff`. Without a
+    /// separate clear, its `Aborted` record survives every successful re-drive
+    /// and the shard is retained until the epoch advances — real
+    /// over-replication on exactly the shape the veto bites on.
+    #[test]
+    fn a_verified_completion_retires_that_targets_abort_without_manufacturing_evidence() {
+        let mut mgr = MigrationManager::new();
+        mgr.record_committed_handoff(810, NodeId(2), 4); // master handoff committed
+        mgr.record_aborted_handoff(810, NodeId(3), 4); // replica push terminally aborted
+        assert!(
+            !mgr.has_committed_handoff(810, 4),
+            "precondition: the abort is vetoing the shed",
+        );
+
+        // The replica push is re-driven and the target VERIFIES it — but the
+        // completion does not commit, so no evidence is ever recorded for n3.
+        mgr.clear_handoff_abort(810, NodeId(3));
+
+        assert!(
+            !mgr.has_aborted_handoff(810, 4),
+            "the verified completion retires the veto",
+        );
+        assert!(
+            mgr.has_committed_handoff(810, 4),
+            "and the SIBLING committed handoff is usable again — this is the \
+             escape hatch that did not exist for replica-side aborts",
+        );
+
+        // Clearing must never MANUFACTURE evidence out of nothing.
+        let mut bare = MigrationManager::new();
+        bare.clear_handoff_abort(811, NodeId(3));
+        assert!(
+            !bare.has_committed_handoff(811, 4),
+            "clearing an abort on a shard with no evidence must not create any",
+        );
+    }
+
+    /// P2-1 guard rail — the clear is ABORT-ONLY. Erasing a `Committed` slot
+    /// would silently withdraw positive evidence and strand the shard forever.
+    #[test]
+    fn clearing_an_abort_never_erases_committed_evidence() {
+        let mut mgr = MigrationManager::new();
+        mgr.record_committed_handoff(812, NodeId(2), 4);
+        mgr.clear_handoff_abort(812, NodeId(2));
+        assert!(
+            mgr.has_committed_handoff(812, 4),
+            "the target's COMMITTED record must survive an abort-clear aimed at \
+             the same target",
+        );
+    }
 
     /// W13 review item 4 — a state reset must not silently rewrite the
     /// OPERATOR's policy.
