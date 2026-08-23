@@ -14391,7 +14391,22 @@ fn handle_partition_version_report(
                 &c.shard_table(),
                 c.inbound_bitmap(),
             );
-            c.kick_recency_refresh();
+            // #95 review P1-1 — the RESPONDER half of the refresh amplification.
+            // Every querier's report kicks a whole-store index+device scan here,
+            // so a periodic repair probe on N nodes would land N-1 kicks per
+            // interval on each responder ON TOP of its own — saturating the 5 s
+            // `RECENCY_REFRESH_MIN_INTERVAL` floor outright at N>=4 and making
+            // back-to-back whole-store scans the steady state (the shape
+            // `crate::ops::recency` already calls the P1-1 defect). Skipping only
+            // the querier's own kick would leave this amplification untouched.
+            //
+            // Fail-safe: an absent or unrecognised origin tag reads as COMMIT, so
+            // a peer that predates the field keeps today's behaviour exactly.
+            if crate::cluster::coordinator::parse_partition_report_origin(&req.payload)
+                .kicks_recency_refresh()
+            {
+                c.kick_recency_refresh();
+            }
             entries
         }
         None => Vec::new(),
@@ -32239,6 +32254,106 @@ mod tests {
             Some(local_key),
             "the rejection must echo the RESPONDER's local cluster key",
         );
+    }
+
+    /// #95 review P1-1 (RED→GREEN) — the RESPONDER half.
+    ///
+    /// Answering a report kicks `maybe_refresh_shard_recency_cache`: a full
+    /// index walk plus per-key device reads, braked only by the 5 s
+    /// `RECENCY_REFRESH_MIN_INTERVAL`. With a periodic repair probe on every
+    /// node, each responder receives N-1 peer kicks per interval on top of
+    /// its own — so skipping the kick only on the QUERIER side would leave
+    /// the amplification fully intact. This pins the peer end.
+    ///
+    /// Ordering is load-bearing: the probe case runs FIRST, against a
+    /// never-scanned cache (`refresh_due` is true immediately, so a kick
+    /// WOULD fire), and the commit case runs second as the positive control
+    /// proving the kick still works and the test is not vacuous.
+    #[test]
+    fn a_probe_origin_partition_report_does_not_kick_a_recency_refresh() {
+        let h = DispatchTestHarness::new();
+        let engine = std::sync::Arc::new(h.engine);
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+        ];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 7, 1);
+        let mut cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4713".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+        cluster.test_set_engine(engine.clone());
+        let local_key = cluster.local_cluster_key();
+        assert!(
+            engine.recency_cache_is_stale(),
+            "a never-scanned cache must start stale, or this test proves nothing",
+        );
+
+        let ask = |payload: Vec<u8>, cluster: &crate::cluster::coordinator::RunningCluster| {
+            let req = RequestFrame {
+                request_id: 0,
+                op_code: OP_PARTITION_VERSION_REPORT,
+                flags: 0,
+                payload: payload.into(),
+            };
+            let mut conn_state = crate::server::ConnectionState::new();
+            handle_request(
+                &req,
+                &engine,
+                8192,
+                Some(cluster),
+                None,
+                &mut conn_state,
+                None,
+            )
+        };
+
+        // PROBE origin: answered normally, but no scan kicked.
+        let resp = ask(
+            crate::cluster::coordinator::encode_partition_version_request(
+                local_key,
+                crate::cluster::coordinator::PartitionReportOrigin::RepairProbe,
+            ),
+            &cluster,
+        );
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "a probe-origin report must still be ANSWERED — only the refresh \
+             side effect is skipped",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            engine.recency_cache_is_stale(),
+            "a probe-origin report must NOT have kicked a whole-store scan",
+        );
+
+        // COMMIT origin: the positive control — the kick still happens.
+        let resp = ask(
+            crate::cluster::coordinator::encode_partition_version_request(
+                local_key,
+                crate::cluster::coordinator::PartitionReportOrigin::Commit,
+            ),
+            &cluster,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while engine.recency_cache_is_stale() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a COMMIT-origin report must still kick the refresh — the \
+                 reverse-heal recency signal depends on it converging",
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     /// W1.1 FIX B — OP_MIGRATION_TRANSFER_REQUEST epoch validation and

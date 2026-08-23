@@ -175,7 +175,18 @@ pub const KEY_DIAGNOSIS_ENCODED_SIZE: usize = 2 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 8 
 /// Request payload (coordinator → peer):
 /// ```text
 ///   cluster_key: u64 LE   (8 bytes)
+///   origin:      u8       (1 byte, OPTIONAL; 0=commit path, 1=repair probe)
 /// ```
+///
+/// The trailing `origin` byte is ADDITIVE (#95 review P1-1) and carries no
+/// authority — it selects only whether answering this query kicks an
+/// off-thread whole-store recency refresh. `0`, an absent byte (a peer that
+/// predates the field) and any unrecognised value all read as "commit path",
+/// i.e. today's behaviour; a `1` from the holder-driven under-replication
+/// probe suppresses the kick, because the derive that probe feeds reads
+/// `last_applied_seq` and the `PENDING_INBOUND` flag and no recency field at
+/// all. No `PROTOCOL_VERSION` bump. See
+/// [`PartitionReportOrigin`](crate::cluster::coordinator).
 ///
 /// Response payload (peer → coordinator):
 /// ```text

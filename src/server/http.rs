@@ -1785,6 +1785,11 @@ pub(crate) fn render_metrics_text(
         "teraslab_exchange_peer_failure_garbled_total",
         crate::cluster::coordinator::exchange_peer_failure_garbled_total(),
     );
+    prom_counter(
+        &mut out,
+        "teraslab_under_replication_probe_peer_failures_total",
+        crate::cluster::coordinator::under_replication_probe_peer_failures_total(),
+    );
     // §9 arm 1 — persistent-divergence gauge: consecutive quorum-backed
     // higher-term commits refused since the last apply. Non-zero and rising
     // means this node is on the losing side of an attestation split.
@@ -5661,6 +5666,7 @@ mod tests {
             "teraslab_activation_degraded_degenerate_view_total",
             "teraslab_exchange_peer_failure_connect_total",
             "teraslab_exchange_peer_failure_status_total",
+            "teraslab_under_replication_probe_peer_failures_total",
             "teraslab_exchange_peer_failure_transport_total",
             "teraslab_exchange_peer_failure_garbled_total",
             "teraslab_topology_refused_higher_term_streak",
