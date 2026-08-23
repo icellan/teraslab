@@ -72,6 +72,28 @@ async fn poll_json(url: &str) -> Result<serde_json::Value, ClientError> {
         .map_err(|e| ClientError::Connection(format!("GET {url} JSON parse failed: {e}")))
 }
 
+/// GET a plain-text endpoint (the Prometheus `/metrics` scrape).
+///
+/// Sibling of [`poll_json`] — same client, same auth header, same
+/// non-2xx-is-an-error rule; only the body decoding differs, because a
+/// Prometheus exposition is not JSON.
+async fn poll_text(url: &str) -> Result<String, ClientError> {
+    let resp = poll_http_client()
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| ClientError::Connection(format!("GET {url} failed: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(ClientError::Connection(format!(
+            "GET {url} returned status {}",
+            resp.status()
+        )));
+    }
+    resp.text()
+        .await
+        .map_err(|e| ClientError::Connection(format!("GET {url} body read failed: {e}")))
+}
+
 /// Create a DockerHelpers for 3-node cluster with a specific scenario ID.
 pub fn docker_3node(scenario_id: u16) -> DockerHelpers {
     DockerHelpers::new(&compose_dir(), scenario_id, 3)
@@ -2528,6 +2550,23 @@ pub async fn collect_failure_diagnostics(scenario_id: u16) {
             if let Ok(json) = poll_json(&url).await {
                 let _ = std::fs::write(dir.join(format!("node{n}_{fname}.json")), json.to_string());
             }
+        }
+        // W15 — the Prometheus scrape, which this dump omitted entirely.
+        // collect_logs.sh writes `*_final_metrics.txt` from the same
+        // `/metrics` route, but it only runs AFTER the harness teardown, and
+        // the in-test failure path destroys the containers first — so on every
+        // in-test failure the counters were simply unavailable. Triaging the
+        // scenario-05 acked-loss chain (CI run 32637576348) needed exactly
+        // these: the migration prune / orphan-cleanup counters that say
+        // whether a deleting path ran at all.
+        //
+        // Same filename shape and the same "an absent file is honest, an empty
+        // one is not" rule as collect_logs.sh.
+        let metrics_url = format!("http://127.0.0.1:{port}/metrics");
+        if let Ok(body) = poll_text(&metrics_url).await
+            && !body.is_empty()
+        {
+            let _ = std::fs::write(dir.join(format!("node{n}_final_metrics.txt")), body);
         }
     }
     eprintln!(
