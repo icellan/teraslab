@@ -1487,6 +1487,11 @@ pub(crate) fn render_metrics_text(
         );
         prom_counter(
             &mut out,
+            "teraslab_under_replication_probe_views_dropped_total",
+            mm.under_replication_probe_views_dropped.get(),
+        );
+        prom_counter(
+            &mut out,
             "teraslab_under_replication_shards_seen_total",
             mm.under_replication_shards_seen.get(),
         );
@@ -5627,6 +5632,7 @@ mod tests {
             "teraslab_under_replication_event_repairs_total",
             "teraslab_under_replication_exchange_repairs_total",
             "teraslab_under_replication_probes_total",
+            "teraslab_under_replication_probe_views_dropped_total",
             "teraslab_under_replication_shards_seen_total",
             "teraslab_under_replication_fills_driven_total",
             "teraslab_under_replication_fills_refused_total",

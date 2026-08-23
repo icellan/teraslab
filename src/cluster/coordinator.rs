@@ -639,8 +639,12 @@ const UNDER_REPLICATION_PROBE_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10)
 ///    doubles the interval toward [`UNDER_REPLICATION_PROBE_BACKOFF_CAP`],
 ///    while a shrinking gap (a large repair genuinely draining in
 ///    cap-sized steps) keeps the base cadence;
-///  * at the launch site, the caller's drain gate and no-active-migration
-///    gate, so a probe cannot stack a batch onto still-streaming repairs.
+///  * the drain gate and the no-active-migration gate, re-checked at BOTH
+///    launch ([`probe_launch_admissible`]) and dispatch
+///    ([`probe_dispatch_admissible`]) — the launch-time reading is up to
+///    [`EXCHANGE_PHASE_TIMEOUT`] stale by the time a view comes back, so
+///    without the second check a probe batch could stack onto a migration
+///    that started during the collection.
 #[derive(Debug)]
 struct UnderReplicationProbe {
     /// `Some(instant)` while a collection is in flight.
@@ -751,11 +755,18 @@ impl UnderReplicationProbe {
 ///   (`Config::under_replication_repair_enabled`).
 /// * `probe_due` — [`UnderReplicationProbe::due`], which owns pacing,
 ///   single-flight and the no-progress backoff.
-/// * `active_migrations` — an in-flight migration IS the repair for the
-///   shards it moves; probing over one both wastes the query and risks
-///   stacking a repair batch on it.
-/// * `resync_inflight_len` — the drain gate ([`resync_drain_gate_open`]):
-///   never stack a pass-batch onto still-streaming resyncs.
+/// * `pipeline` — reads `(active_migrations, resync_inflight_len)`. An
+///   in-flight migration IS the repair for the shards it moves, and the drain
+///   gate ([`resync_drain_gate_open`]) refuses to stack a pass-batch onto
+///   still-streaming resyncs.
+///
+/// `pipeline` is a CLOSURE, not two values, and that is load-bearing (review
+/// round 2): reading it takes two mutexes (the migration manager and the
+/// resync in-flight set) and the event loop evaluates this gate ~10x/s
+/// forever. Eager arguments made a node with the driver DISARMED pay exactly
+/// what an armed one pays — the wrong shape for a flag whose whole purpose is
+/// to be a zero-cost rollback switch. It is called only once both cheap gates
+/// pass.
 ///
 /// A refused launch leaves the probe DUE — the caller records a skip only
 /// after the expensive membership/holdings snapshot declines — so these cheap
@@ -763,13 +774,13 @@ impl UnderReplicationProbe {
 fn probe_launch_admissible(
     repair_enabled: bool,
     probe_due: bool,
-    active_migrations: usize,
-    resync_inflight_len: usize,
+    pipeline: impl FnOnce() -> (usize, usize),
 ) -> bool {
-    repair_enabled
-        && probe_due
-        && active_migrations == 0
-        && resync_drain_gate_open(resync_inflight_len)
+    if !(repair_enabled && probe_due) {
+        return false;
+    }
+    let (active_migrations, resync_inflight_len) = pipeline();
+    active_migrations == 0 && resync_drain_gate_open(resync_inflight_len)
 }
 
 /// #95 review P2-1 — may a COLLECTED probe view be dispatched into a repair
@@ -4520,8 +4531,12 @@ impl ClusterCoordinator {
                         if probe_launch_admissible(
                             under_replication_repair_enabled_event,
                             under_replication_probe.due(std::time::Instant::now()),
-                            migration.lock().active_count(),
-                            resync_inflight.lock().len(),
+                            || {
+                                (
+                                    migration.lock().active_count(),
+                                    resync_inflight.lock().len(),
+                                )
+                            },
                         ) {
                             let committed_term = topo_authority_event.committed_term();
                             // Review P2-2 — the CHEAP member check FIRST. A
@@ -4881,6 +4896,9 @@ impl ClusterCoordinator {
                         // No peer answered (and self always reports), so this
                         // collection carries no evidence. A skip, not a
                         // result: it says nothing about repair progress.
+                        if let Some(m) = crate::metrics::migration_metrics() {
+                            m.under_replication_probe_views_dropped.inc();
+                        }
                         under_replication_probe.record_skipped(now);
                         continue;
                     }
@@ -4898,6 +4916,9 @@ impl ClusterCoordinator {
                             "cluster: under-replication probe view dropped — a \
                              migration or resync started during the collection",
                         );
+                        if let Some(m) = crate::metrics::migration_metrics() {
+                            m.under_replication_probe_views_dropped.inc();
+                        }
                         under_replication_probe.record_skipped(now);
                         continue;
                     }
@@ -8621,16 +8642,13 @@ impl ClusterCoordinator {
                                 parse_stale_epoch_report_rejection(&response.payload)
                                 && responder_key > cluster_key
                             {
-                                tracing::warn!(
-                                    peer = peer.0,
-                                    %addr,
-                                    our_key = cluster_key,
+                                report_exchange_peer_higher_key(
+                                    peer,
+                                    addr,
+                                    cluster_key,
                                     responder_key,
                                     attempts,
-                                    "cluster: exchange peer reports a HIGHER \
-                                     cluster key — this node is the stale side; \
-                                     abandoning the re-query (topology catch-up \
-                                     converges us)",
+                                    origin,
                                 );
                                 let _ = tx.send((peer, None));
                                 return;
@@ -8655,14 +8673,7 @@ impl ClusterCoordinator {
                     // window. Give up (honest absence) once a full retry
                     // interval no longer fits before the deadline.
                     if std::time::Instant::now() + EXCHANGE_PEER_RETRY_INTERVAL >= deadline {
-                        tracing::warn!(
-                            peer = peer.0,
-                            %addr,
-                            attempts,
-                            last_failure,
-                            "cluster: exchange peer ABSENT — every report \
-                             query failed within the exchange deadline",
-                        );
+                        report_exchange_peer_absent(peer, addr, attempts, &last_failure, origin);
                         let _ = tx.send((peer, None));
                         return;
                     }
@@ -10098,6 +10109,86 @@ fn exchange_peer_failure_warn_due(n: u64) -> bool {
     const WARN_FIRST: u64 = 10;
     const WARN_EVERY: u64 = 100;
     n <= WARN_FIRST || n.is_multiple_of(WARN_EVERY)
+}
+
+/// #95 re-review P2-NEW-2 — report that a peer was abandoned as ABSENT for
+/// this exchange.
+///
+/// Split by origin for the same reason the counters are (round-1 P2-3), and
+/// it matters MORE here: this site is not rate-limited, so a SWIM-alive but
+/// term-skewed peer would make every 15 s probe emit a commit-voiced warn
+/// forever on the default path — round-1's noise problem surviving in the
+/// signal operators actually grep.
+///
+/// COMMIT origin keeps the WARN: a peer that never answered inside the
+/// activation window is exactly the chronic view starvation that warn exists
+/// to surface. A probe give-up is DE-ESCALATED to DEBUG, never dropped: the
+/// probe derives from whatever answered and the next one re-collects, but an
+/// operator who turns DEBUG on must still be able to see it.
+fn report_exchange_peer_absent(
+    peer: NodeId,
+    addr: SocketAddr,
+    attempts: u32,
+    last_failure: &str,
+    origin: PartitionReportOrigin,
+) {
+    if origin == PartitionReportOrigin::Commit {
+        tracing::warn!(
+            peer = peer.0,
+            %addr,
+            attempts,
+            last_failure,
+            "cluster: exchange peer ABSENT — every report query failed within \
+             the exchange deadline",
+        );
+    } else {
+        tracing::debug!(
+            peer = peer.0,
+            %addr,
+            attempts,
+            last_failure,
+            "cluster: under-replication probe peer did not answer — the probe \
+             derives from whatever did; the next probe re-collects",
+        );
+    }
+}
+
+/// #95 re-review P2-NEW-2 — report that a peer echoed a HIGHER cluster key,
+/// so THIS node is the stale side and re-querying is pointless.
+///
+/// Same split, same reasoning as [`report_exchange_peer_absent`]: on the
+/// commit path this is the operator's signal that topology catch-up is owed;
+/// reached from a background repair probe it is routine and must not shout.
+fn report_exchange_peer_higher_key(
+    peer: NodeId,
+    addr: SocketAddr,
+    our_key: u64,
+    responder_key: u64,
+    attempts: u32,
+    origin: PartitionReportOrigin,
+) {
+    if origin == PartitionReportOrigin::Commit {
+        tracing::warn!(
+            peer = peer.0,
+            %addr,
+            our_key,
+            responder_key,
+            attempts,
+            "cluster: exchange peer reports a HIGHER cluster key — this node \
+             is the stale side; abandoning the re-query (topology catch-up \
+             converges us)",
+        );
+    } else {
+        tracing::debug!(
+            peer = peer.0,
+            %addr,
+            our_key,
+            responder_key,
+            attempts,
+            "cluster: under-replication probe peer reports a HIGHER cluster \
+             key — abandoning this peer's re-query for this probe",
+        );
+    }
 }
 
 /// W9 P2 — meter + (rate-limited) warn one discarded exchange report
@@ -25318,6 +25409,65 @@ mod tests {
         );
     }
 
+    /// #95 re-review P2-NEW-2 (RED→GREEN) — the origin split must reach the
+    /// LOGS, not just the counters.
+    ///
+    /// Two give-up sites in `run_exchange_phase`'s per-peer thread report at
+    /// WARN and are NOT rate-limited (unlike `record_exchange_peer_failure`,
+    /// which is gated by `exchange_peer_failure_warn_due`). A SWIM-alive but
+    /// term-skewed peer therefore makes EVERY probe emit a commit-voiced
+    /// `"exchange peer ABSENT"` / `"HIGHER cluster key"` warn — every 15 s,
+    /// forever, on the default path.
+    ///
+    /// That is round-1's P2-3 scenario surviving in the signal operators
+    /// actually grep. Fixing the metrics and leaving the logs fixes the
+    /// dashboard and not the incident.
+    #[test]
+    fn a_repair_probes_give_up_never_speaks_in_the_commit_paths_warn_voice() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().expect("fixture addr");
+        let peer = NodeId(9);
+
+        for (origin, must_warn) in [
+            (PartitionReportOrigin::Commit, true),
+            (PartitionReportOrigin::RepairProbe, false),
+        ] {
+            let warns = capture_tracing_lines(tracing::Level::WARN, || {
+                report_exchange_peer_absent(peer, addr, 3, "connect refused", origin);
+                report_exchange_peer_higher_key(peer, addr, 4, 7, 3, origin);
+            });
+            assert_eq!(
+                !warns.is_empty(),
+                must_warn,
+                "{origin:?}: give-up WARN emission is wrong (captured {warns:?})",
+            );
+        }
+
+        // The probe's give-ups are not silenced, only de-escalated: an
+        // operator who turns DEBUG on must still be able to see them.
+        let debugs = capture_tracing_lines(tracing::Level::DEBUG, || {
+            report_exchange_peer_absent(
+                peer,
+                addr,
+                3,
+                "connect refused",
+                PartitionReportOrigin::RepairProbe,
+            );
+            report_exchange_peer_higher_key(
+                peer,
+                addr,
+                4,
+                7,
+                3,
+                PartitionReportOrigin::RepairProbe,
+            );
+        });
+        assert_eq!(
+            debugs.len(),
+            2,
+            "a probe give-up must be DE-ESCALATED, not dropped (captured {debugs:?})",
+        );
+    }
+
     /// #95 review P1-1 (RED→GREEN) — a repair probe must NOT kick the
     /// whole-store recency scan, at either end of the wire.
     ///
@@ -25402,22 +25552,59 @@ mod tests {
     #[test]
     fn probe_launch_is_admissible_only_with_every_gate_open() {
         assert!(
-            probe_launch_admissible(true, true, 0, 0),
+            probe_launch_admissible(true, true, || (0, 0)),
             "flag on, due, no migrations, pipeline drained → launch",
         );
         assert!(
-            !probe_launch_admissible(false, true, 0, 0),
+            !probe_launch_admissible(false, true, || (0, 0)),
             "the driver flag is the operator's rollback switch",
         );
-        assert!(!probe_launch_admissible(true, false, 0, 0), "not due yet");
         assert!(
-            !probe_launch_admissible(true, true, 1, 0),
+            !probe_launch_admissible(true, false, || (0, 0)),
+            "not due yet",
+        );
+        assert!(
+            !probe_launch_admissible(true, true, || (1, 0)),
             "an in-flight migration IS the repair — never probe over it",
         );
         assert!(
-            !probe_launch_admissible(true, true, 0, 1),
+            !probe_launch_admissible(true, true, || (0, 1)),
             "an undrained resync pipeline must never get a batch stacked on it",
         );
+    }
+
+    /// #95 re-review P3 (RED→GREEN) — the pipeline state is expensive to read
+    /// (two mutex acquisitions: the migration manager and the resync in-flight
+    /// set) and the event loop evaluates this gate ~10x/s forever. A node with
+    /// the driver DISARMED, or simply not due yet, must not pay for it.
+    ///
+    /// Eager argument evaluation made the disarmed path cost exactly as much
+    /// as the armed one, which is the wrong shape for a flag whose entire
+    /// purpose is to be a zero-cost rollback switch.
+    #[test]
+    fn probe_launch_reads_the_pipeline_only_once_the_cheap_gates_pass() {
+        for (repair_enabled, probe_due) in [(false, true), (true, false), (false, false)] {
+            let read = std::cell::Cell::new(false);
+            let admitted = probe_launch_admissible(repair_enabled, probe_due, || {
+                read.set(true);
+                (0, 0)
+            });
+            assert!(!admitted);
+            assert!(
+                !read.get(),
+                "repair_enabled={repair_enabled} probe_due={probe_due}: the pipeline locks \
+                 must NOT be taken — a disarmed or not-yet-due probe pays nothing",
+            );
+        }
+
+        // ...and it IS read once both cheap gates pass, or the gate would be
+        // vacuous in the direction that matters.
+        let read = std::cell::Cell::new(false);
+        assert!(probe_launch_admissible(true, true, || {
+            read.set(true);
+            (0, 0)
+        }));
+        assert!(read.get(), "an armed, due probe must consult the pipeline");
     }
 
     /// #95 review P2-1 (RED→GREEN) — TOCTOU. The launch gates are checked up
@@ -48508,45 +48695,66 @@ mod tests {
         let garbled_before = exchange_peer_failure_garbled_total();
         let probe_before = under_replication_probe_peer_failures_total();
 
-        for kind in [
-            ExchangePeerFailureKind::Connect,
-            ExchangePeerFailureKind::Status,
-            ExchangePeerFailureKind::Transport,
-            ExchangePeerFailureKind::Garbled,
-        ] {
-            record_exchange_peer_failure(
-                peer,
-                addr,
-                kind,
-                "probe query failed",
-                PartitionReportOrigin::RepairProbe,
-            );
+        // Re-review P3 — AMPLIFY. The four commit counters are process-global
+        // and sibling tests drive them through real sockets, so an exact
+        // negative assertion is not sound. Driving each kind REPS times
+        // instead makes a leak of any single kind add exactly REPS to that
+        // counter, which no incidental socket failure in this window comes
+        // near; the earlier `< before + 4` bound tolerated a 3-count leak.
+        const REPS: u64 = 50;
+        for _ in 0..REPS {
+            for kind in [
+                ExchangePeerFailureKind::Connect,
+                ExchangePeerFailureKind::Status,
+                ExchangePeerFailureKind::Transport,
+                ExchangePeerFailureKind::Garbled,
+            ] {
+                record_exchange_peer_failure(
+                    peer,
+                    addr,
+                    kind,
+                    "probe query failed",
+                    PartitionReportOrigin::RepairProbe,
+                );
+            }
         }
 
         assert_eq!(
             under_replication_probe_peer_failures_total(),
-            probe_before + 4,
-            "every probe-origin failure must be counted — on its OWN counter",
+            probe_before + REPS * 4,
+            "every probe-origin failure must be counted — on its OWN counter. \
+             A routing regression shows up HERE first: failures sent to the \
+             commit counters would leave this one flat.",
         );
-        // The commit counters are process-global and other tests drive them
-        // through real sockets, so assert they did not move BY OUR FOUR rather
-        // than that they did not move at all.
-        assert!(
-            exchange_peer_failure_connect_total() < connect_before + 4,
-            "a probe failure must not land on the commit connect counter",
-        );
-        assert!(
-            exchange_peer_failure_status_total() < status_before + 4,
-            "a probe failure must not land on the commit status counter",
-        );
-        assert!(
-            exchange_peer_failure_transport_total() < transport_before + 4,
-            "a probe failure must not land on the commit transport counter",
-        );
-        assert!(
-            exchange_peer_failure_garbled_total() < garbled_before + 4,
-            "a probe failure must not land on the commit garbled counter",
-        );
+        for (name, now, before) in [
+            (
+                "connect",
+                exchange_peer_failure_connect_total(),
+                connect_before,
+            ),
+            (
+                "status",
+                exchange_peer_failure_status_total(),
+                status_before,
+            ),
+            (
+                "transport",
+                exchange_peer_failure_transport_total(),
+                transport_before,
+            ),
+            (
+                "garbled",
+                exchange_peer_failure_garbled_total(),
+                garbled_before,
+            ),
+        ] {
+            assert!(
+                now < before + REPS,
+                "a probe failure must not land on the commit {name} counter \
+                 (moved {} while our {REPS} probe-origin {name} failures ran)",
+                now - before,
+            );
+        }
     }
 
     // ── Phase I: cluster startup readiness ───────────────────────────────

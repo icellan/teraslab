@@ -1426,6 +1426,18 @@ pub struct MigrationMetrics {
     /// undrained resync pipeline, a single-member cluster, or a no-progress
     /// backoff that has saturated.
     pub under_replication_probes: PaddedCounter,
+    /// #95 re-review P3 — probe views COLLECTED but never dispatched into a
+    /// repair pass: the collection came back empty (no peer answered), or the
+    /// drain/no-active-migration gate closed during it (review P2-1's TOCTOU
+    /// re-check).
+    ///
+    /// Read against `under_replication_probes_total`. Climbing in lockstep
+    /// with it means every probe is paying its query and throwing the answer
+    /// away — a driver that looks alive in `..._probes_total` while repairing
+    /// nothing. Correlate with
+    /// `teraslab_under_replication_probe_peer_failures_total` to tell "nobody
+    /// answered" from "the pipeline is permanently busy".
+    pub under_replication_probe_views_dropped: PaddedCounter,
     /// #95 — `(replica, shard)` pairs an under-replication pass classified as
     /// under-replicated: the shard is mastered here, holds records, passed
     /// the freshness fence, and a committed replica reports no data for it.
@@ -1716,6 +1728,7 @@ impl MigrationMetrics {
             under_replication_event_repairs: PaddedCounter::new(),
             under_replication_exchange_repairs: PaddedCounter::new(),
             under_replication_probes: PaddedCounter::new(),
+            under_replication_probe_views_dropped: PaddedCounter::new(),
             under_replication_shards_seen: PaddedCounter::new(),
             under_replication_fills_driven: PaddedCounter::new(),
             under_replication_fills_refused: PaddedCounter::new(),

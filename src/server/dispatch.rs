@@ -14341,10 +14341,17 @@ fn handle_partition_version_report(
     // Reject mismatched cluster_key — a stale coordinator must not influence
     // this node's view of the partition map.
     // F-G5-009: use le_u64_at instead of the silently-substituted-zero
-    // try_into-unwrap_or pattern that previously parsed a truncated
-    // payload as cluster_key = 0. The preceding length check makes the
-    // path unreachable today but the pattern was inconsistent with the
-    // rest of the dispatcher's helpers.
+    // try_into-unwrap_or pattern that previously parsed a truncated payload
+    // as cluster_key = 0.
+    //
+    // #95 re-review — an earlier version of this comment claimed "the
+    // preceding length check makes the path unreachable". There is NO length
+    // gate anywhere on this path: `le_u64_at`'s own bounds check is the only
+    // thing standing between a short payload and a wrong cluster_key. That
+    // mattered more once the request grew an optional trailing origin byte
+    // (see `PartitionReportOrigin`) and the payload became variable-length:
+    // this handler must tolerate 8 bytes, 9 bytes, and anything longer, and
+    // reject shorter.
     let Some(request_cluster_key) = le_u64_at(&req.payload, 0) else {
         return error_response(
             req.request_id,
