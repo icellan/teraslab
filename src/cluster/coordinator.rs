@@ -2371,6 +2371,19 @@ fn complete_migration_task_current_epoch_with_midpoint(
     {
         let mut mgr = migration.lock();
         mgr.mark_complete(task);
+        // W15 review P2-1 — this completion was VERIFIED by the target (the
+        // count+manifest handshake passed before either caller reaches here),
+        // so any ABORT recorded against this same target is now obsolete
+        // evidence: the target has just confirmed it holds what we streamed.
+        // Retire it INDEPENDENTLY of `commit`, because the case that matters is
+        // exactly the non-committing one. `should_commit` is
+        // `is_master || target_assignment names from_node`, so a replica push
+        // from a node the new table makes a NON-OWNER has `commit == false` and
+        // never reaches the recorder below — leaving the veto standing until
+        // the epoch advanced. That is real over-replication on the shape the
+        // veto bites on. Clearing never manufactures evidence and never erases
+        // a `Committed` record.
+        mgr.clear_handoff_abort(task.shard, task.to_node);
         if commit {
             // Data-loss guard (task #28): the master move was just committed
             // to the shard table, so the new owner is now authoritative and
@@ -31593,6 +31606,247 @@ mod tests {
             0,
             "shard {control_shard}: a clean committed handoff with no abort must \
              still be reclaimed — the veto must not disable orphan cleanup",
+        );
+    }
+
+    /// A fixture for the W15 review tests: a shard node1 physically holds but
+    /// no longer owns at the new epoch, with the shard table already advanced.
+    /// Returns `(shard, engine, shard_table, migration, fenced, migrating,
+    /// epoch)`.
+    #[allow(clippy::type_complexity)]
+    fn w15_shed_fixture(
+        salt: u8,
+    ) -> (
+        u16,
+        Arc<Engine>,
+        Arc<ShardTableLock<ShardTable>>,
+        Arc<Mutex<MigrationManager>>,
+        Arc<crate::cluster::migration::AtomicShardBitmap>,
+        Arc<crate::cluster::migration::AtomicShardBitmap>,
+        u64,
+    ) {
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let shard = shard_node1_lost(&old_table, &new_table);
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(shard, salt));
+        let epoch = new_table.version;
+        (
+            shard,
+            engine,
+            Arc::new(ShardTableLock::new(new_table)),
+            Arc::new(Mutex::new(MigrationManager::new())),
+            Arc::new(crate::cluster::migration::AtomicShardBitmap::new()),
+            Arc::new(crate::cluster::migration::AtomicShardBitmap::new()),
+            epoch,
+        )
+    }
+
+    /// W15 review P2-1 — a VERIFIED completion must retire that target's abort
+    /// veto even though it does not COMMIT, or the veto has no escape on
+    /// exactly the shape it bites.
+    ///
+    /// `should_commit` (coordinator.rs, both batch call sites) is
+    /// `task.is_master || target_assignment.master == task.from_node ||
+    /// replicas.contains(&task.from_node)`. For a replica push from a node the
+    /// new table makes a NON-OWNER — the scenario-05 shape — every leg is
+    /// false, so a fully successful re-drive completes with `commit == false`
+    /// and never reaches `record_committed_handoff`. The abort would then
+    /// stand until the epoch advanced: real, unbounded over-replication that
+    /// would show up in the `holders=[Y,Y,Y]` census assertions.
+    ///
+    /// This test asserts the non-commit shape explicitly, so it cannot pass by
+    /// accidentally taking the committing path.
+    #[test]
+    fn verified_noncommitting_completion_retires_the_targets_abort_veto() {
+        let (shard, engine, shard_table, migration, fenced, migrating, epoch) =
+            w15_shed_fixture(81);
+
+        // The master handoff to node2 commits — the #28 evidence.
+        let master = make_outbound_master_task(shard, NodeId(1), NodeId(2));
+        migration.lock().start_outbound(
+            std::slice::from_ref(&master),
+            NodeId(1),
+            &std::collections::HashSet::from([shard]),
+        );
+        assert!(complete_migration_task_current_epoch(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &master,
+            epoch,
+            true,
+        ));
+
+        // The replica push to node3 terminally aborts — the veto.
+        let replica = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: false,
+        };
+        migration.lock().start_outbound(
+            std::slice::from_ref(&replica),
+            NodeId(1),
+            &std::collections::HashSet::from([shard]),
+        );
+        assert!(terminally_abort_unshippable_task(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &replica,
+            epoch,
+        ));
+        cleanup_orphaned_shard_if_settled(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            shard,
+            epoch,
+        );
+        assert_eq!(
+            engine.shard_record_count(shard),
+            1,
+            "precondition: the abort veto is standing and the shed is blocked",
+        );
+
+        // The push is re-driven and the target VERIFIES it. Pin that this is
+        // genuinely the NON-COMMITTING shape before relying on it.
+        let should_commit = {
+            let table = shard_table.read();
+            let target = table.target_assignment(shard);
+            replica.is_master
+                || target.master == replica.from_node
+                || target.replicas.contains(&replica.from_node)
+        };
+        assert!(
+            !should_commit,
+            "the fixture must exercise the non-committing replica push — \
+             otherwise `record_committed_handoff` would clear the veto and the \
+             test proves nothing",
+        );
+        migration.lock().start_outbound(
+            std::slice::from_ref(&replica),
+            NodeId(1),
+            &std::collections::HashSet::from([shard]),
+        );
+        assert!(complete_migration_task_current_epoch(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &replica,
+            epoch,
+            should_commit,
+        ));
+
+        cleanup_orphaned_shard_if_settled(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            shard,
+            epoch,
+        );
+        assert_eq!(
+            engine.shard_record_count(shard),
+            0,
+            "a verified completion retires the veto, so the sibling committed \
+             handoff authorizes the shed again — without this the shard is \
+             retained until the epoch advances",
+        );
+    }
+
+    /// W15 review P1-1, end to end — the scenario-05 chain ONE STEP OVER.
+    ///
+    /// Master handoff S:n1→n2 commits. The replica push S:n1→n3 fails
+    /// ORDINARILY (connection reset / budget exhausted / abandoned-batch park),
+    /// leaving a `Failed` entry — which is the only thing blocking the shed,
+    /// because the sibling commit already satisfies the #28 evidence check.
+    /// The event loop's periodic `cleanup_completed()` then reaps that entry,
+    /// and the steady-state sweep deletes every local record of S. Loss iff
+    /// n2's manifest did not cover them, which is precisely the scenario-05
+    /// condition.
+    #[test]
+    fn reaping_an_ordinary_failure_does_not_leave_a_sibling_commit_authorizing_the_shed() {
+        let (shard, engine, shard_table, migration, fenced, migrating, epoch) =
+            w15_shed_fixture(82);
+
+        let master = make_outbound_master_task(shard, NodeId(1), NodeId(2));
+        migration.lock().start_outbound(
+            std::slice::from_ref(&master),
+            NodeId(1),
+            &std::collections::HashSet::from([shard]),
+        );
+        assert!(complete_migration_task_current_epoch(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &master,
+            epoch,
+            true,
+        ));
+
+        // An ORDINARY replica-push failure: the table is left untouched
+        // (`FailedTaskTableAction::None`, the replica-role disposition) and the
+        // tracking entry parks as `Failed`.
+        let replica = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: false,
+        };
+        migration.lock().start_outbound(
+            std::slice::from_ref(&replica),
+            NodeId(1),
+            &std::collections::HashSet::from([shard]),
+        );
+        assert!(fail_migration_task_current_epoch(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &replica,
+            epoch,
+            FailedTaskTableAction::None,
+        ));
+        assert!(
+            migration.lock().has_committed_handoff(shard, epoch),
+            "precondition: the sibling commit satisfies the #28 check — the \
+             Failed entry is the ONLY thing standing between the sweep and the \
+             records",
+        );
+
+        run_orphan_cleanup(NodeId(1), &engine, &shard_table, &migration, epoch, None);
+        assert_eq!(
+            engine.shard_record_count(shard),
+            1,
+            "precondition: the Failed entry blocks the sweep",
+        );
+
+        // The event loop's periodic prune reaps it.
+        migration.lock().cleanup_completed();
+        assert!(
+            !migration
+                .lock()
+                .active_migrations()
+                .iter()
+                .any(|p| p.shard == shard),
+            "precondition: the prune really reaped the entry, removing the block",
+        );
+
+        run_orphan_cleanup(NodeId(1), &engine, &shard_table, &migration, epoch, None);
+        assert_eq!(
+            engine.shard_record_count(shard),
+            1,
+            "the reap removed the block, so it must have removed the evidence \
+             with it — otherwise the sweep deletes records the failed push was \
+             still trying to deliver",
         );
     }
 
