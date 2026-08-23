@@ -1565,19 +1565,42 @@ pub struct ServerConfig {
     /// # The risk, stated plainly
     ///
     /// A default node now puts a read-only `OP_PARTITION_VERSION_REPORT`
-    /// query on the wire every 15 s per peer while it masters non-empty
-    /// shards, and can dispatch up to 128 full-shard resync backfills per
-    /// probe that it previously never dispatched. Those runs hold
-    /// `active_count() > 0` — which blocks reactivation — and compete with
-    /// client traffic for migration threads (capped at 8 connections for
-    /// resync-origin runs). Bounds: single-flight probes, the drain and
-    /// no-active-migration gates (so a repair batch can never stack on a
-    /// streaming one), the per-pass cap, and a no-progress backoff to a
-    /// 120 s cadence. All of it is visible in
+    /// query on the wire every 15 s per ALIVE COMMITTED PEER while it masters
+    /// non-empty shards, and can dispatch up to 128 full-shard resync
+    /// backfills per probe that it previously never dispatched. Those runs
+    /// hold `active_count() > 0` — which blocks reactivation — and compete
+    /// with client traffic for migration threads (capped at 8 connections for
+    /// resync-origin runs).
+    ///
+    /// The probe query itself is deliberately CHEAP, and keeping it that way
+    /// took work (review P1-1). Answering a partition-version report normally
+    /// kicks an off-thread whole-store recency refresh — a full index walk
+    /// plus per-key device reads, braked only by a 5 s floor — at BOTH ends.
+    /// Making that periodic would have turned an event-driven scan into a
+    /// continuous one on every node (each kicking its own AND receiving one
+    /// per peer probe), which `crate::ops::recency` already classifies as a
+    /// defect. A repair-probe query therefore carries an origin tag and
+    /// neither end refreshes: the derive reads `last_applied_seq` and the
+    /// inbound flag and no recency field at all. If that tag is ever dropped,
+    /// this flag's cost changes by orders of magnitude.
+    ///
+    /// Bounds: single-flight probes with a watchdog release, the drain and
+    /// no-active-migration gates re-checked at BOTH launch and dispatch (so a
+    /// repair batch can never stack on a migration that started during the
+    /// collection), the per-pass cap, and a no-progress backoff to a 120 s
+    /// cadence. All of it is visible in
     /// `teraslab_under_replication_probes_total`,
     /// `..._exchange_repairs_total`, `..._shards_seen_total`,
-    /// `..._fills_driven_total`, `..._fills_refused_total` and
-    /// `..._shards_fenced_total`.
+    /// `..._fills_driven_total`, `..._fills_refused_total`,
+    /// `..._shards_fenced_total` and
+    /// `teraslab_under_replication_probe_peer_failures_total` (kept separate
+    /// from the commit path's `exchange_peer_failure_*` health counters so a
+    /// background repair cannot make activation look like it is starving).
+    ///
+    /// The E2E harness can disarm this without an image rebuild:
+    /// `TERASLAB_DOCKER_UNDER_REPLICATION_REPAIR=0` (nightly input
+    /// `disarm_repair`), and every generated node config states which way the
+    /// run measured.
     ///
     /// Turning it OFF restores the pre-#95 disposition EXACTLY: no probe
     /// runs, and the exchange arm self-gates on

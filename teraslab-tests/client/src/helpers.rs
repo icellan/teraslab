@@ -87,6 +87,13 @@ fn docker_migration_batch_size_from_env() -> Result<usize, ClientError> {
 const ENV_DOCKER_COMMITTED_ELECTION: &str = "TERASLAB_DOCKER_COMMITTED_ELECTION";
 const ENV_DOCKER_UNDER_REPLICATION_SWEEP: &str = "TERASLAB_DOCKER_UNDER_REPLICATION_SWEEP";
 
+// #95 review P2-5 — the holder-driven under-replication repair driver.
+// Unlike the two above this ships ARMED, so this knob is a DISARM switch:
+// unset means the shipped default (on), and `0`/`false` turns it off. A run
+// investigating whether the driver is implicated can now isolate it without
+// rebuilding the image, and the generated TOML always states which way it ran.
+const ENV_DOCKER_UNDER_REPLICATION_REPAIR: &str = "TERASLAB_DOCKER_UNDER_REPLICATION_REPAIR";
+
 fn parse_docker_arming_flag(env_name: &str, raw: &str) -> Result<bool, String> {
     match raw.trim() {
         "" | "0" | "false" => Ok(false),
@@ -95,6 +102,30 @@ fn parse_docker_arming_flag(env_name: &str, raw: &str) -> Result<bool, String> {
             "{env_name} must be one of 1/true/0/false, got {other:?}"
         )),
     }
+}
+
+/// #95 review P2-5 — parse a DISARM knob for a flag that ships ON.
+///
+/// Mirrors [`parse_docker_arming_flag`]'s spellings and its
+/// reject-typos-loudly posture, but defaults the OTHER way: unset (or blank)
+/// means "leave the shipped default alone", which for
+/// `under_replication_repair_enabled` is `true`. A typo must still fail the
+/// run rather than silently measure the opposite configuration from the one
+/// the operator asked for.
+fn parse_docker_disarm_flag(env_name: &str, raw: &str) -> Result<bool, String> {
+    match raw.trim() {
+        "" => Ok(true),
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        other => Err(format!(
+            "{env_name} must be one of 1/true/0/false, got {other:?}"
+        )),
+    }
+}
+
+fn docker_disarm_flag_from_env(env_name: &str) -> Result<bool, ClientError> {
+    let raw = std::env::var(env_name).unwrap_or_default();
+    parse_docker_disarm_flag(env_name, &raw).map_err(ClientError::Connection)
 }
 
 fn docker_arming_flag_from_env(env_name: &str) -> Result<bool, ClientError> {
@@ -150,6 +181,7 @@ fn render_node_config(
     swim_suspicion_timeout_ms: u32,
     committed_master_election_enabled: bool,
     under_replication_sweep_enabled: bool,
+    under_replication_repair_enabled: bool,
 ) -> String {
     format!(
         r#"node_id = {node_id}
@@ -216,6 +248,12 @@ admin_token = "{admin_token}"
 # which path — armed or default — the run actually measured.
 committed_master_election_enabled = {committed_master_election_enabled}
 under_replication_sweep_enabled = {under_replication_sweep_enabled}
+# #95 — the holder-driven under-replication repair driver. This one ships
+# ARMED, so TERASLAB_DOCKER_UNDER_REPLICATION_REPAIR is a DISARM knob
+# (unset = on). Pinned explicitly for the same reason as the two above: a
+# generated config must state which way the run measured, and a run that
+# suspects the driver must be able to isolate it without a rebuild.
+under_replication_repair_enabled = {under_replication_repair_enabled}
 "#,
         admin_token = DOCKER_TEST_ADMIN_TOKEN,
         max_connections_per_ip = DOCKER_MAX_CONNECTIONS_PER_IP,
@@ -496,6 +534,8 @@ services:
             docker_arming_flag_from_env(ENV_DOCKER_COMMITTED_ELECTION)?;
         let under_replication_sweep_enabled =
             docker_arming_flag_from_env(ENV_DOCKER_UNDER_REPLICATION_SWEEP)?;
+        let under_replication_repair_enabled =
+            docker_disarm_flag_from_env(ENV_DOCKER_UNDER_REPLICATION_REPAIR)?;
         let (swim_probe_interval_ms, swim_suspicion_timeout_ms) =
             swim_timing_for_scenario(self.scenario_id);
 
@@ -520,6 +560,7 @@ services:
                 swim_suspicion_timeout_ms,
                 committed_master_election_enabled,
                 under_replication_sweep_enabled,
+                under_replication_repair_enabled,
             );
 
             let path = format!("{config_dir}/ts{:02}-node{n}.toml", self.scenario_id);
@@ -1102,6 +1143,25 @@ mod tests {
         assert!(!parse_docker_arming_flag(ENV_DOCKER_UNDER_REPLICATION_SWEEP, "   ").unwrap());
     }
 
+    /// #95 review P2-5 — the DISARM knob defaults the other way: unset means
+    /// the shipped default (ON). Typos must still fail the run loudly rather
+    /// than silently measure the opposite configuration.
+    #[test]
+    fn docker_disarm_flag_parse_defaults_on_and_rejects_typos() {
+        assert!(parse_docker_disarm_flag(ENV_DOCKER_UNDER_REPLICATION_REPAIR, "").unwrap());
+        assert!(parse_docker_disarm_flag(ENV_DOCKER_UNDER_REPLICATION_REPAIR, "   ").unwrap());
+        assert!(parse_docker_disarm_flag(ENV_DOCKER_UNDER_REPLICATION_REPAIR, "1").unwrap());
+        assert!(parse_docker_disarm_flag(ENV_DOCKER_UNDER_REPLICATION_REPAIR, "true").unwrap());
+        assert!(!parse_docker_disarm_flag(ENV_DOCKER_UNDER_REPLICATION_REPAIR, "0").unwrap());
+        assert!(!parse_docker_disarm_flag(ENV_DOCKER_UNDER_REPLICATION_REPAIR, "false").unwrap());
+        let err =
+            parse_docker_disarm_flag(ENV_DOCKER_UNDER_REPLICATION_REPAIR, "disarmed").unwrap_err();
+        assert!(
+            err.contains(ENV_DOCKER_UNDER_REPLICATION_REPAIR),
+            "err was: {err}",
+        );
+    }
+
     #[test]
     fn docker_arming_flag_parse_accepts_truthy_and_falsy_spellings() {
         assert!(parse_docker_arming_flag(ENV_DOCKER_COMMITTED_ELECTION, "1").unwrap());
@@ -1135,6 +1195,7 @@ mod tests {
             1000,
             false,
             false,
+            true,
         );
 
         assert!(config.contains("node_id = 2"));
@@ -1166,6 +1227,7 @@ mod tests {
             5000,
             false,
             false,
+            false,
         );
         assert!(
             disarmed.contains("committed_master_election_enabled = false"),
@@ -1174,6 +1236,20 @@ mod tests {
         assert!(
             disarmed.contains("under_replication_sweep_enabled = false"),
             "disarmed render must pin the sweep OFF explicitly",
+        );
+        // #95 review P2-5 — the repair driver ships ARMED, so the harness
+        // needs a way to turn it OFF; a run that suspects it must be able to
+        // isolate it without rebuilding the image.
+        assert!(
+            disarmed.contains("under_replication_repair_enabled = false"),
+            "the harness must be able to DISARM the under-replication repair \
+             driver, and say so in the generated config",
+        );
+        let disarmed_cfg: ServerConfig = toml::from_str(&disarmed)
+            .expect("disarmed docker node config must be a valid ServerConfig TOML payload");
+        assert!(
+            !disarmed_cfg.under_replication_repair_enabled,
+            "the disarm knob must actually reach ServerConfig",
         );
 
         let armed = render_node_config(
@@ -1186,6 +1262,7 @@ mod tests {
             5000,
             true,
             true,
+            true,
         );
         let cfg: ServerConfig = toml::from_str(&armed)
             .expect("armed docker node config must be a valid ServerConfig TOML payload");
@@ -1196,6 +1273,10 @@ mod tests {
         assert!(
             cfg.under_replication_sweep_enabled,
             "armed render must flip under_replication_sweep_enabled on",
+        );
+        assert!(
+            cfg.under_replication_repair_enabled,
+            "the repair driver stays armed in the armed render",
         );
         cfg.validate_safe_defaults()
             .expect("armed docker node config must still pass safe-defaults validation");
@@ -1244,6 +1325,7 @@ mod tests {
             5000,
             false,
             false,
+            true,
         );
         let cfg: ServerConfig = toml::from_str(&rendered)
             .expect("rendered docker node config must be a valid ServerConfig TOML payload");
@@ -1342,6 +1424,7 @@ mod tests {
             1000,
             false,
             false,
+            true,
         );
         let cfg: ServerConfig = toml::from_str(&rendered)
             .expect("rendered docker node config must be a valid ServerConfig TOML payload");
