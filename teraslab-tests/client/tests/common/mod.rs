@@ -72,6 +72,37 @@ async fn poll_json(url: &str) -> Result<serde_json::Value, ClientError> {
         .map_err(|e| ClientError::Connection(format!("GET {url} JSON parse failed: {e}")))
 }
 
+/// Fetch a plain-text endpoint (`/metrics` is Prometheus text, not JSON) with
+/// the same bounded, admin-authenticated client [`poll_json`] uses.
+///
+/// An empty body is reported as an error rather than as a successful scrape:
+/// a 0-byte metrics file is indistinguishable from a scrape that never ran,
+/// and that ambiguity has already burned one nightly's worth of archived
+/// metrics (see the port-mapping note in `teraslab-tests/scripts/collect_logs.sh`).
+async fn poll_text(url: &str) -> Result<String, ClientError> {
+    let resp = poll_http_client()
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| ClientError::Connection(format!("GET {url} failed: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(ClientError::Connection(format!(
+            "GET {url} returned status {}",
+            resp.status()
+        )));
+    }
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| ClientError::Connection(format!("GET {url} body read failed: {e}")))?;
+    if body.is_empty() {
+        return Err(ClientError::Connection(format!(
+            "GET {url} returned an empty body"
+        )));
+    }
+    Ok(body)
+}
+
 /// Create a DockerHelpers for 3-node cluster with a specific scenario ID.
 pub fn docker_3node(scenario_id: u16) -> DockerHelpers {
     DockerHelpers::new(&compose_dir(), scenario_id, 3)
@@ -529,6 +560,16 @@ pub fn in_flight_inbound_pending(json: &serde_json::Value) -> u64 {
 }
 
 /// Wait until migrations complete on specific nodes (by node number).
+///
+/// Used when some node is deliberately absent (killed, restarting, being
+/// removed) and therefore cannot be polled. The polled nodes must still
+/// cover all 4096 master shards between them — a shard left to the absent
+/// node is exactly the non-convergence this gate exists to catch.
+///
+/// On timeout the error carries the same master-census dump as
+/// [`wait_migrations_complete`] (see [`master_divergence_block`]), so a
+/// divergent sum names the offending shards and their claimants instead of
+/// reporting only `masters=N/4096`.
 pub async fn wait_specific_migrations_complete(
     docker: &DockerHelpers,
     node_nums: &[u32],
@@ -609,8 +650,24 @@ pub async fn wait_specific_migrations_complete(
         }
         ready_polls = 0;
         if start.elapsed() >= timeout {
+            // W15 — the specific-nodes gate gets the SAME master-census dump
+            // as `wait_migrations_complete`. It did not have one, which is
+            // why a 4103/4096 excess could name its seven overlapping shards
+            // while a 4094/4096 deficit through this gate could only report
+            // the sum. Only the polled nodes contribute claims, so
+            // `master_divergence_block` names the polled set alongside the
+            // orphan list.
+            let overlap_detail = if total_masters != 4096 {
+                let (per_node, unfetched) = fetch_master_sets(docker, node_nums).await;
+                format!(
+                    " [{}]",
+                    master_divergence_block(&per_node, &unfetched, node_nums)
+                )
+            } else {
+                String::new()
+            };
             return Err(ClientError::Connection(format!(
-                "migrations still active on specific nodes after {timeout:?} [masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}] [{}]",
+                "migrations still active on specific nodes after {timeout:?} [masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}] [{}]{overlap_detail}",
                 status_details.join(", ")
             )));
         }
@@ -875,6 +932,123 @@ pub fn master_overlap_diagnostic(per_node: &[(u32, Vec<u16>)], unfetched: &[u32]
 /// Cap on the shard IDs [`master_overlap_diagnostic`] prints per list.
 pub const MASTER_OVERLAP_DIAGNOSTIC_CAP: usize = 20;
 
+/// W15 — the complete master-census block a convergence gate stamps onto its
+/// timeout error: the DIRECTION of the divergence, its magnitude, the polled
+/// set that defines the census, and the shard-level detail from
+/// [`master_overlap_diagnostic`].
+///
+/// The direction is the part that was missing. Both convergence gates report
+/// a bare `masters=N/4096` sum, and the two ways that sum goes wrong have
+/// opposite causes and opposite repairs:
+///
+/// * **EXCESS** (`4103/4096`) — shards claimed by two nodes at once. The
+///   shard IDs come with their claimant nodes, so the pair is named.
+/// * **DEFICIT** (`4094/4096`) — shards claimed by NOBODY in the polled set.
+///   Named just as explicitly here (`orphaned=2 [7, 1234]`), because reading
+///   a deficit off a sum alone tells you only that two shards are missing,
+///   not which — that asymmetry is exactly what made one CI triage cost an
+///   afternoon while the excess case named its seven shards immediately.
+/// * **BALANCED-BUT-DIVERGENT** — a surplus that exactly cancels a shortfall
+///   sums to 4096 and slips through the gate's sum check entirely. It is
+///   still a divergent table, so it is never rendered as a bare "0".
+///
+/// `polled` is named because it defines what "nobody" means: only the polled
+/// nodes contribute claims, so a shard mastered by an unpolled node (killed,
+/// restarting, deliberately excluded from a specific-nodes gate) is counted
+/// as orphaned here. That is precisely what the gate means by "not
+/// converged" — the polled survivors must cover all 4096 — but it must not
+/// be misread as "no node anywhere masters this shard". `unfetched` names
+/// polled nodes that failed to answer, whose claims inflate the orphan count
+/// the same way.
+pub fn master_divergence_block(
+    per_node: &[(u32, Vec<u16>)],
+    unfetched: &[u32],
+    polled: &[u32],
+) -> String {
+    const NUM_SHARDS: usize = 4096;
+    let node_list = |nodes: &[u32]| {
+        nodes
+            .iter()
+            .map(|n| format!("n{n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let polled_suffix = format!("polled=[{}]", node_list(polled));
+    if per_node.is_empty() {
+        // No claims at all is a statement about the POLL, not the cluster:
+        // rendering it as 4096 orphans would fabricate a total-orphaning
+        // wedge out of an HTTP failure.
+        return format!(
+            "master sets unavailable: {polled_suffix}, unfetched=[{}]",
+            node_list(unfetched)
+        );
+    }
+    let mut claim_count = vec![0u32; NUM_SHARDS];
+    for (_, shards) in per_node {
+        for &s in shards {
+            if let Some(c) = claim_count.get_mut(s as usize) {
+                *c += 1;
+            }
+        }
+    }
+    let total_claims: i64 = claim_count.iter().map(|&c| i64::from(c)).sum();
+    let orphaned = claim_count.iter().filter(|&&c| c == 0).count();
+    let overlapping = claim_count.iter().filter(|&&c| c >= 2).count();
+    let net = total_claims - NUM_SHARDS as i64;
+    let verdict = if net > 0 {
+        format!("MASTER CENSUS EXCESS: {net} claim(s) over {NUM_SHARDS}")
+    } else if net < 0 {
+        format!(
+            "MASTER CENSUS DEFICIT: {} shard(s) mastered by none of the polled nodes",
+            -net
+        )
+    } else if orphaned > 0 || overlapping > 0 {
+        format!(
+            "MASTER CENSUS BALANCED-BUT-DIVERGENT: {overlapping} surplus claim(s) exactly \
+             cancel {orphaned} orphan(s), so the sum reads {NUM_SHARDS} while the table is \
+             still split"
+        )
+    } else {
+        format!("MASTER CENSUS SETTLED: every one of {NUM_SHARDS} shards claimed exactly once")
+    };
+    format!(
+        "{verdict}; {polled_suffix}; {}",
+        master_overlap_diagnostic(per_node, unfetched)
+    )
+}
+
+/// Fetch each node's EFFECTIVE mastered shard IDs via
+/// `/status?master_shards=1`, for [`master_divergence_block`].
+///
+/// Returns `(per_node, unfetched)`: nodes that did not answer (or answered a
+/// DEGRADED payload, which omits the field) land in `unfetched` rather than
+/// contributing an empty claim set, so the caller can keep the resulting
+/// orphan inflation honest.
+async fn fetch_master_sets(
+    docker: &DockerHelpers,
+    nodes: &[u32],
+) -> (Vec<(u32, Vec<u16>)>, Vec<u32>) {
+    let mut per_node: Vec<(u32, Vec<u16>)> = Vec::new();
+    let mut unfetched: Vec<u32> = Vec::new();
+    for &i in nodes {
+        let port = docker.http_port(i);
+        let url = format!("http://127.0.0.1:{port}/status?master_shards=1");
+        if let Ok(json) = poll_json(&url).await
+            && let Some(list) = json["master_shards"].as_array()
+        {
+            let shards: Vec<u16> = list
+                .iter()
+                .filter_map(|v| v.as_u64())
+                .filter_map(|v| u16::try_from(v).ok())
+                .collect();
+            per_node.push((i, shards));
+        } else {
+            unfetched.push(i);
+        }
+    }
+    (per_node, unfetched)
+}
+
 /// Wait until all active migrations complete on all nodes.
 ///
 /// Also waits for shard master counts to sum to 4096 (all shards assigned)
@@ -1060,33 +1234,12 @@ pub async fn wait_migrations_complete(
             // EFFECTIVE mastered shard IDs and NAME the divergent shards, so
             // the next "4464/4096" comes with a shard list instead of a sum.
             let overlap_detail = if total_masters != 4096 {
-                let mut per_node: Vec<(u32, Vec<u16>)> = Vec::new();
-                let mut unfetched: Vec<u32> = Vec::new();
-                for i in 1..=node_count {
-                    let port = docker.http_port(i);
-                    let url = format!("http://127.0.0.1:{port}/status?master_shards=1");
-                    if let Ok(json) = poll_json(&url).await
-                        && let Some(list) = json["master_shards"].as_array()
-                    {
-                        let shards: Vec<u16> = list
-                            .iter()
-                            .filter_map(|v| v.as_u64())
-                            .filter_map(|v| u16::try_from(v).ok())
-                            .collect();
-                        per_node.push((i, shards));
-                    } else {
-                        unfetched.push(i);
-                    }
-                }
-                if per_node.is_empty() {
-                    let names: Vec<String> = unfetched.iter().map(|n| format!("n{n}")).collect();
-                    format!(
-                        " [master sets unavailable: unfetched=[{}]]",
-                        names.join(", ")
-                    )
-                } else {
-                    format!(" [{}]", master_overlap_diagnostic(&per_node, &unfetched))
-                }
+                let polled: Vec<u32> = (1..=node_count).collect();
+                let (per_node, unfetched) = fetch_master_sets(docker, &polled).await;
+                format!(
+                    " [{}]",
+                    master_divergence_block(&per_node, &unfetched, &polled)
+                )
             } else {
                 String::new()
             };
@@ -2492,6 +2645,16 @@ pub async fn teardown_all(scenario_id: u16) {
 /// when the variable is unset (e.g. direct `cargo test` runs). The
 /// harness-side collect_logs.sh cannot do this: the in-test teardown on the
 /// failure path removes the containers before it runs.
+///
+/// Captures, per node: container logs, `/status`, `/admin/migration_status`
+/// and the `/metrics` scrape as `nodeN_final_metrics.txt` — the same file
+/// name collect_logs.sh writes, so the CI artifact glob picks up either
+/// path's copy. The metrics were the gap: a scenario that dies here takes
+/// its containers down with it, so counters like
+/// `teraslab_under_replication_*` were unavailable for exactly the runs that
+/// needed them (scenario 11's topology failure had none). A file is written
+/// only when the scrape really returned a body — an absent file is honest,
+/// an empty one is not.
 pub async fn collect_failure_diagnostics(scenario_id: u16) {
     let Ok(dir) = std::env::var(teraslab_test_client::helpers::ENV_DIAG_DIR) else {
         return;
@@ -2528,6 +2691,12 @@ pub async fn collect_failure_diagnostics(scenario_id: u16) {
             if let Ok(json) = poll_json(&url).await {
                 let _ = std::fs::write(dir.join(format!("node{n}_{fname}.json")), json.to_string());
             }
+        }
+        // Prometheus text, not JSON — and the only place the replication /
+        // under-replication counters are exposed.
+        let metrics_url = format!("http://127.0.0.1:{port}/metrics");
+        if let Ok(text) = poll_text(&metrics_url).await {
+            let _ = std::fs::write(dir.join(format!("node{n}_final_metrics.txt")), text);
         }
     }
     eprintln!(
@@ -4023,6 +4192,138 @@ mod master_overlap_diagnostic_tests {
             named, MASTER_OVERLAP_DIAGNOSTIC_CAP,
             "exactly the cap's worth of shard IDs may be printed: {d}"
         );
+    }
+}
+
+#[cfg(test)]
+mod master_divergence_block_tests {
+    use super::*;
+
+    /// Build a per-node census that partitions 0..4096 across `nodes`, then
+    /// lets the caller perturb it.
+    fn clean_census(nodes: &[u32]) -> Vec<(u32, Vec<u16>)> {
+        let mut per_node: Vec<(u32, Vec<u16>)> = nodes.iter().map(|&n| (n, Vec::new())).collect();
+        for s in 0..4096u16 {
+            per_node[s as usize % nodes.len()].1.push(s);
+        }
+        per_node
+    }
+
+    /// The EXCESS shape (the 4103/4096 case that could name its shards):
+    /// the direction is stated up front, the surplus is counted, and the
+    /// double-claimed shards still carry their claimant nodes.
+    #[test]
+    fn an_excess_census_names_the_direction_the_count_and_the_claimants() {
+        let mut per_node = clean_census(&[1, 3, 4]);
+        // node3 additionally claims two shards node1 already masters.
+        per_node[1].1.push(0);
+        per_node[1].1.push(3);
+        let block = master_divergence_block(&per_node, &[], &[1, 3, 4]);
+        assert!(
+            block.starts_with("MASTER CENSUS EXCESS: 2 claim(s) over 4096"),
+            "the direction and surplus must lead the block: {block}"
+        );
+        assert!(
+            block.contains("polled=[n1, n3, n4]"),
+            "the polled set must be named: {block}"
+        );
+        assert!(
+            block.contains("0(n1+n3)") && block.contains("3(n1+n3)"),
+            "the dual-claimed shards must name both claimants: {block}"
+        );
+    }
+
+    /// The DEFICIT shape (the 4094/4096 case that could NOT name its shards).
+    /// It must be as legible as the excess: direction, count, the orphaned
+    /// shard IDs, and the polled set that defines "nobody".
+    #[test]
+    fn a_deficit_census_names_the_direction_the_count_and_the_orphans() {
+        let mut per_node = clean_census(&[1, 3, 4]);
+        // Drop shard 7 from node2's slot and shard 1234 from wherever it sits.
+        for (_, shards) in per_node.iter_mut() {
+            shards.retain(|&s| s != 7 && s != 1234);
+        }
+        let block = master_divergence_block(&per_node, &[], &[1, 3, 4]);
+        assert!(
+            block.starts_with(
+                "MASTER CENSUS DEFICIT: 2 shard(s) mastered by none of the polled nodes"
+            ),
+            "the direction and shortfall must lead the block: {block}"
+        );
+        assert!(
+            block.contains("orphaned=2 [7, 1234]"),
+            "the orphaned shard IDs must be named: {block}"
+        );
+        assert!(
+            block.contains("polled=[n1, n3, n4]"),
+            "the polled set defines what 'nobody' means: {block}"
+        );
+    }
+
+    /// A census whose surplus exactly cancels its shortfall sums to 4096 and
+    /// therefore slips through the gate's sum check. It is still divergent,
+    /// and the block must say so instead of printing a bare "0".
+    #[test]
+    fn a_balanced_census_is_still_reported_as_divergent() {
+        let mut per_node = clean_census(&[1, 2]);
+        for (_, shards) in per_node.iter_mut() {
+            shards.retain(|&s| s != 7);
+        }
+        per_node[1].1.push(0); // node2 dual-claims a node1 shard
+        let block = master_divergence_block(&per_node, &[], &[1, 2]);
+        assert!(
+            block.starts_with("MASTER CENSUS BALANCED-BUT-DIVERGENT"),
+            "a cancelling census must not read as clean: {block}"
+        );
+        assert!(
+            block.contains("overlapping=1 [0(n1+n2)]") && block.contains("orphaned=1 [7]"),
+            "both halves must still be named: {block}"
+        );
+    }
+
+    /// Every shard claimed exactly once by a polled node: nothing to report
+    /// beyond the census being settled. (Reached when the gate times out on
+    /// migration activity rather than on the master sum, or when the state
+    /// moved between the gate's last poll and this second fetch.)
+    #[test]
+    fn a_settled_census_says_so() {
+        let per_node = clean_census(&[1, 2, 3]);
+        let block = master_divergence_block(&per_node, &[], &[1, 2, 3]);
+        assert!(
+            block.starts_with("MASTER CENSUS SETTLED"),
+            "a clean census must be reported as clean: {block}"
+        );
+    }
+
+    /// Nodes that did not answer are named, and the caveat travels with the
+    /// orphan count they inflate — a deficit built entirely out of unfetched
+    /// nodes must not read as real orphaning.
+    #[test]
+    fn unfetched_nodes_are_named_inside_the_block() {
+        let per_node = vec![(1u32, vec![0u16, 1])];
+        let block = master_divergence_block(&per_node, &[3, 4], &[1, 3, 4]);
+        assert!(
+            block.contains("unfetched=[n3, n4] (their masters count as orphaned)"),
+            "the inflation source must be named: {block}"
+        );
+        assert!(block.starts_with("MASTER CENSUS DEFICIT"), "{block}");
+    }
+
+    /// No node answered at all: there is no census to report, and inventing
+    /// "4096 orphans" would be a lie about the cluster rather than about the
+    /// poll. Say the poll failed and name who was asked.
+    #[test]
+    fn an_empty_census_reports_the_failed_poll_not_4096_orphans() {
+        let block = master_divergence_block(&[], &[1, 2, 3], &[1, 2, 3]);
+        assert!(
+            block.contains("master sets unavailable"),
+            "an all-unfetched poll must report itself as such: {block}"
+        );
+        assert!(
+            !block.contains("orphaned=4096"),
+            "a failed poll must not be rendered as total orphaning: {block}"
+        );
+        assert!(block.contains("polled=[n1, n2, n3]"), "{block}");
     }
 }
 

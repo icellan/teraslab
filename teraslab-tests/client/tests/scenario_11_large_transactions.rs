@@ -32,6 +32,59 @@ macro_rules! tlog {
 /// Scenario ID for unique Docker ports and container names.
 const SID: u16 = 11;
 
+/// Mirror of `SAME_TERM_REACTIVATION_COOLDOWN` (`src/cluster/coordinator.rs`):
+/// the minimum gap between two same-term re-activations, i.e. the period of
+/// the re-heal that repairs a post-election dual-claim.
+///
+/// Mirrored, not imported: the server constant is private to that module.
+const SAME_TERM_REACTIVATION_COOLDOWN_SECS: u64 = 30;
+
+/// Mirror of `REHEAL_MAX_CONSECUTIVE_DECLINES` (`src/cluster/coordinator.rs`):
+/// how many consecutive same-term re-heal installs a node may DECLINE as
+/// refinement-revert-only before the decline is withdrawn and the install
+/// becomes mandatory.
+const REHEAL_MAX_CONSECUTIVE_DECLINES: u64 = 2;
+
+/// Budget for a re-heal to actually converge after an election-triggered
+/// dual-claim, used by test 11.11.
+///
+/// # The arithmetic, stated so the two constants cannot drift apart silently
+///
+/// A declined round consumes a cooldown period and installs nothing. With a
+/// budget of `REHEAL_MAX_CONSECUTIVE_DECLINES` declines, rounds
+/// `1..=REHEAL_MAX_CONSECUTIVE_DECLINES` may all decline and the first
+/// MANDATORY install is round `REHEAL_MAX_CONSECUTIVE_DECLINES + 1`. So the
+/// earliest guaranteed install is
+///
+/// ```text
+/// SAME_TERM_REACTIVATION_COOLDOWN * (REHEAL_MAX_CONSECUTIVE_DECLINES + 1)
+///   = 30s * 3 = 90s
+/// ```
+///
+/// after the last activation, plus a ~2s exchange phase before the repaired
+/// table activates.
+///
+/// The previous budget was 90s and its comment claimed to cover "two full
+/// cooldown periods" — off by one whole round. CI observed the exact miss:
+/// declines at 12:11:46 (`declines=1 budget=2`) and 12:12:16 (`declines=2
+/// budget=2`), first mandatory install due ~12:12:46, deadline expired
+/// 12:12:38 — eight seconds short. Whenever both rounds declined, the test
+/// could not pass. The margin on top of the 90s covers the exchange phase,
+/// the settle polling, and the offset between when this wait starts and when
+/// the cooldown clock actually started (the preceding
+/// `wait_specific_nodes_ready` can itself burn tens of seconds).
+///
+/// # This makes the test winnable, not guaranteed
+///
+/// Round `REHEAL_MAX_CONSECUTIVE_DECLINES + 1` installing does not imply
+/// convergence: the re-heal recomputes another node-local refinement, which
+/// can itself diverge and need a further round. The budget removes an
+/// arithmetic impossibility; it does not promise the mechanism converges on
+/// the first mandatory install.
+const REHEAL_CONVERGENCE_BUDGET: Duration = Duration::from_secs(
+    SAME_TERM_REACTIVATION_COOLDOWN_SECS * (REHEAL_MAX_CONSECUTIVE_DECLINES + 1) + 60,
+);
+
 #[tokio::test(flavor = "multi_thread")]
 async fn scenario_11_large_transactions() {
     let result = tokio::time::timeout(Duration::from_secs(600), run_scenario()).await;
@@ -922,13 +975,14 @@ async fn run_scenario() -> Result<(), ClientError> {
             // activates. A 30s wait therefore expires just BEFORE the first
             // re-heal is even due — it can only pass when the repair happens
             // to have already been in flight (CI 31911172622 failed here).
-            // 90s covers two full cooldown periods plus exchange/activation.
-            // Every other post-membership-change wait in this suite uses
-            // 120s; this is the same class of wait.
+            // The budget must also outlast the DECLINE rounds, which is where
+            // the previous 90s was off by a whole round — see
+            // `REHEAL_CONVERGENCE_BUDGET` for the arithmetic and for why this
+            // makes the test winnable rather than guaranteed.
             common::wait_specific_migrations_complete(
                 &docker_5,
                 &[1, 3, 4],
-                Duration::from_secs(90),
+                REHEAL_CONVERGENCE_BUDGET,
             )
             .await?;
             let _ = client_4.refresh_routing().await;
@@ -1014,4 +1068,62 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     tlog!(t0, "=== SCENARIO COMPLETE ===");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 11.11 budget must outlast every DECLINE round plus the first
+    /// MANDATORY install. This is the check the old hard-coded 90s failed:
+    /// with 2 declines allowed, the first mandatory install is at round 3
+    /// (90s), and a 90s deadline expires exactly as that round becomes due —
+    /// the CI miss was 8s.
+    ///
+    /// Asserted rather than merely commented so that raising the server's
+    /// decline budget (or its cooldown) without revisiting this wait fails
+    /// here instead of in a Docker run 12 minutes deep.
+    #[test]
+    fn reheal_budget_outlasts_every_decline_round() {
+        let first_mandatory_install = Duration::from_secs(
+            SAME_TERM_REACTIVATION_COOLDOWN_SECS * (REHEAL_MAX_CONSECUTIVE_DECLINES + 1),
+        );
+        assert_eq!(
+            first_mandatory_install,
+            Duration::from_secs(90),
+            "30s cooldown x (2 declines + 1) = 90s"
+        );
+        assert!(
+            REHEAL_CONVERGENCE_BUDGET > first_mandatory_install,
+            "budget {REHEAL_CONVERGENCE_BUDGET:?} must EXCEED the first mandatory install at \
+             {first_mandatory_install:?}, not merely reach it"
+        );
+        // The margin has to absorb the ~2s exchange phase, the gate's own
+        // 3-consecutive-ready-poll settle, and the offset between this
+        // wait's start and the activation the cooldown clock runs from.
+        let margin = REHEAL_CONVERGENCE_BUDGET - first_mandatory_install;
+        assert!(
+            margin >= Duration::from_secs(30),
+            "margin over the mandatory install is only {margin:?}; the 8s CI miss came from \
+             treating the deadline as if it started at the activation"
+        );
+    }
+
+    /// A budget that only covers `REHEAL_MAX_CONSECUTIVE_DECLINES` rounds —
+    /// the off-by-one that shipped — must be recognisable as too small. This
+    /// pins the direction of the fix: the round count is declines + 1.
+    #[test]
+    fn a_budget_sized_for_the_decline_count_alone_is_too_small() {
+        let declines_only = Duration::from_secs(
+            SAME_TERM_REACTIVATION_COOLDOWN_SECS * REHEAL_MAX_CONSECUTIVE_DECLINES,
+        );
+        assert_eq!(declines_only, Duration::from_secs(60));
+        let first_mandatory_install = Duration::from_secs(
+            SAME_TERM_REACTIVATION_COOLDOWN_SECS * (REHEAL_MAX_CONSECUTIVE_DECLINES + 1),
+        );
+        assert!(
+            declines_only < first_mandatory_install,
+            "a budget covering only the declined rounds cannot see the install that follows them"
+        );
+    }
 }
