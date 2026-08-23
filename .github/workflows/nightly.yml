@@ -3,7 +3,7 @@ name: Nightly E2E
 # Surfaces the armed-qualification opt-ins in the run list so armed runs are
 # distinguishable from default-path runs at a glance. Scheduled runs have an
 # empty `inputs` context and render as plain "Nightly E2E".
-run-name: "Nightly E2E${{ inputs.arm_election && ' [armed: election]' || '' }}${{ inputs.arm_sweep && ' [armed: sweep]' || '' }}"
+run-name: "Nightly E2E${{ inputs.arm_election && ' [armed: election]' || '' }}${{ inputs.arm_sweep && ' [armed: sweep]' || '' }}${{ inputs.disarm_repair && ' [disarmed: repair]' || '' }}"
 
 on:
   schedule:
@@ -17,6 +17,10 @@ on:
         default: false
       arm_sweep:
         description: "Arm under_replication_sweep_enabled in every generated docker node config"
+        type: boolean
+        default: false
+      disarm_repair:
+        description: "DISARM under_replication_repair_enabled (#95 holder-driven repair driver; ships ON)"
         type: boolean
         default: false
 
@@ -157,10 +161,17 @@ jobs:
           # config generator (teraslab-tests/client/src/helpers.rs). On
           # scheduled runs `inputs` is empty, the expressions yield '0',
           # and the generated configs keep both flags default-off.
+          #
+          # #95 is the odd one out: the holder-driven repair driver ships ON,
+          # so its knob DISARMS. `disarm_repair` unset yields '1' (the shipped
+          # default); checking it yields '0'. Isolating the driver therefore
+          # needs no image rebuild, and the generated TOML always records
+          # which way the run measured.
           TERASLAB_DOCKER_COMMITTED_ELECTION: ${{ inputs.arm_election && '1' || '0' }}
           TERASLAB_DOCKER_UNDER_REPLICATION_SWEEP: ${{ inputs.arm_sweep && '1' || '0' }}
+          TERASLAB_DOCKER_UNDER_REPLICATION_REPAIR: ${{ inputs.disarm_repair && '0' || '1' }}
         run: |
-          echo "arming: election=${TERASLAB_DOCKER_COMMITTED_ELECTION} sweep=${TERASLAB_DOCKER_UNDER_REPLICATION_SWEEP}"
+          echo "arming: election=${TERASLAB_DOCKER_COMMITTED_ELECTION} sweep=${TERASLAB_DOCKER_UNDER_REPLICATION_SWEEP} repair=${TERASLAB_DOCKER_UNDER_REPLICATION_REPAIR}"
           ./run_all.sh --tier nightly
 
       - name: Collect logs on failure

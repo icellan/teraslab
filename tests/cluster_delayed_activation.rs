@@ -114,6 +114,9 @@ fn create_node(node_id: u64, seed_swim_ports: &[u16], hold_activation: bool) -> 
         replication_factor: 2,
         committed_master_election_enabled: false,
         under_replication_sweep_enabled: false,
+        // #95 — mirror the shipped default: a completed exchange arms
+        // one holder-driven under-replication repair pass.
+        under_replication_repair_enabled: true,
         replica_abort_forced_resync_enabled: true,
         migration_vetoed_reduction_enabled: false,
         migration_weak_veto_arbitration_enabled: true,

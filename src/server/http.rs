@@ -1482,6 +1482,41 @@ pub(crate) fn render_metrics_text(
         );
         prom_counter(
             &mut out,
+            "teraslab_under_replication_exchange_repairs_total",
+            mm.under_replication_exchange_repairs.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_under_replication_probes_total",
+            mm.under_replication_probes.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_under_replication_probe_views_dropped_total",
+            mm.under_replication_probe_views_dropped.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_under_replication_shards_seen_total",
+            mm.under_replication_shards_seen.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_under_replication_fills_driven_total",
+            mm.under_replication_fills_driven.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_under_replication_fills_refused_total",
+            mm.under_replication_fills_refused.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_under_replication_shards_fenced_total",
+            mm.under_replication_shards_fenced.get(),
+        );
+        prom_counter(
+            &mut out,
             "teraslab_replica_abort_forced_resyncs_total",
             mm.replica_abort_forced_resyncs.get(),
         );
@@ -1759,6 +1794,11 @@ pub(crate) fn render_metrics_text(
         &mut out,
         "teraslab_exchange_peer_failure_garbled_total",
         crate::cluster::coordinator::exchange_peer_failure_garbled_total(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_under_replication_probe_peer_failures_total",
+        crate::cluster::coordinator::under_replication_probe_peer_failures_total(),
     );
     // §9 arm 1 — persistent-divergence gauge: consecutive quorum-backed
     // higher-term commits refused since the last apply. Non-zero and rising
@@ -5595,6 +5635,13 @@ mod tests {
             "teraslab_migration_phase_delta",
             "teraslab_migration_phase_serving_new",
             "teraslab_under_replication_event_repairs_total",
+            "teraslab_under_replication_exchange_repairs_total",
+            "teraslab_under_replication_probes_total",
+            "teraslab_under_replication_probe_views_dropped_total",
+            "teraslab_under_replication_shards_seen_total",
+            "teraslab_under_replication_fills_driven_total",
+            "teraslab_under_replication_fills_refused_total",
+            "teraslab_under_replication_shards_fenced_total",
             "teraslab_replica_abort_forced_resyncs_total",
             "teraslab_migration_completion_manifest_reduced_vetoed_total",
             "teraslab_migration_weak_veto_arbitrations_total",
@@ -5630,6 +5677,7 @@ mod tests {
             "teraslab_activation_degraded_degenerate_view_total",
             "teraslab_exchange_peer_failure_connect_total",
             "teraslab_exchange_peer_failure_status_total",
+            "teraslab_under_replication_probe_peer_failures_total",
             "teraslab_exchange_peer_failure_transport_total",
             "teraslab_exchange_peer_failure_garbled_total",
             "teraslab_topology_refused_higher_term_streak",

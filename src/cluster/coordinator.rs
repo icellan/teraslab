@@ -500,6 +500,303 @@ fn event_repair_take_fire(
     true
 }
 
+/// #95 — HOLDER-DRIVEN under-replication repair: arm the repair pass at
+/// EXCHANGE COMPLETION, the one moment fresh cluster-wide holder evidence
+/// lands, regardless of whether the periodic sweep is armed.
+///
+/// # The gap this closes
+///
+/// A shard's master could be the SOLE holder of a shard under RF=2 with no
+/// driver whose job it was to notice. The three candidate drivers all miss
+/// the settled-cluster shape (CI run 32084447959, default scenario 08,
+/// shard 1561 at epoch 4 = `master=node3, replicas=[node2]`, final census
+/// `[n1:N, n2:N, n3:Y]`):
+///
+///  * `replica_migration_plan` emits nothing — node3's v3 and v4 tables
+///    carry the SAME members, so the planner's "already a holder" skip
+///    fires and no task is produced;
+///  * `replica_abort_resync_pass` needs a replica-side terminal abort, and
+///    is scoped to shards the aborting node still TARGET-MASTERS anyway
+///    (review P1-2a);
+///  * the periodic sweep and the membership/failed-batch event arms are all
+///    gated on `under_replication_sweep_enabled`, default OFF.
+///
+/// The exchange-completion site is the fourth arm and the only one that
+/// runs against evidence that just moved, but it used
+/// [`EventRepairTrigger::observe`] — which self-gates on the same flag — so
+/// the default configuration had no holder-driven repair path at all.
+///
+/// # What it does and does not do
+///
+/// This is an ARMING decision only. The fired pass is the ordinary
+/// [`run_under_replication_pass`] derive: it CREATES missing replicas by
+/// signaling full-shard resync backfills and touches no deletion path, and
+/// every existing gate stays in force — the freshness fence, the dead-peer
+/// guard, the in-flight/already-signaled dedup, the per-pass cap, the
+/// no-active-migration gate, the drain gate, and the sc08 failure-streak
+/// backoff. A legitimately refused fill stays refused.
+///
+/// # What bounds it
+///
+/// The bound is the EVIDENCE, not a timer: one arm per completed exchange,
+/// coalesced by the debounce window (a flurry of same-epoch re-heal
+/// exchanges yields ONE pass), and `resync_signaled` — cleared only when a
+/// new view is stored — suppresses re-deciding a pair against a view that
+/// has not moved. On a settled cluster that never re-exchanges, this driver
+/// costs exactly nothing. The rate is observable as
+/// `teraslab_under_replication_exchange_repairs_total` against
+/// `teraslab_under_replication_fills_driven_total`.
+///
+/// # Parameters
+/// - `trigger`: the loop-local event-repair trigger to arm.
+/// - `now`/`epoch`: the arm instant and the term the exchange completed under.
+/// - `exchange_repair_enabled`: mirrors
+///   `Config::under_replication_repair_enabled` (default ON). When
+///   OFF this degrades to the pre-#95 [`EventRepairTrigger::observe`], i.e.
+///   the arm self-gates on the sweep flag again — so an operator disabling
+///   the driver gets the old behaviour in BOTH sweep modes, not a new one.
+///
+/// Returns whether a pass is armed after the call.
+fn arm_exchange_repair(
+    trigger: &mut EventRepairTrigger,
+    now: std::time::Instant,
+    epoch: u64,
+    exchange_repair_enabled: bool,
+) -> bool {
+    if exchange_repair_enabled {
+        trigger.observe_forced(now, epoch);
+        if let Some(m) = crate::metrics::migration_metrics() {
+            m.under_replication_exchange_repairs.inc();
+        }
+    } else {
+        trigger.observe(now, epoch);
+    }
+    trigger.armed.is_some()
+}
+
+/// #95 — base cadence of the holder-driven under-replication PROBE: how
+/// often a node that masters non-empty shards re-collects the cluster's
+/// partition view for repair purposes.
+///
+/// 15 s, sized against the two harness contracts this must fit inside:
+/// scenario 08's 60 s migration read-verify (three probes' worth of margin)
+/// and `RF2_CENSUS_WINDOW`'s 15 s convergence window, where a gap that
+/// opened before the census still gets a probe inside it. The cost of a
+/// probe is one `OP_PARTITION_VERSION_REPORT` round trip per peer, answered
+/// from RAM (`build_self_partition_version_entries` reads O(1) shard
+/// counters and the cached recency snapshot — no device reads), so the
+/// cadence is bounded by the REPAIRS it may trigger, not by the query.
+const UNDER_REPLICATION_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// #95 — cap on the probe's NO-PROGRESS backoff
+/// ([`UnderReplicationProbe::interval`]). A repair that keeps re-signalling
+/// the same gap stands down to this cadence and stays there; it never
+/// stands down to zero, because a settled cluster's epoch can stay unchanged
+/// indefinitely and a hard attempt budget would re-create the very
+/// no-driver wedge this closes (the same reasoning as
+/// [`FAILED_REDRIVE_BACKOFF_CAP`]).
+const UNDER_REPLICATION_PROBE_BACKOFF_CAP: Duration = Duration::from_secs(120);
+
+/// #95 — watchdog release for a probe launch whose result never arrives.
+///
+/// The probe is single-flight; without a release, one lost reply would
+/// disable the only holder-driven repair driver for the life of the
+/// process. Comfortably above [`EXCHANGE_PHASE_TIMEOUT`] plus per-peer
+/// connect time, so it never pre-empts a healthy collection.
+const UNDER_REPLICATION_PROBE_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// #95 — pacing state for the holder-driven under-replication probe.
+///
+/// # Why a probe exists at all
+///
+/// The under-replication derive judges a replica against the RETAINED
+/// exchange view, and that view has exactly one writer: the
+/// exchange-completion arm. A settled cluster never re-exchanges —
+/// `should_trigger_topology_reactivation` needs
+/// `mismatched_shards > 0 || pending_handoffs > 0` and under-replication
+/// contributes to neither — so on a quiescent cluster the view freezes at
+/// the last activation and the derive's freshness fence correctly refuses
+/// to read its replica zeros as absence of data. The pass is then blind,
+/// not idle, and no cadence fixes that: only fresh evidence does.
+///
+/// CI runs 32630545533 / 32630553766 are that shape exactly: three nodes
+/// agreeing on topology epoch 4, nothing fenced, migrating or inbound,
+/// `master_failed=0/1200`, and one record (shard 921) at a single holder
+/// under RF=2 until the 60 s read-verify timeout expired.
+///
+/// So the master ASKS. The probe re-runs
+/// [`ClusterCoordinator::run_exchange_phase`] — the same read-only
+/// collection the commit path uses — on its own cadence, and the resulting
+/// view is used for REPAIR ONLY: it is never stored as the retained view
+/// (which feeds the election assignment provider) and never triggers an
+/// activation.
+///
+/// # What bounds it
+///
+///  * single-flight, one collection at a time, with a watchdog release;
+///  * one collection per [`UnderReplicationProbe::interval`];
+///  * a NO-PROGRESS backoff — a probe whose signal count fails to shrink
+///    doubles the interval toward [`UNDER_REPLICATION_PROBE_BACKOFF_CAP`],
+///    while a shrinking gap (a large repair genuinely draining in
+///    cap-sized steps) keeps the base cadence;
+///  * the drain gate and the no-active-migration gate, re-checked at BOTH
+///    launch ([`probe_launch_admissible`]) and dispatch
+///    ([`probe_dispatch_admissible`]) — the launch-time reading is up to
+///    [`EXCHANGE_PHASE_TIMEOUT`] stale by the time a view comes back, so
+///    without the second check a probe batch could stack onto a migration
+///    that started during the collection.
+#[derive(Debug)]
+struct UnderReplicationProbe {
+    /// `Some(instant)` while a collection is in flight.
+    launched_at: Option<std::time::Instant>,
+    /// When the last collection finished (or the probe was constructed) —
+    /// the interval is measured from here, so a slow collection does not
+    /// immediately re-arm on return.
+    last_finished: std::time::Instant,
+    /// Consecutive results whose signal count failed to shrink.
+    no_progress_streak: u32,
+    /// The previous result's signal count, for the progress comparison.
+    last_signaled: usize,
+}
+
+impl UnderReplicationProbe {
+    /// A probe that first becomes due one base interval after `now`.
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            launched_at: None,
+            last_finished: now,
+            no_progress_streak: 0,
+            last_signaled: 0,
+        }
+    }
+
+    /// The current cadence: base × 2^streak, saturating at
+    /// [`UNDER_REPLICATION_PROBE_BACKOFF_CAP`] and never below the base.
+    fn interval(&self) -> Duration {
+        if self.no_progress_streak == 0 {
+            return UNDER_REPLICATION_PROBE_INTERVAL;
+        }
+        // Shift capped well past the point where the cap dominates, to keep
+        // `1u32 << shift` sound.
+        let shift = self.no_progress_streak.min(16);
+        UNDER_REPLICATION_PROBE_INTERVAL
+            .saturating_mul(1u32 << shift)
+            .min(UNDER_REPLICATION_PROBE_BACKOFF_CAP)
+            .max(UNDER_REPLICATION_PROBE_INTERVAL)
+    }
+
+    /// Whether a collection may be launched at `now`.
+    ///
+    /// While one is in flight this is `false` until
+    /// [`UNDER_REPLICATION_PROBE_LAUNCH_TIMEOUT`] has elapsed, at which
+    /// point the launch is presumed lost and a replacement is allowed. A
+    /// late reply from the presumed-lost collection is still processed
+    /// normally — worst case that costs one extra probe, which is strictly
+    /// preferable to a permanently disabled driver.
+    fn due(&self, now: std::time::Instant) -> bool {
+        if let Some(launched) = self.launched_at {
+            return now.duration_since(launched) >= UNDER_REPLICATION_PROBE_LAUNCH_TIMEOUT;
+        }
+        now.duration_since(self.last_finished) >= self.interval()
+    }
+
+    /// Record that a collection was launched at `now`.
+    fn mark_launched(&mut self, now: std::time::Instant) {
+        self.launched_at = Some(now);
+    }
+
+    /// #95 review P2-2 — record that a DUE probe did not run: the launch was
+    /// declined after the gates were evaluated, or the collected view was
+    /// refused at dispatch.
+    ///
+    /// This must advance the interval clock. Without it `due` stays true and
+    /// the event loop re-evaluates the launch — including the 4096-shard
+    /// `snapshot_under_replication_inputs` walk — on EVERY 100 ms iteration.
+    /// A single-node cluster sits in that state permanently: a busy-loop, not
+    /// a paced probe.
+    ///
+    /// A skip carries no information about repair progress, so it disturbs
+    /// neither `no_progress_streak` nor `last_signaled` — it must not reset a
+    /// backoff a genuinely stuck repair earned, and must not become the
+    /// baseline the next result is compared against.
+    fn record_skipped(&mut self, now: std::time::Instant) {
+        self.launched_at = None;
+        self.last_finished = now;
+    }
+
+    /// Fold one finished collection's outcome in: `signaled` is how many
+    /// fills the derived pass drove.
+    ///
+    /// `0` means converged (or nothing to repair) and resets the streak.
+    /// A count that did not SHRINK relative to the previous result extends
+    /// it — that is the "re-signalling the same gap forever" shape. The
+    /// FIRST signalling result never counts as no-progress: it has no
+    /// predecessor that could have failed.
+    fn record_result(&mut self, now: std::time::Instant, signaled: usize) {
+        self.launched_at = None;
+        self.last_finished = now;
+        if signaled == 0 {
+            self.no_progress_streak = 0;
+        } else if self.last_signaled > 0 && signaled >= self.last_signaled {
+            self.no_progress_streak = self.no_progress_streak.saturating_add(1);
+        } else {
+            self.no_progress_streak = 0;
+        }
+        self.last_signaled = signaled;
+    }
+}
+
+/// #95 — may a probe COLLECTION be launched right now?
+///
+/// Extracted from the event loop so the gate set is a tested predicate rather
+/// than an inline condition no test can reach (review P2-4).
+///
+/// * `repair_enabled` — the operator's rollback switch
+///   (`Config::under_replication_repair_enabled`).
+/// * `probe_due` — [`UnderReplicationProbe::due`], which owns pacing,
+///   single-flight and the no-progress backoff.
+/// * `pipeline` — reads `(active_migrations, resync_inflight_len)`. An
+///   in-flight migration IS the repair for the shards it moves, and the drain
+///   gate ([`resync_drain_gate_open`]) refuses to stack a pass-batch onto
+///   still-streaming resyncs.
+///
+/// `pipeline` is a CLOSURE, not two values, and that is load-bearing (review
+/// round 2): reading it takes two mutexes (the migration manager and the
+/// resync in-flight set) and the event loop evaluates this gate ~10x/s
+/// forever. Eager arguments made a node with the driver DISARMED pay exactly
+/// what an armed one pays — the wrong shape for a flag whose whole purpose is
+/// to be a zero-cost rollback switch. It is called only once both cheap gates
+/// pass.
+///
+/// A refused launch leaves the probe DUE — the caller records a skip only
+/// after the expensive membership/holdings snapshot declines — so these cheap
+/// gates simply re-evaluate on the next loop tick.
+fn probe_launch_admissible(
+    repair_enabled: bool,
+    probe_due: bool,
+    pipeline: impl FnOnce() -> (usize, usize),
+) -> bool {
+    if !(repair_enabled && probe_due) {
+        return false;
+    }
+    let (active_migrations, resync_inflight_len) = pipeline();
+    active_migrations == 0 && resync_drain_gate_open(resync_inflight_len)
+}
+
+/// #95 review P2-1 — may a COLLECTED probe view be dispatched into a repair
+/// pass?
+///
+/// The launch gates are checked up to [`EXCHANGE_PHASE_TIMEOUT`] before the
+/// view comes back, so they are a TOCTOU: a topology migration or a catch-up
+/// resync that STARTS during the collection would have a probe batch stacked
+/// on top of it — exactly what the drain gate exists to prevent. The same two
+/// conditions are therefore re-checked at dispatch, and a refused view is
+/// DROPPED (recorded as a skip, not as a result): the evidence is stale by
+/// then anyway and the next probe re-collects it.
+fn probe_dispatch_admissible(active_migrations: usize, resync_inflight_len: usize) -> bool {
+    active_migrations == 0 && resync_drain_gate_open(resync_inflight_len)
+}
+
 /// W8 (defect 1) — base delay before a failed migration batch's tracked
 /// tasks are re-driven without a membership edge. Doubles per fired attempt
 /// (see [`FailedBatchRedrive::backoff`]).
@@ -839,6 +1136,21 @@ fn run_under_replication_pass(
             already_dispatched,
             cap,
         );
+    // #95 — meter the pass HERE, at the single point where a pass resolves,
+    // so no fire site can add a cadence and forget the observability. Three
+    // states an operator must be able to tell apart from a one-holder shard:
+    // nothing seen, seen-but-refused, and fenced blind.
+    if let Some(m) = crate::metrics::migration_metrics() {
+        let refused = dropped
+            .saturating_add(dead_skipped)
+            .saturating_add(dispatched_skipped);
+        m.under_replication_shards_seen
+            .inc_by(signaled.saturating_add(refused) as u64);
+        m.under_replication_fills_driven.inc_by(signaled as u64);
+        m.under_replication_fills_refused.inc_by(refused as u64);
+        m.under_replication_shards_fenced
+            .inc_by(stale_fenced as u64);
+    }
     if signaled > 0 || dropped > 0 || dead_skipped > 0 || dispatched_skipped > 0 {
         tracing::info!(
             origin,
@@ -2941,6 +3253,14 @@ pub struct ClusterConfig {
     /// `under_replication_sweep_enabled`). Default-off pending CI
     /// qualification.
     pub under_replication_sweep_enabled: bool,
+    /// #95 — holder-driven under-replication repair arming (see `Config`
+    /// `under_replication_repair_enabled` for the full rationale and the CI
+    /// evidence). Default ON, so a shard's master can notice it is
+    /// under-replicated and drive the fill without a migration plan or a
+    /// replica abort. Gates BOTH evidence sources: [`arm_exchange_repair`] at
+    /// the exchange-completion site, and the paced [`UnderReplicationProbe`]
+    /// that re-collects the partition view on a quiescent cluster.
+    pub under_replication_repair_enabled: bool,
     /// W9 Part B — replica-abort forced resync arming (see `Config`
     /// `replica_abort_forced_resync_enabled` for the full rationale).
     /// Default ON: without it a replica-side terminal abort leaves its shard
@@ -3055,6 +3375,7 @@ pub struct ClusterCoordinator {
     replication_factor: u8,
     committed_master_election_enabled: bool,
     under_replication_sweep_enabled: bool,
+    under_replication_repair_enabled: bool,
     node_addrs: Arc<RwLock<std::collections::HashMap<NodeId, SocketAddr>>>,
     shutdown: Arc<AtomicBool>,
     initial_peak: usize,
@@ -3274,6 +3595,12 @@ impl ClusterCoordinator {
             replication_factor: config.replication_factor,
             committed_master_election_enabled: config.committed_master_election_enabled,
             under_replication_sweep_enabled: config.under_replication_sweep_enabled,
+            // #95 — MUST be `config.under_replication_repair_enabled`.
+            // Its neighbour above defaults OFF; feeding that field here
+            // type-checks, keeps every other test green, and silently
+            // restores the configuration whose scenario-08 shard served at
+            // one holder under RF=2 forever. Pinned by test in `bin/server.rs`.
+            under_replication_repair_enabled: config.under_replication_repair_enabled,
             node_addrs: Arc::new(RwLock::new(addrs)),
             shutdown: Arc::new(AtomicBool::new(false)),
             initial_peak,
@@ -3482,6 +3809,10 @@ impl ClusterCoordinator {
         let retained_exchange_view_event = retained_exchange_view.clone();
         let committed_master_election_enabled_event = self.committed_master_election_enabled;
         let under_replication_sweep_enabled_event = self.under_replication_sweep_enabled;
+        // #95 — the holder-driven repair arming, read once for the event loop.
+        // Deliberately a SEPARATE capture from the sweep flag above: the two
+        // arm different cadences (one pass per view refresh vs. a 20s timer).
+        let under_replication_repair_enabled_event = self.under_replication_repair_enabled;
         let (swim_shutdown, swim_handle, event_rx) = swim.start();
 
         let shard_table = self.shard_table.clone();
@@ -3756,6 +4087,16 @@ impl ClusterCoordinator {
             // contradiction after boot can fire immediately.
             let mut last_reelection_at = std::time::Instant::now() - REELECTION_MIN_INTERVAL;
             let mut last_under_replication_sweep = std::time::Instant::now();
+            // #95 — pacing state and result channel for the holder-driven
+            // under-replication probe (see [`UnderReplicationProbe`]). The
+            // collection runs off the loop; the view comes back here and is
+            // used for REPAIR ONLY — it is deliberately never stored as the
+            // retained exchange view (whose single writer feeds the election
+            // assignment provider) and never triggers an activation.
+            let mut under_replication_probe = UnderReplicationProbe::new(std::time::Instant::now());
+            let (probe_view_tx, probe_view_rx) = std::sync::mpsc::channel::<
+                std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+            >();
             // W5-followup — progress tracker for the fast self-drain
             // reactivation cadence. Holds `(term, work_remaining)` captured the
             // last time the fast path fired. `None` (or a stale term) means the
@@ -4151,6 +4492,124 @@ impl ClusterCoordinator {
                             }
                         }
 
+                        // #95 — HOLDER-DRIVEN under-replication probe. The
+                        // exchange-completion arm above only sees gaps that
+                        // exist when a topology event happens; a QUIESCENT
+                        // cluster never re-exchanges, so its retained view
+                        // freezes and the derive's freshness fence blinds
+                        // every pass (CI 32630545533: three nodes agreeing on
+                        // epoch 4, nothing migrating, one record at a single
+                        // holder until the 60s read-verify timeout). So the
+                        // master ASKS: re-collect the partition view on the
+                        // probe cadence and derive from THAT.
+                        //
+                        // Gate order is the same posture as the sweep: the
+                        // no-active-migration gate first (in-flight catch-up
+                        // IS the repair) and the drain gate second (never
+                        // stack a repair batch onto still-streaming ones), so
+                        // a refused tick simply re-tries next iteration. The
+                        // `mastered_nonempty` emptiness check comes last
+                        // because it is the only one that walks the shards —
+                        // a node that masters no data has nothing to protect
+                        // and must not put a query on the wire.
+                        //
+                        // The collection is READ-ONLY (`run_exchange_phase`
+                        // mutates no cluster state and the peer handler only
+                        // reads counters), and its result goes to a PRIVATE
+                        // channel — never to `exchange_complete_tx`, which
+                        // would activate a topology, and never into
+                        // `retained_exchange_view`, whose single writer feeds
+                        // the election assignment provider.
+                        //
+                        // Living in the recv-TIMEOUT branch (like the
+                        // periodic sweep) is deliberate, not an oversight:
+                        // the two arms are complementary. A cluster busy
+                        // enough to starve this branch is producing the
+                        // topology events that arm the exchange path, and a
+                        // quiescent cluster — the shape with NO other driver
+                        // — reaches the timeout branch every iteration.
+                        if probe_launch_admissible(
+                            under_replication_repair_enabled_event,
+                            under_replication_probe.due(std::time::Instant::now()),
+                            || {
+                                (
+                                    migration.lock().active_count(),
+                                    resync_inflight.lock().len(),
+                                )
+                            },
+                        ) {
+                            let committed_term = topo_authority_event.committed_term();
+                            // Review P2-2 — the CHEAP member check FIRST. A
+                            // single-node cluster passes every gate above
+                            // forever, so putting the 4096-shard holdings
+                            // snapshot ahead of it would re-walk the shard
+                            // table on every 100 ms loop tick, permanently.
+                            let committed_members = topo_authority_event.committed_members();
+                            let (alive, mastered_nonempty) = if committed_members.len() > 1 {
+                                snapshot_under_replication_inputs(
+                                    &swim_membership_event,
+                                    &shard_table,
+                                    &engine,
+                                    self_id,
+                                )
+                            } else {
+                                (std::collections::HashSet::new(), Vec::new())
+                            };
+                            // Query only the committed members SWIM currently
+                            // reports ALIVE. A dead peer would burn the whole
+                            // EXCHANGE_PHASE_TIMEOUT to learn nothing: the
+                            // derive's dead-peer guard refuses to signal a
+                            // resync toward it anyway.
+                            let probe_members: Vec<NodeId> = committed_members
+                                .into_iter()
+                                .filter(|m| alive.contains(m))
+                                .collect();
+                            if probe_members.len() > 1 && !mastered_nonempty.is_empty() {
+                                under_replication_probe.mark_launched(std::time::Instant::now());
+                                if let Some(m) = crate::metrics::migration_metrics() {
+                                    m.under_replication_probes.inc();
+                                }
+                                tracing::debug!(
+                                    term = committed_term,
+                                    members = probe_members.len(),
+                                    mastered_nonempty = mastered_nonempty.len(),
+                                    interval_secs = under_replication_probe.interval().as_secs(),
+                                    "cluster: under-replication probe — re-collecting the \
+                                     partition view for repair (read-only; never activates)",
+                                );
+                                let probe_tx = probe_view_tx.clone();
+                                let node_addrs_p = node_addrs.clone();
+                                let engine_p = engine.clone();
+                                let shard_table_p = shard_table.clone();
+                                let inbound_bm_p = inbound_bm_event.clone();
+                                let secret_p = cluster_secret_event.clone();
+                                std::thread::spawn(move || {
+                                    let view = Self::run_exchange_phase(
+                                        &probe_members,
+                                        self_id,
+                                        committed_term,
+                                        &node_addrs_p,
+                                        &engine_p,
+                                        &shard_table_p,
+                                        &inbound_bm_p,
+                                        EXCHANGE_PHASE_TIMEOUT,
+                                        &secret_p,
+                                        PartitionReportOrigin::RepairProbe,
+                                    );
+                                    let _ = probe_tx.send(view);
+                                });
+                            } else {
+                                // Review P2-2 — a DUE probe that declines to
+                                // launch must still consume the tick.
+                                // Otherwise `due` stays true and this whole
+                                // block (holdings snapshot included) re-runs
+                                // on every 100 ms iteration — the state a
+                                // single-node cluster, or a node mastering no
+                                // data, sits in permanently.
+                                under_replication_probe.record_skipped(std::time::Instant::now());
+                            }
+                        }
+
                         const PLACEMENT_UPGRADE_SETTLE: Duration = Duration::from_secs(60);
                         let upgrade_settled = migration.lock().active_count() == 0
                             && last_activation_at.elapsed() >= PLACEMENT_UPGRADE_SETTLE;
@@ -4411,6 +4870,81 @@ impl ClusterCoordinator {
                             );
                         }
                     }
+                }
+
+                // #95 — drain the holder-driven probe's freshly collected
+                // partition view and derive one repair pass from it. Runs
+                // every loop iteration (not just the recv-timeout branch) so
+                // event traffic cannot starve the driver.
+                //
+                // The pass is the SAME `run_under_replication_pass` the
+                // exchange arm and the periodic sweep use — same freshness
+                // fence, same dead-peer guard, same cap, same never-delete
+                // contract — differing only in WHICH view it judges against.
+                // `already_dispatched` is the in-flight set alone: the
+                // W11-FIX-3(a) `resync_signaled` set exists to stop a pass
+                // re-deciding against evidence that has NOT moved, and a
+                // probe view has by construction moved, so folding it in here
+                // would suppress exactly the re-decision the probe was run to
+                // make. The per-view suppression a probe still needs — one
+                // signal per pair per view — is the fresh local set below,
+                // which the pass records into.
+                while let Ok(probe_view) = probe_view_rx.try_recv() {
+                    loop_heartbeat_event.stamp(crate::cluster::watchdog::LoopPhase::RepairFire);
+                    let now = std::time::Instant::now();
+                    if probe_view.is_empty() {
+                        // No peer answered (and self always reports), so this
+                        // collection carries no evidence. A skip, not a
+                        // result: it says nothing about repair progress.
+                        if let Some(m) = crate::metrics::migration_metrics() {
+                            m.under_replication_probe_views_dropped.inc();
+                        }
+                        under_replication_probe.record_skipped(now);
+                        continue;
+                    }
+                    // Review P2-1 — TOCTOU. The launch gates were checked up
+                    // to EXCHANGE_PHASE_TIMEOUT ago; a topology migration or
+                    // a catch-up resync may have started since, and
+                    // dispatching now would stack a repair batch on top of it
+                    // — exactly what the drain gate exists to prevent. Drop
+                    // the view; the next probe re-collects fresher evidence.
+                    if !probe_dispatch_admissible(
+                        migration.lock().active_count(),
+                        resync_inflight.lock().len(),
+                    ) {
+                        tracing::debug!(
+                            "cluster: under-replication probe view dropped — a \
+                             migration or resync started during the collection",
+                        );
+                        if let Some(m) = crate::metrics::migration_metrics() {
+                            m.under_replication_probe_views_dropped.inc();
+                        }
+                        under_replication_probe.record_skipped(now);
+                        continue;
+                    }
+                    let (alive, mastered_nonempty) = snapshot_under_replication_inputs(
+                        &swim_membership_event,
+                        &shard_table,
+                        &engine,
+                        self_id,
+                    );
+                    let already_dispatched = resync_inflight.lock().clone();
+                    let (signaled, dropped, _dead_skipped, _dispatched_skipped) =
+                        run_under_replication_pass(
+                            &probe_view,
+                            &alive,
+                            self_id,
+                            &mastered_nonempty,
+                            &already_dispatched,
+                            UNDER_REPLICATION_SWEEP_MAX_SHARDS,
+                            "probe",
+                            &resync_request_tx_event,
+                            &Mutex::new(std::collections::HashSet::new()),
+                        );
+                    // The cap remainder counts toward the outstanding gap:
+                    // a probe that drove its full cap and dropped more has
+                    // NOT converged, and the next probe re-derives the rest.
+                    under_replication_probe.record_result(now, signaled.saturating_add(dropped));
                 }
 
                 // W8 (defect 1) — the failed-batch self-retry section (arm
@@ -4827,6 +5361,7 @@ impl ClusterCoordinator {
                                 &inbound_bm_x,
                                 EXCHANGE_PHASE_TIMEOUT,
                                 &secret_x,
+                                PartitionReportOrigin::Commit,
                             );
                             let _ = exchange_tx.send((members_x, committed_term, view, false));
                         });
@@ -4882,6 +5417,7 @@ impl ClusterCoordinator {
                                     &inbound_bm_x,
                                     EXCHANGE_PHASE_TIMEOUT,
                                     &secret_x,
+                                    PartitionReportOrigin::Commit,
                                 );
                                 let _ = exchange_tx.send((members_x, committed_term, view, false));
                             });
@@ -5172,6 +5708,7 @@ impl ClusterCoordinator {
                                             &inbound_bm_x,
                                             EXCHANGE_PHASE_TIMEOUT,
                                             &secret_x,
+                                            PartitionReportOrigin::Commit,
                                         );
                                         let _ = exchange_tx.send((
                                             members_x,
@@ -5319,6 +5856,7 @@ impl ClusterCoordinator {
                                 &inbound_bm_x,
                                 EXCHANGE_PHASE_TIMEOUT,
                                 &secret_x,
+                                PartitionReportOrigin::Commit,
                             );
                             let _ = exchange_tx.send((members_x, term, view, false));
                         });
@@ -5574,8 +6112,20 @@ impl ClusterCoordinator {
                     // carries no evidence to repair from, and a fired pass
                     // would burn the arm AND push back the periodic sweep
                     // timer for nothing.
+                    //
+                    // #95 — this arm is the HOLDER-DRIVEN repair driver, and
+                    // it is default-ON (`arm_exchange_repair`): the plain
+                    // `observe` used here before self-gated on the sweep
+                    // flag, which left a default cluster with no driver at
+                    // all for a shard its master under-replicates without a
+                    // migration plan or a replica abort.
                     if !partition_view.is_empty() {
-                        event_repair_trigger.observe(std::time::Instant::now(), term);
+                        arm_exchange_repair(
+                            &mut event_repair_trigger,
+                            std::time::Instant::now(),
+                            term,
+                            under_replication_repair_enabled_event,
+                        );
                         // GAP 2 (armed scenario 17) — drive orphan cleanup
                         // from the exchange-completion event, alongside the
                         // repair arm above. `run_orphan_cleanup` used to run
@@ -7937,6 +8487,7 @@ impl ClusterCoordinator {
         inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
         total_timeout: std::time::Duration,
         auth_secret: &Option<Arc<Vec<u8>>>,
+        origin: PartitionReportOrigin,
     ) -> std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> {
         let mut phase = ExchangePhase::new(cluster_key, members.len(), total_timeout);
 
@@ -7944,7 +8495,14 @@ impl ClusterCoordinator {
         // (this term's re-query cadence, or the next exchange) serves fresh
         // fingerprints. The self-report below is served from the cache
         // immediately — the refresh must never eat into the exchange window.
-        engine.maybe_refresh_shard_recency_cache();
+        //
+        // #95 review P1-1 — COMMIT-origin only. A repair probe runs on a
+        // timer, so kicking here would turn an event-driven whole-store
+        // index+device scan into a continuous one; the derive that probe
+        // feeds reads no recency field. See [`PartitionReportOrigin`].
+        if origin.kicks_recency_refresh() {
+            engine.maybe_refresh_shard_recency_cache();
+        }
 
         // Self-report (no TCP, no device reads — see
         // `build_self_partition_version_entries`).
@@ -8040,7 +8598,7 @@ impl ClusterCoordinator {
                     match send_topology_frame_response_with_read_timeout(
                         addr,
                         OP_PARTITION_VERSION_REPORT,
-                        &cluster_key.to_le_bytes(),
+                        &encode_partition_version_request(cluster_key, origin),
                         secret.as_deref().map(Vec::as_slice),
                         EXCHANGE_REPORT_READ_TIMEOUT,
                     ) {
@@ -8057,6 +8615,7 @@ impl ClusterCoordinator {
                                         addr,
                                         ExchangePeerFailureKind::Garbled,
                                         detail,
+                                        origin,
                                     );
                                     last_failure = detail.to_string();
                                 }
@@ -8069,6 +8628,7 @@ impl ClusterCoordinator {
                                 addr,
                                 classify_exchange_peer_error(&err),
                                 &err,
+                                origin,
                             );
                             // W9 P2-3 — the STALE_EPOCH rejection echoes the
                             // responder's local cluster key. HIGHER than
@@ -8082,16 +8642,13 @@ impl ClusterCoordinator {
                                 parse_stale_epoch_report_rejection(&response.payload)
                                 && responder_key > cluster_key
                             {
-                                tracing::warn!(
-                                    peer = peer.0,
-                                    %addr,
-                                    our_key = cluster_key,
+                                report_exchange_peer_higher_key(
+                                    peer,
+                                    addr,
+                                    cluster_key,
                                     responder_key,
                                     attempts,
-                                    "cluster: exchange peer reports a HIGHER \
-                                     cluster key — this node is the stale side; \
-                                     abandoning the re-query (topology catch-up \
-                                     converges us)",
+                                    origin,
                                 );
                                 let _ = tx.send((peer, None));
                                 return;
@@ -8104,6 +8661,7 @@ impl ClusterCoordinator {
                                 addr,
                                 classify_exchange_peer_error(&err),
                                 &err,
+                                origin,
                             );
                             last_failure = err;
                         }
@@ -8115,14 +8673,7 @@ impl ClusterCoordinator {
                     // window. Give up (honest absence) once a full retry
                     // interval no longer fits before the deadline.
                     if std::time::Instant::now() + EXCHANGE_PEER_RETRY_INTERVAL >= deadline {
-                        tracing::warn!(
-                            peer = peer.0,
-                            %addr,
-                            attempts,
-                            last_failure,
-                            "cluster: exchange peer ABSENT — every report \
-                             query failed within the exchange deadline",
-                        );
+                        report_exchange_peer_absent(peer, addr, attempts, &last_failure, origin);
                         let _ = tx.send((peer, None));
                         return;
                     }
@@ -9507,6 +10058,12 @@ static EXCHANGE_PEER_FAILURE_TRANSPORT_TOTAL: std::sync::atomic::AtomicU64 =
 /// W9 P2 — exchange report replies whose payload failed to parse.
 static EXCHANGE_PEER_FAILURE_GARBLED_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// #95 review P2-3 — report queries that failed on a REPAIR PROBE, kept out
+/// of the four counters above so a background repair cannot make the commit
+/// path's exchange look unhealthy. Exported as
+/// `teraslab_under_replication_probe_peer_failures_total`.
+static UNDER_REPLICATION_PROBE_PEER_FAILURE_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Exchange report queries failed on TCP connect since process start
 /// (W9 P2). Exported as `teraslab_exchange_peer_failure_connect_total`.
@@ -9534,6 +10091,16 @@ pub fn exchange_peer_failure_garbled_total() -> u64 {
     EXCHANGE_PEER_FAILURE_GARBLED_TOTAL.load(Ordering::Relaxed)
 }
 
+/// #95 review P2-3 — report queries that failed on a holder-driven repair
+/// PROBE since process start. Deliberately separate from the four
+/// `exchange_peer_failure_*` counters: those mean "topology activation is
+/// starving on a peer that will not answer", and a probe failing against a
+/// just-departed peer says nothing about that. Exported as
+/// `teraslab_under_replication_probe_peer_failures_total`.
+pub fn under_replication_probe_peer_failures_total() -> u64 {
+    UNDER_REPLICATION_PROBE_PEER_FAILURE_TOTAL.load(Ordering::Relaxed)
+}
+
 /// W9 P2 — whether the `n`th exchange report-query failure (1-based,
 /// process-wide) emits its warn: the first 10 all do, then every 100th.
 /// The re-query cadence retries every 500 ms against a peer that may stay
@@ -9544,6 +10111,86 @@ fn exchange_peer_failure_warn_due(n: u64) -> bool {
     n <= WARN_FIRST || n.is_multiple_of(WARN_EVERY)
 }
 
+/// #95 re-review P2-NEW-2 — report that a peer was abandoned as ABSENT for
+/// this exchange.
+///
+/// Split by origin for the same reason the counters are (round-1 P2-3), and
+/// it matters MORE here: this site is not rate-limited, so a SWIM-alive but
+/// term-skewed peer would make every 15 s probe emit a commit-voiced warn
+/// forever on the default path — round-1's noise problem surviving in the
+/// signal operators actually grep.
+///
+/// COMMIT origin keeps the WARN: a peer that never answered inside the
+/// activation window is exactly the chronic view starvation that warn exists
+/// to surface. A probe give-up is DE-ESCALATED to DEBUG, never dropped: the
+/// probe derives from whatever answered and the next one re-collects, but an
+/// operator who turns DEBUG on must still be able to see it.
+fn report_exchange_peer_absent(
+    peer: NodeId,
+    addr: SocketAddr,
+    attempts: u32,
+    last_failure: &str,
+    origin: PartitionReportOrigin,
+) {
+    if origin == PartitionReportOrigin::Commit {
+        tracing::warn!(
+            peer = peer.0,
+            %addr,
+            attempts,
+            last_failure,
+            "cluster: exchange peer ABSENT — every report query failed within \
+             the exchange deadline",
+        );
+    } else {
+        tracing::debug!(
+            peer = peer.0,
+            %addr,
+            attempts,
+            last_failure,
+            "cluster: under-replication probe peer did not answer — the probe \
+             derives from whatever did; the next probe re-collects",
+        );
+    }
+}
+
+/// #95 re-review P2-NEW-2 — report that a peer echoed a HIGHER cluster key,
+/// so THIS node is the stale side and re-querying is pointless.
+///
+/// Same split, same reasoning as [`report_exchange_peer_absent`]: on the
+/// commit path this is the operator's signal that topology catch-up is owed;
+/// reached from a background repair probe it is routine and must not shout.
+fn report_exchange_peer_higher_key(
+    peer: NodeId,
+    addr: SocketAddr,
+    our_key: u64,
+    responder_key: u64,
+    attempts: u32,
+    origin: PartitionReportOrigin,
+) {
+    if origin == PartitionReportOrigin::Commit {
+        tracing::warn!(
+            peer = peer.0,
+            %addr,
+            our_key,
+            responder_key,
+            attempts,
+            "cluster: exchange peer reports a HIGHER cluster key — this node \
+             is the stale side; abandoning the re-query (topology catch-up \
+             converges us)",
+        );
+    } else {
+        tracing::debug!(
+            peer = peer.0,
+            %addr,
+            our_key,
+            responder_key,
+            attempts,
+            "cluster: under-replication probe peer reports a HIGHER cluster \
+             key — abandoning this peer's re-query for this probe",
+        );
+    }
+}
+
 /// W9 P2 — meter + (rate-limited) warn one discarded exchange report
 /// query, naming the peer, address, and failure kind/detail so chronic
 /// view starvation is diagnosable from the log and `/metrics`.
@@ -9552,7 +10199,26 @@ fn record_exchange_peer_failure(
     addr: SocketAddr,
     kind: ExchangePeerFailureKind,
     detail: &str,
+    origin: PartitionReportOrigin,
 ) {
+    // #95 review P2-3 — a repair probe must never make the COMMIT path look
+    // unhealthy. These four counters (and their rate-limited warn) are the
+    // operator's signal that topology activation is starving on a peer that
+    // will not answer; a background repair query failing against a peer that
+    // just departed says nothing about that. Probe-origin failures get their
+    // own counter and stay out of the commit path's warn budget.
+    if origin != PartitionReportOrigin::Commit {
+        UNDER_REPLICATION_PROBE_PEER_FAILURE_TOTAL.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            peer = peer.0,
+            %addr,
+            kind = ?kind,
+            detail,
+            "cluster: under-replication probe report query failed — the probe \
+             derives from whatever answered; the next probe re-collects",
+        );
+        return;
+    }
     let counter = match kind {
         ExchangePeerFailureKind::Connect => &EXCHANGE_PEER_FAILURE_CONNECT_TOTAL,
         ExchangePeerFailureKind::Status => &EXCHANGE_PEER_FAILURE_STATUS_TOTAL,
@@ -10680,6 +11346,86 @@ pub(crate) fn build_self_partition_version_entries(
     // scrape, a node stuck UNKNOWN) observable.
     engine.note_recency_report_unknown_shards(unknown_shards);
     entries
+}
+
+/// #95 review P1-1 — why an `OP_PARTITION_VERSION_REPORT` query was sent.
+///
+/// The report itself is identical either way; what differs is whether sending
+/// or answering it should kick a whole-store recency refresh. That refresh
+/// (`Engine::refresh_shard_recency_cache`) is a full index walk plus per-key
+/// device reads whose only brake is
+/// [`RECENCY_REFRESH_MIN_INTERVAL`](crate::ops::recency::RECENCY_REFRESH_MIN_INTERVAL)
+/// (5 s), so on a write-busy store — where the cache is permanently stale —
+/// the trigger rate IS the scan rate.
+///
+/// Before the holder-driven driver existed, both kicks (the querier's in
+/// [`ClusterCoordinator::run_exchange_phase`] and the responder's in the
+/// `OP_PARTITION_VERSION_REPORT` dispatch handler) were purely event-driven:
+/// a topology-quiescent cluster fired neither. A periodic probe on every node
+/// would make them continuous — each node kicking its own every interval AND
+/// receiving one kick per peer probe — which `crate::ops::recency` already
+/// classifies in as many words ("back-to-back whole-store scans were the P1-1
+/// defect").
+///
+/// The probe does not need the data: [`derive_under_replication_resyncs`]
+/// reads `last_applied_seq` and [`PARTITION_FLAG_PENDING_INBOUND`], and never
+/// touches `manifest_digest`, `max_generation` or
+/// [`PARTITION_FLAG_RECENCY_UNKNOWN`]. So the origin rides the request and
+/// BOTH ends skip the refresh — skipping only the querier's side would leave
+/// the N-1 responder amplification fully intact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PartitionReportOrigin {
+    /// The topology commit / activation path (including the same-term
+    /// re-heal, prompt-activation and degraded-upgrade re-fires). Keeps the
+    /// refresh kick: the reverse-heal recency signal these views feed depends
+    /// on the fingerprints converging.
+    Commit,
+    /// The #95 holder-driven under-replication probe. Repair-only, and the
+    /// derive it feeds reads no recency field, so it never kicks a scan.
+    RepairProbe,
+}
+
+impl PartitionReportOrigin {
+    /// The wire tag appended to the request payload.
+    fn wire_tag(self) -> u8 {
+        match self {
+            Self::Commit => 0,
+            Self::RepairProbe => 1,
+        }
+    }
+
+    /// Whether sending or answering a query of this origin should kick an
+    /// off-thread recency refresh.
+    pub(crate) fn kicks_recency_refresh(self) -> bool {
+        matches!(self, Self::Commit)
+    }
+}
+
+/// #95 review P1-1 — build an `OP_PARTITION_VERSION_REPORT` request payload.
+///
+/// `cluster_key` stays at offset 0 (the responder's stale-epoch gate reads it
+/// there); the origin tag is an ADDITIVE trailing byte, so a peer built before
+/// this field simply ignores it. No `PROTOCOL_VERSION` bump.
+pub(crate) fn encode_partition_version_request(
+    cluster_key: u64,
+    origin: PartitionReportOrigin,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(9);
+    payload.extend_from_slice(&cluster_key.to_le_bytes());
+    payload.push(origin.wire_tag());
+    payload
+}
+
+/// #95 review P1-1 — read the origin tag from a report request payload.
+///
+/// Fail-safe to [`PartitionReportOrigin::Commit`] for an absent (legacy
+/// 8-byte) or unrecognised tag: an unknown origin degrades to the pre-#95
+/// cost, never to a commit-path exchange that silently stops refreshing.
+pub(crate) fn parse_partition_report_origin(payload: &[u8]) -> PartitionReportOrigin {
+    match payload.get(8) {
+        Some(1) => PartitionReportOrigin::RepairProbe,
+        _ => PartitionReportOrigin::Commit,
+    }
 }
 
 /// Serialize an `OP_PARTITION_VERSION_REPORT` response payload from a list of
@@ -23990,6 +24736,10 @@ mod tests {
     /// the point signals are emitted, not at a call site that could forget it.
     #[test]
     fn under_replication_pass_does_not_re_signal_against_an_unchanged_view() {
+        // #95 — `run_under_replication_pass` now bumps the process-global
+        // under-replication counters; hold the shared metrics lock so a
+        // sibling's delta assertion cannot read this pass as its own.
+        let _metrics_guard = crate::metrics::migration_metrics_test_lock();
         let master = NodeId(1);
         let replica = NodeId(2);
         let mut view = std::collections::HashMap::new();
@@ -24483,6 +25233,10 @@ mod tests {
     /// periodic sweep uses.
     #[test]
     fn dead_to_alive_rejoin_arms_event_repair_that_derives_and_pushes() {
+        // #95 — `run_under_replication_pass` now bumps the process-global
+        // under-replication counters; hold the shared metrics lock so a
+        // sibling's delta assertion cannot read this pass as its own.
+        let _metrics_guard = crate::metrics::migration_metrics_test_lock();
         // Membership: node2 joins, dies, then rejoins (SIGKILL + restart).
         let mut m =
             crate::cluster::membership::Membership::new(NodeId(1), Duration::from_millis(10));
@@ -24566,6 +25320,592 @@ mod tests {
         );
     }
 
+    /// #95 (RED→GREEN) — THE QUIESCENT SHAPE. CI runs 32630545533 (default)
+    /// and 32630553766 (armed) at c444734: all three nodes at topology epoch
+    /// 4, `master_failed=0/1200`, nothing fenced, nothing migrating, nothing
+    /// inbound — and ONE record, shard 921, whose holders read
+    /// `[n1:N, n2:N, n3:Y]`. It sat there until the 60 s read-verify timeout.
+    /// armed-17 corroborates with `holder_count_histogram=[1:1, 3:757]`.
+    ///
+    /// The exchange-completion arm alone CANNOT see this. The retained view
+    /// is written only when an exchange completes, and a settled cluster
+    /// never re-exchanges — `should_trigger_topology_reactivation` requires
+    /// `mismatched_shards > 0 || pending_handoffs > 0`, and under-replication
+    /// contributes to neither. So the retained view stays frozen at the
+    /// epoch-4 activation, and the derive's freshness fence (correctly)
+    /// refuses to read its replica zeros as absence of data for any shard
+    /// whose records postdate it: the pass is fenced blind, not idle.
+    ///
+    /// This pins BOTH halves of that statement against the REAL derive:
+    /// the frozen view yields nothing and reports the shard as fenced, and
+    /// the probe's freshly collected view — same cluster, same instant —
+    /// yields exactly the missing fill.
+    #[test]
+    fn a_probe_view_reveals_the_gap_a_frozen_retained_view_fences() {
+        let master = NodeId(3);
+        let replica = NodeId(2);
+        let shard = 921u16;
+        let alive: std::collections::HashSet<NodeId> = [master, replica].into_iter().collect();
+        let mastered = vec![(shard, vec![replica])];
+
+        // The FROZEN retained view: taken at the epoch-4 activation, before
+        // this record existed. Both nodes reported, both showed zero.
+        let mut frozen = std::collections::HashMap::new();
+        frozen.insert(master, vec![sweep_entry(shard, 0)]);
+        frozen.insert(replica, vec![sweep_entry(shard, 0)]);
+        let (missing, signaled, _dropped, _dead, _dispatched, stale_fenced) =
+            derive_under_replication_resyncs(
+                &frozen,
+                &alive,
+                master,
+                &mastered,
+                &std::collections::HashSet::new(),
+                1024,
+            );
+        assert!(
+            missing.is_empty() && signaled == 0,
+            "the frozen view must NOT drive a fill — its replica zeros are \
+             absence of evidence, not evidence of absence",
+        );
+        assert_eq!(
+            stale_fenced, 1,
+            "and it must report the shard as FENCED, so the operator can \
+             tell a blind driver from an idle one",
+        );
+
+        // The PROBE view: the same shard, re-collected now.
+        // `build_self_partition_version_entries` reports `last_applied_seq`
+        // from the LIVE `Engine::shard_record_count`, so a fresh probe is a
+        // fresh answer to "does this peer hold anything for this shard".
+        let mut probed = std::collections::HashMap::new();
+        probed.insert(master, vec![sweep_entry(shard, 1)]);
+        probed.insert(replica, vec![sweep_entry(shard, 0)]);
+        // Driven through the REAL pass the event loop's probe drain calls,
+        // so the resync push is exercised, not just the classification.
+        let _metrics_guard = crate::metrics::migration_metrics_test_lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (signaled, dropped, dead_skipped, dispatched_skipped) = run_under_replication_pass(
+            &probed,
+            &alive,
+            master,
+            &mastered,
+            &std::collections::HashSet::new(),
+            UNDER_REPLICATION_SWEEP_MAX_SHARDS,
+            "probe",
+            &tx,
+            &Mutex::new(std::collections::HashSet::new()),
+        );
+        assert_eq!(signaled, 1, "the probe view must drive the missing fill");
+        assert_eq!((dropped, dead_skipped, dispatched_skipped), (0, 0, 0));
+        let req = rx.try_recv().expect("the fill must be enqueued");
+        assert_eq!(
+            (req.node_id, req.shards),
+            (replica.0, vec![shard]),
+            "the fill must target the committed replica that holds nothing",
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "and nothing else — the master's own copy is never touched",
+        );
+    }
+
+    /// #95 re-review P2-NEW-2 (RED→GREEN) — the origin split must reach the
+    /// LOGS, not just the counters.
+    ///
+    /// Two give-up sites in `run_exchange_phase`'s per-peer thread report at
+    /// WARN and are NOT rate-limited (unlike `record_exchange_peer_failure`,
+    /// which is gated by `exchange_peer_failure_warn_due`). A SWIM-alive but
+    /// term-skewed peer therefore makes EVERY probe emit a commit-voiced
+    /// `"exchange peer ABSENT"` / `"HIGHER cluster key"` warn — every 15 s,
+    /// forever, on the default path.
+    ///
+    /// That is round-1's P2-3 scenario surviving in the signal operators
+    /// actually grep. Fixing the metrics and leaving the logs fixes the
+    /// dashboard and not the incident.
+    #[test]
+    fn a_repair_probes_give_up_never_speaks_in_the_commit_paths_warn_voice() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().expect("fixture addr");
+        let peer = NodeId(9);
+
+        for (origin, must_warn) in [
+            (PartitionReportOrigin::Commit, true),
+            (PartitionReportOrigin::RepairProbe, false),
+        ] {
+            let warns = capture_tracing_lines(tracing::Level::WARN, || {
+                report_exchange_peer_absent(peer, addr, 3, "connect refused", origin);
+                report_exchange_peer_higher_key(peer, addr, 4, 7, 3, origin);
+            });
+            assert_eq!(
+                !warns.is_empty(),
+                must_warn,
+                "{origin:?}: give-up WARN emission is wrong (captured {warns:?})",
+            );
+        }
+
+        // The probe's give-ups are not silenced, only de-escalated: an
+        // operator who turns DEBUG on must still be able to see them.
+        let debugs = capture_tracing_lines(tracing::Level::DEBUG, || {
+            report_exchange_peer_absent(
+                peer,
+                addr,
+                3,
+                "connect refused",
+                PartitionReportOrigin::RepairProbe,
+            );
+            report_exchange_peer_higher_key(
+                peer,
+                addr,
+                4,
+                7,
+                3,
+                PartitionReportOrigin::RepairProbe,
+            );
+        });
+        assert_eq!(
+            debugs.len(),
+            2,
+            "a probe give-up must be DE-ESCALATED, not dropped (captured {debugs:?})",
+        );
+    }
+
+    /// #95 review P1-1 (RED→GREEN) — a repair probe must NOT kick the
+    /// whole-store recency scan, at either end of the wire.
+    ///
+    /// `run_exchange_phase` kicks `maybe_refresh_shard_recency_cache` and the
+    /// peer's report handler kicks one per responder. That scan is a full
+    /// index walk (`keys_by_shard_filtered`) plus per-key device reads
+    /// (`recency_for_keys`), and its ONLY brake is
+    /// `RECENCY_REFRESH_MIN_INTERVAL` (5 s). On a write-busy store the cache
+    /// is permanently stale, so that floor is the entire pacing.
+    ///
+    /// Before #95 both kicks were event-driven: a topology-quiescent cluster
+    /// fired neither. A 15 s probe on every node — each also RECEIVING N-1
+    /// peer kicks — saturates the floor outright at N>=4 and makes
+    /// back-to-back whole-store scans the steady state. `recency.rs` already
+    /// names that shape: "back-to-back whole-store scans were the P1-1
+    /// defect".
+    ///
+    /// The probe needs none of it: `derive_under_replication_resyncs` reads
+    /// `last_applied_seq` and the `PENDING_INBOUND` flag and nothing else —
+    /// never `manifest_digest`, never `max_generation`, never
+    /// `RECENCY_UNKNOWN`. So the origin travels on the wire and BOTH ends
+    /// skip the refresh.
+    #[test]
+    fn a_repair_probe_query_never_kicks_the_whole_store_recency_scan() {
+        assert!(
+            PartitionReportOrigin::Commit.kicks_recency_refresh(),
+            "the commit path's exchange must keep its refresh kick — the \
+             reverse-heal recency signal depends on it converging",
+        );
+        assert!(
+            !PartitionReportOrigin::RepairProbe.kicks_recency_refresh(),
+            "a repair probe must never kick a whole-store index+device scan: \
+             it reads last_applied_seq and the inbound flag, and no recency \
+             field at all",
+        );
+    }
+
+    /// #95 review P1-1 — the origin must survive the wire, and a peer that
+    /// predates the field must be read as COMMIT.
+    ///
+    /// Fail-safe direction: an unknown or absent tag means "behave exactly as
+    /// before", i.e. kick the refresh. A mixed-version cluster degrades to the
+    /// pre-#95 cost, never to a commit-path exchange that silently stops
+    /// refreshing.
+    #[test]
+    fn partition_report_origin_round_trips_and_defaults_legacy_to_commit() {
+        for origin in [
+            PartitionReportOrigin::Commit,
+            PartitionReportOrigin::RepairProbe,
+        ] {
+            let payload = encode_partition_version_request(0xDEAD_BEEF_1234_5678, origin);
+            assert_eq!(
+                payload.get(..8).map(|b| u64::from_le_bytes(
+                    b.try_into().expect("8-byte slice into an 8-byte array")
+                )),
+                Some(0xDEAD_BEEF_1234_5678),
+                "the cluster_key must stay at offset 0 — the responder's \
+                 stale-epoch gate reads it there",
+            );
+            assert_eq!(parse_partition_report_origin(&payload), origin);
+        }
+
+        // A legacy 8-byte request (a peer built before this field existed).
+        let legacy = 7u64.to_le_bytes().to_vec();
+        assert_eq!(
+            parse_partition_report_origin(&legacy),
+            PartitionReportOrigin::Commit,
+            "an 8-byte legacy request must read as COMMIT",
+        );
+        // An unrecognised tag from a future/garbled peer: same fail-safe.
+        let mut unknown = 7u64.to_le_bytes().to_vec();
+        unknown.push(0xFF);
+        assert_eq!(
+            parse_partition_report_origin(&unknown),
+            PartitionReportOrigin::Commit,
+            "an unknown origin tag must fail SAFE to COMMIT",
+        );
+    }
+
+    /// #95 review P2-4 — the launch gates, as a predicate rather than inline
+    /// event-loop code no test can reach.
+    #[test]
+    fn probe_launch_is_admissible_only_with_every_gate_open() {
+        assert!(
+            probe_launch_admissible(true, true, || (0, 0)),
+            "flag on, due, no migrations, pipeline drained → launch",
+        );
+        assert!(
+            !probe_launch_admissible(false, true, || (0, 0)),
+            "the driver flag is the operator's rollback switch",
+        );
+        assert!(
+            !probe_launch_admissible(true, false, || (0, 0)),
+            "not due yet",
+        );
+        assert!(
+            !probe_launch_admissible(true, true, || (1, 0)),
+            "an in-flight migration IS the repair — never probe over it",
+        );
+        assert!(
+            !probe_launch_admissible(true, true, || (0, 1)),
+            "an undrained resync pipeline must never get a batch stacked on it",
+        );
+    }
+
+    /// #95 re-review P3 (RED→GREEN) — the pipeline state is expensive to read
+    /// (two mutex acquisitions: the migration manager and the resync in-flight
+    /// set) and the event loop evaluates this gate ~10x/s forever. A node with
+    /// the driver DISARMED, or simply not due yet, must not pay for it.
+    ///
+    /// Eager argument evaluation made the disarmed path cost exactly as much
+    /// as the armed one, which is the wrong shape for a flag whose entire
+    /// purpose is to be a zero-cost rollback switch.
+    #[test]
+    fn probe_launch_reads_the_pipeline_only_once_the_cheap_gates_pass() {
+        for (repair_enabled, probe_due) in [(false, true), (true, false), (false, false)] {
+            let read = std::cell::Cell::new(false);
+            let admitted = probe_launch_admissible(repair_enabled, probe_due, || {
+                read.set(true);
+                (0, 0)
+            });
+            assert!(!admitted);
+            assert!(
+                !read.get(),
+                "repair_enabled={repair_enabled} probe_due={probe_due}: the pipeline locks \
+                 must NOT be taken — a disarmed or not-yet-due probe pays nothing",
+            );
+        }
+
+        // ...and it IS read once both cheap gates pass, or the gate would be
+        // vacuous in the direction that matters.
+        let read = std::cell::Cell::new(false);
+        assert!(probe_launch_admissible(true, true, || {
+            read.set(true);
+            (0, 0)
+        }));
+        assert!(read.get(), "an armed, due probe must consult the pipeline");
+    }
+
+    /// #95 review P2-1 (RED→GREEN) — TOCTOU. The launch gates are checked up
+    /// to `EXCHANGE_PHASE_TIMEOUT` before the collected view is dispatched, so
+    /// a topology migration (or a catch-up resync) that STARTS during the
+    /// collection would have a probe batch stacked on top of it. The drain
+    /// must re-check.
+    #[test]
+    fn probe_dispatch_rechecks_the_gates_after_the_collection() {
+        assert!(probe_dispatch_admissible(0, 0));
+        assert!(
+            !probe_dispatch_admissible(1, 0),
+            "a migration that started DURING the collection must veto the \
+             dispatch — the launch-time gate is stale by then",
+        );
+        assert!(
+            !probe_dispatch_admissible(0, 1),
+            "so must a resync that started during the collection",
+        );
+    }
+
+    /// #95 review P2-2 (RED→GREEN) — a DUE probe that does not launch (or
+    /// whose view is refused at dispatch) must still advance the interval
+    /// clock. Otherwise `due` stays true and the event loop re-runs the
+    /// 4096-shard snapshot every 100 ms forever — a busy-loop, not a paced
+    /// probe. Single-node clusters sit in exactly that state permanently.
+    ///
+    /// A skip carries no information about repair progress, so it must
+    /// disturb neither the streak nor the last-signalled baseline.
+    #[test]
+    fn a_skipped_probe_advances_the_clock_without_disturbing_progress() {
+        let t0 = std::time::Instant::now();
+        let mut probe = UnderReplicationProbe::new(t0);
+        let due_at = t0 + UNDER_REPLICATION_PROBE_INTERVAL;
+        assert!(probe.due(due_at));
+
+        probe.record_skipped(due_at);
+        assert!(
+            !probe.due(due_at),
+            "a skipped launch must consume the tick — otherwise the snapshot \
+             re-runs on every 100ms event-loop iteration",
+        );
+        assert!(probe.due(due_at + UNDER_REPLICATION_PROBE_INTERVAL));
+
+        // Skips must not look like convergence, and must not look like
+        // failure either: build a real no-progress streak, skip, and confirm
+        // the backoff is exactly where it was.
+        probe.record_result(due_at, 40);
+        probe.record_result(due_at, 40);
+        let backed_off = probe.interval();
+        assert_eq!(backed_off, UNDER_REPLICATION_PROBE_INTERVAL * 2);
+        probe.record_skipped(due_at);
+        assert_eq!(
+            probe.interval(),
+            backed_off,
+            "a skip must not reset a no-progress backoff (that would restore \
+             the fast cadence for a repair that is still stuck)",
+        );
+        probe.record_result(due_at, 40);
+        assert_eq!(
+            probe.interval(),
+            UNDER_REPLICATION_PROBE_INTERVAL * 4,
+            "and it must not have disturbed the last-signalled baseline the \
+             progress comparison uses",
+        );
+    }
+
+    /// #95 — the probe paces itself and is SINGLE-FLIGHT: one collection at
+    /// a time, one per interval. A launch whose result never arrives is
+    /// released by a watchdog rather than wedging the driver forever.
+    #[test]
+    fn under_replication_probe_is_paced_and_single_flight() {
+        let t0 = std::time::Instant::now();
+        let mut probe = UnderReplicationProbe::new(t0);
+        assert!(
+            !probe.due(t0),
+            "a freshly constructed probe must wait a full interval",
+        );
+        assert!(!probe.due(t0 + UNDER_REPLICATION_PROBE_INTERVAL - Duration::from_millis(1)));
+        assert!(probe.due(t0 + UNDER_REPLICATION_PROBE_INTERVAL));
+
+        let launched = t0 + UNDER_REPLICATION_PROBE_INTERVAL;
+        probe.mark_launched(launched);
+        assert!(
+            !probe
+                .due(launched + UNDER_REPLICATION_PROBE_LAUNCH_TIMEOUT - Duration::from_millis(1)),
+            "a probe in flight must not launch a second collection while the \
+             first is still inside its watchdog window",
+        );
+        assert!(
+            probe.due(launched + UNDER_REPLICATION_PROBE_LAUNCH_TIMEOUT),
+            "but a launch whose result never arrives must be released — a \
+             lost reply may not disable the only holder-driven driver",
+        );
+
+        probe.record_result(launched + Duration::from_secs(1), 0);
+        assert!(
+            !probe.due(launched + Duration::from_secs(1)),
+            "a finished probe restarts the interval",
+        );
+        assert!(probe.due(launched + Duration::from_secs(1) + UNDER_REPLICATION_PROBE_INTERVAL));
+    }
+
+    /// #95 — the bound, and it must be a NO-PROGRESS bound, not a
+    /// signalled-anything bound: a large repair that is genuinely draining
+    /// (a whole-node rebuild walks the 128-shard cap in steps) must keep the
+    /// base cadence, while a repair that re-signals the same gap forever
+    /// backs off toward the cap instead of re-driving every tick.
+    #[test]
+    fn under_replication_probe_backs_off_only_when_repair_stops_progressing() {
+        let t0 = std::time::Instant::now();
+        let mut probe = UnderReplicationProbe::new(t0);
+        assert_eq!(probe.interval(), UNDER_REPLICATION_PROBE_INTERVAL);
+
+        // First result: nothing to compare against, so no backoff yet.
+        probe.record_result(t0, 128);
+        assert_eq!(
+            probe.interval(),
+            UNDER_REPLICATION_PROBE_INTERVAL,
+            "the FIRST signalling probe has no predecessor to have failed",
+        );
+
+        // Draining backlog — progress keeps the base cadence.
+        probe.record_result(t0, 96);
+        probe.record_result(t0, 40);
+        assert_eq!(
+            probe.interval(),
+            UNDER_REPLICATION_PROBE_INTERVAL,
+            "a shrinking gap is repair working; do not slow it down",
+        );
+
+        // Stuck: the same gap, probe after probe.
+        probe.record_result(t0, 40);
+        assert_eq!(probe.interval(), UNDER_REPLICATION_PROBE_INTERVAL * 2);
+        probe.record_result(t0, 40);
+        assert_eq!(probe.interval(), UNDER_REPLICATION_PROBE_INTERVAL * 4);
+        for _ in 0..20 {
+            probe.record_result(t0, 40);
+        }
+        assert_eq!(
+            probe.interval(),
+            UNDER_REPLICATION_PROBE_BACKOFF_CAP,
+            "the backoff saturates at the cap — it never stands down to zero, \
+             so a permanently stuck repair keeps retrying at the cap cadence",
+        );
+
+        // Converged: back to the base cadence for the next gap.
+        probe.record_result(t0, 0);
+        assert_eq!(probe.interval(), UNDER_REPLICATION_PROBE_INTERVAL);
+    }
+
+    /// #95 (RED→GREEN) — a completed exchange must arm the under-replication
+    /// repair pass in a DEFAULT (`under_replication_sweep_enabled = false`)
+    /// cluster.
+    ///
+    /// CI run 32084447959, default scenario 08: shard 1561 at epoch 4 is
+    /// `master=node3, replicas=[node2]` and the final census reads
+    /// `[n1:N, n2:N, n3:Y]` — one holder under RF=2, permanently. No driver
+    /// existed for it: `replica_migration_plan` emits no task (node3's v3 and
+    /// v4 tables carry the SAME members, so the "already a holder" skip
+    /// fires), no replica aborted (so `replica_abort_resync_pass` never
+    /// force-arms), and the exchange-completion arm — the one site that runs
+    /// the instant fresh holder evidence lands — self-gated on the sweep
+    /// flag via [`EventRepairTrigger::observe`].
+    ///
+    /// The four quadrants are pinned together so neither flag can be wired
+    /// to swallow the other's arm: turning the new exchange driver OFF must
+    /// restore EXACTLY the pre-#95 behaviour in both sweep modes.
+    #[test]
+    fn exchange_completion_arms_under_replication_repair_with_the_sweep_off() {
+        let window = Duration::from_millis(10);
+        let epoch = 4u64;
+        let t0 = std::time::Instant::now();
+        let due = t0 + window * 2;
+        // (sweep_enabled, exchange_repair_enabled, a pass must fire)
+        for (sweep, exchange_repair, must_fire) in [
+            // The #95 defect shape: no driver at all.
+            (false, false, false),
+            // The new default: fresh exchange evidence drives the fill.
+            (false, true, true),
+            // Armed clusters keep the arm they already had.
+            (true, false, true),
+            (true, true, true),
+        ] {
+            let mut trigger = EventRepairTrigger::new(window, sweep);
+            assert_eq!(
+                arm_exchange_repair(&mut trigger, t0, epoch, exchange_repair),
+                must_fire,
+                "sweep={sweep} exchange_repair={exchange_repair}: wrong arm outcome",
+            );
+            let mut last_sweep = t0;
+            assert_eq!(
+                event_repair_take_fire(&mut trigger, due, epoch, 0, &mut last_sweep),
+                must_fire,
+                "sweep={sweep} exchange_repair={exchange_repair}: wrong fire outcome",
+            );
+        }
+    }
+
+    /// #95 — the exchange-driven arm is bounded by the EVIDENCE, not by a
+    /// timer: a flurry of exchange completions under one epoch coalesces
+    /// into a single pass, and a fired pass does not re-fire without a new
+    /// exchange. This is what keeps a default-on driver from becoming a
+    /// repair storm on a re-healing cluster (wave-10/11 observed same-term
+    /// re-heal exchanges 41-65 ms apart).
+    #[test]
+    fn exchange_repair_arms_coalesce_into_one_pass_per_epoch() {
+        let window = Duration::from_millis(10);
+        let epoch = 9u64;
+        let t0 = std::time::Instant::now();
+        let mut trigger = EventRepairTrigger::new(window, false);
+        for step in 0..20u32 {
+            assert!(arm_exchange_repair(
+                &mut trigger,
+                t0 + Duration::from_millis(u64::from(step)),
+                epoch,
+                true,
+            ));
+        }
+        let mut last_sweep = t0;
+        assert!(
+            event_repair_take_fire(&mut trigger, t0 + window * 2, epoch, 0, &mut last_sweep),
+            "the coalesced flurry fires exactly one pass",
+        );
+        assert!(
+            !event_repair_take_fire(&mut trigger, t0 + window * 10, epoch, 0, &mut last_sweep),
+            "a fired pass must not re-fire without a NEW exchange completion",
+        );
+    }
+
+    /// #95 — every under-replication pass must be observable. An operator
+    /// staring at a one-holder shard needs to tell three states apart:
+    /// the driver saw nothing (`seen == 0`, `fenced == 0`), the driver is
+    /// blind because the retained view predates the local data
+    /// (`fenced > 0`), and the driver saw the gap but declined to drive it
+    /// this round (`refused > 0` — dead replica, already dispatched, or
+    /// cap-dropped).
+    #[test]
+    fn under_replication_pass_meters_seen_driven_refused_and_fenced() {
+        // The counters are process-global; serialize against every other
+        // test that runs a pass.
+        let _metrics_guard = crate::metrics::migration_metrics_test_lock();
+        let m = install_test_migration_metrics();
+        let before_seen = m.under_replication_shards_seen.get();
+        let before_driven = m.under_replication_fills_driven.get();
+        let before_refused = m.under_replication_fills_refused.get();
+        let before_fenced = m.under_replication_shards_fenced.get();
+
+        // Shard 7: this node holds data and the view witnesses it, replica
+        // N2 is alive and dataless (drive), replica N3 is SWIM-dead
+        // (refuse). Shard 8: locally non-empty but the view carries no self
+        // entry for it, so the freshness fence skips the shard whole.
+        let master = NodeId(1);
+        let mut view = std::collections::HashMap::new();
+        view.insert(master, vec![sweep_entry(7, 5)]);
+        view.insert(NodeId(2), vec![sweep_entry(7, 0), sweep_entry(8, 0)]);
+        view.insert(NodeId(3), vec![sweep_entry(7, 0)]);
+        let alive: std::collections::HashSet<NodeId> = [master, NodeId(2)].into_iter().collect();
+        let mastered = vec![(7u16, vec![NodeId(2), NodeId(3)]), (8u16, vec![NodeId(2)])];
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let (signaled, dropped, dead_skipped, dispatched_skipped) = run_under_replication_pass(
+            &view,
+            &alive,
+            master,
+            &mastered,
+            &std::collections::HashSet::new(),
+            1024,
+            "test",
+            &tx,
+            &Mutex::new(std::collections::HashSet::new()),
+        );
+        assert_eq!(signaled, 1, "only the alive dataless replica is driven");
+        assert_eq!(dropped, 0);
+        assert_eq!(dead_skipped, 1, "the SWIM-dead replica is refused");
+        assert_eq!(dispatched_skipped, 0);
+        let req = rx.try_recv().expect("the driven fill must be enqueued");
+        assert_eq!((req.node_id, req.shards), (2u64, vec![7u16]));
+
+        assert_eq!(
+            m.under_replication_shards_seen.get() - before_seen,
+            2,
+            "both under-replicated (replica, shard) candidates must be counted as SEEN",
+        );
+        assert_eq!(
+            m.under_replication_fills_driven.get() - before_driven,
+            1,
+            "exactly one fill was driven",
+        );
+        assert_eq!(
+            m.under_replication_fills_refused.get() - before_refused,
+            1,
+            "the dead-replica candidate must be counted as REFUSED, not silently dropped",
+        );
+        assert_eq!(
+            m.under_replication_shards_fenced.get() - before_fenced,
+            1,
+            "the shard the freshness fence skipped whole must be visible",
+        );
+    }
+
     /// Task #50 (c) — a flurry of membership events coalesces into ONE
     /// armed pass: the debounce keeps the deadline of the FIRST event, and
     /// firing disarms the trigger until a new event re-arms it.
@@ -24639,6 +25979,10 @@ mod tests {
     /// counted, never silent.
     #[test]
     fn event_repair_pass_never_pushes_toward_swim_dead_replica() {
+        // #95 — `run_under_replication_pass` now bumps the process-global
+        // under-replication counters; hold the shared metrics lock so a
+        // sibling's delta assertion cannot read this pass as its own.
+        let _metrics_guard = crate::metrics::migration_metrics_test_lock();
         let master = NodeId(1);
         let replica = NodeId(2);
         let mut view = std::collections::HashMap::new();
@@ -28163,6 +29507,9 @@ mod tests {
             replication_factor: 2,
             committed_master_election_enabled: false,
             under_replication_sweep_enabled: false,
+            // #95 — mirror the shipped default: a completed exchange arms
+            // one holder-driven under-replication repair pass.
+            under_replication_repair_enabled: true,
             replica_abort_forced_resync_enabled: true,
             migration_vetoed_reduction_enabled: false,
             migration_weak_veto_arbitration_enabled,
@@ -44813,6 +46160,7 @@ mod tests {
             &inbound_bm,
             std::time::Duration::from_millis(1500),
             &None,
+            PartitionReportOrigin::Commit,
         );
 
         assert!(
@@ -44930,6 +46278,7 @@ mod tests {
             &inbound_bm,
             std::time::Duration::from_millis(3000),
             &None,
+            PartitionReportOrigin::Commit,
         );
 
         assert_eq!(
@@ -45026,6 +46375,7 @@ mod tests {
             &inbound_bm,
             EXCHANGE_PHASE_TIMEOUT,
             &None,
+            PartitionReportOrigin::Commit,
         );
 
         assert_eq!(
@@ -45250,6 +46600,7 @@ mod tests {
             &inbound_bm,
             std::time::Duration::from_millis(2500),
             &None,
+            PartitionReportOrigin::Commit,
         );
         let elapsed = started.elapsed();
 
@@ -45335,6 +46686,7 @@ mod tests {
             &inbound_bm,
             std::time::Duration::from_millis(3000),
             &None,
+            PartitionReportOrigin::Commit,
         );
         let elapsed = started.elapsed();
 
@@ -45413,6 +46765,7 @@ mod tests {
             &inbound_bm,
             window,
             &None,
+            PartitionReportOrigin::Commit,
         );
         let elapsed = started.elapsed();
 
@@ -45497,6 +46850,7 @@ mod tests {
             &inbound_bm,
             std::time::Duration::from_millis(1200),
             &None,
+            PartitionReportOrigin::Commit,
         );
 
         assert!(
@@ -47287,6 +48641,7 @@ mod tests {
             addr,
             ExchangePeerFailureKind::Connect,
             "connect: Connection refused",
+            PartitionReportOrigin::Commit,
         );
         assert_eq!(exchange_peer_failure_connect_total(), before + 1);
 
@@ -47296,6 +48651,7 @@ mod tests {
             addr,
             ExchangePeerFailureKind::Status,
             "peer replied status 24",
+            PartitionReportOrigin::Commit,
         );
         assert_eq!(exchange_peer_failure_status_total(), before + 1);
 
@@ -47305,6 +48661,7 @@ mod tests {
             addr,
             ExchangePeerFailureKind::Transport,
             "read length: timed out",
+            PartitionReportOrigin::Commit,
         );
         assert_eq!(exchange_peer_failure_transport_total(), before + 1);
 
@@ -47314,8 +48671,90 @@ mod tests {
             addr,
             ExchangePeerFailureKind::Garbled,
             "unparseable report payload",
+            PartitionReportOrigin::Commit,
         );
         assert_eq!(exchange_peer_failure_garbled_total(), before + 1);
+    }
+
+    /// #95 review P2-3 (RED→GREEN) — a REPAIR PROBE's failed report query
+    /// must not touch the commit path's health counters.
+    ///
+    /// Those four counters mean "topology activation is starving on a peer
+    /// that will not answer". A background repair probe failing against a
+    /// peer that just departed says nothing about that, and before this a
+    /// default node's 15 s probe would have driven them on every degraded
+    /// cluster — turning the commit path's own starvation signal into noise.
+    #[test]
+    fn a_repair_probes_failed_query_never_touches_the_commit_health_counters() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let peer = NodeId(9);
+
+        let connect_before = exchange_peer_failure_connect_total();
+        let status_before = exchange_peer_failure_status_total();
+        let transport_before = exchange_peer_failure_transport_total();
+        let garbled_before = exchange_peer_failure_garbled_total();
+        let probe_before = under_replication_probe_peer_failures_total();
+
+        // Re-review P3 — AMPLIFY. The four commit counters are process-global
+        // and sibling tests drive them through real sockets, so an exact
+        // negative assertion is not sound. Driving each kind REPS times
+        // instead makes a leak of any single kind add exactly REPS to that
+        // counter, which no incidental socket failure in this window comes
+        // near; the earlier `< before + 4` bound tolerated a 3-count leak.
+        const REPS: u64 = 50;
+        for _ in 0..REPS {
+            for kind in [
+                ExchangePeerFailureKind::Connect,
+                ExchangePeerFailureKind::Status,
+                ExchangePeerFailureKind::Transport,
+                ExchangePeerFailureKind::Garbled,
+            ] {
+                record_exchange_peer_failure(
+                    peer,
+                    addr,
+                    kind,
+                    "probe query failed",
+                    PartitionReportOrigin::RepairProbe,
+                );
+            }
+        }
+
+        assert_eq!(
+            under_replication_probe_peer_failures_total(),
+            probe_before + REPS * 4,
+            "every probe-origin failure must be counted — on its OWN counter. \
+             A routing regression shows up HERE first: failures sent to the \
+             commit counters would leave this one flat.",
+        );
+        for (name, now, before) in [
+            (
+                "connect",
+                exchange_peer_failure_connect_total(),
+                connect_before,
+            ),
+            (
+                "status",
+                exchange_peer_failure_status_total(),
+                status_before,
+            ),
+            (
+                "transport",
+                exchange_peer_failure_transport_total(),
+                transport_before,
+            ),
+            (
+                "garbled",
+                exchange_peer_failure_garbled_total(),
+                garbled_before,
+            ),
+        ] {
+            assert!(
+                now < before + REPS,
+                "a probe failure must not land on the commit {name} counter \
+                 (moved {} while our {REPS} probe-origin {name} failures ran)",
+                now - before,
+            );
+        }
     }
 
     // ── Phase I: cluster startup readiness ───────────────────────────────

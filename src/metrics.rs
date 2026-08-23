@@ -1423,6 +1423,66 @@ pub struct MigrationMetrics {
     /// re-replication after a member death/rejoin. Only ever non-zero when
     /// `under_replication_sweep_enabled` is on.
     pub under_replication_event_repairs: PaddedCounter,
+    /// #95 — under-replication repair passes ARMED by a completed exchange
+    /// (`under_replication_repair_enabled`, default ON). Counted at
+    /// the arm, like `replica_abort_forced_resyncs`, so it is non-zero in
+    /// sweep-off clusters: this is the operator-visible evidence that the
+    /// holder-driven driver exists at all. A cluster whose shards sit under
+    /// RF with this counter FLAT is not being refused — it is never being
+    /// asked, which points at the exchange cadence rather than at a gate.
+    pub under_replication_exchange_repairs: PaddedCounter,
+    /// #95 — holder-driven under-replication PROBES launched: partition-view
+    /// re-collections a master ran on its own cadence because a quiescent
+    /// cluster's retained exchange view is frozen and blinds the derive.
+    /// The rate is the driver's cost side (one read-only
+    /// `OP_PARTITION_VERSION_REPORT` round trip per peer, answered from
+    /// RAM); read it against `under_replication_fills_driven` to see what
+    /// the cost bought. A value that stops climbing while shards sit under
+    /// RF means the launch gates are closed — active migrations, an
+    /// undrained resync pipeline, a single-member cluster, or a no-progress
+    /// backoff that has saturated.
+    pub under_replication_probes: PaddedCounter,
+    /// #95 re-review P3 — probe views COLLECTED but never dispatched into a
+    /// repair pass: the collection came back empty (no peer answered), or the
+    /// drain/no-active-migration gate closed during it (review P2-1's TOCTOU
+    /// re-check).
+    ///
+    /// Read against `under_replication_probes_total`. Climbing in lockstep
+    /// with it means every probe is paying its query and throwing the answer
+    /// away — a driver that looks alive in `..._probes_total` while repairing
+    /// nothing. Correlate with
+    /// `teraslab_under_replication_probe_peer_failures_total` to tell "nobody
+    /// answered" from "the pipeline is permanently busy".
+    pub under_replication_probe_views_dropped: PaddedCounter,
+    /// #95 — `(replica, shard)` pairs an under-replication pass classified as
+    /// under-replicated: the shard is mastered here, holds records, passed
+    /// the freshness fence, and a committed replica reports no data for it.
+    /// Equals `under_replication_fills_driven` + `under_replication_fills_refused`.
+    pub under_replication_shards_seen: PaddedCounter,
+    /// #95 — under-replicated pairs a pass actually DROVE: a full-shard
+    /// resync backfill was signaled toward the replica. The fill itself is
+    /// an ordinary migration-pipeline run and can still be refused
+    /// downstream by the authority gates; this counts the drive, not the
+    /// landing.
+    pub under_replication_fills_driven: PaddedCounter,
+    /// #95 — under-replicated pairs a pass declined to drive THIS round:
+    /// the replica is SWIM-dead (a resync toward a black hole ties the
+    /// replication manager up in retries exactly when the cluster is already
+    /// degraded), its repair is already dispatched (streaming now, or
+    /// already signaled against this same retained view), or the per-pass
+    /// cap dropped it. All three are re-derived by a later pass — a
+    /// climbing value is backpressure working, a value climbing in lockstep
+    /// with `under_replication_shards_seen` while
+    /// `under_replication_fills_driven` stays flat is a stuck repair.
+    pub under_replication_fills_refused: PaddedCounter,
+    /// #95 — SHARDS an under-replication pass skipped whole because the
+    /// retained exchange view does not witness this node's OWN data for them
+    /// (the freshness fence: a view that predates the local data cannot have
+    /// its replica zeros read as absence of data). This is the "the driver
+    /// is blind, not idle" signal — a large steady value alongside a stuck
+    /// under-replication repair means the view has not been refreshed since
+    /// the data landed, not that the replicas are healthy.
+    pub under_replication_shards_fenced: PaddedCounter,
     /// W9 Part B — event-repair passes FORCE-armed by a replica-side terminal
     /// abort (`replica_abort_forced_resync_enabled`, default ON). Counted at
     /// the arm (the drained signal), so it is non-zero even in sweep-off
@@ -1682,6 +1742,13 @@ impl MigrationMetrics {
             heal_deadline_alerts: PaddedCounter::new(),
             heal_source_refused_no_quorum: PaddedCounter::new(),
             under_replication_event_repairs: PaddedCounter::new(),
+            under_replication_exchange_repairs: PaddedCounter::new(),
+            under_replication_probes: PaddedCounter::new(),
+            under_replication_probe_views_dropped: PaddedCounter::new(),
+            under_replication_shards_seen: PaddedCounter::new(),
+            under_replication_fills_driven: PaddedCounter::new(),
+            under_replication_fills_refused: PaddedCounter::new(),
+            under_replication_shards_fenced: PaddedCounter::new(),
             replica_abort_forced_resyncs: PaddedCounter::new(),
             migration_completion_manifest_reduced_vetoed: PaddedCounter::new(),
             migration_weak_veto_arbitrations: PaddedCounter::new(),
