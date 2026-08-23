@@ -10,21 +10,65 @@
 //!
 //! # Durability model (Invariant TS-1)
 //!
-//! A delete is LOCAL, buffered prune GC: it fsyncs only the allocator
-//! `FreeRegion`, while the primary-index unregister and the on-device header
-//! tombstone stay in the write-back cache and become durable at the next
-//! checkpoint. A crash before that checkpoint reverts them and
-//! `recovery::reconcile_freelist_against_live_index` restores the record LIVE.
+//! A delete is LOCAL prune GC and journals no `RedoOp::Delete`. Its ONE durable
+//! commit record is the allocator's fsynced `FreeRegion`, written by
+//! `Engine::delete_inner` BEFORE it destroys the record's on-device header
+//! (`RecordAllocator::journal_free`); the primary-index unregister and the
+//! header marker stay in the write-back cache until the next checkpoint. A
+//! crash after that fsync therefore resolves DELETE-WINS, not "the delete never
+//! happened": `FreeRegion` replay evicts any index entry still pointing at the
+//! freed slot (`recovery::evict_freed_region_owner`).
+//! `recovery::reconcile_freelist_against_live_index` is NOT the delete's undo —
+//! it is the safety net for live-and-free skew arriving with no `FreeRegion` in
+//! the replayed tail (e.g. a torn checkpoint sequence). Because the commit
+//! record now precedes the destructive header write, "no `FreeRegion` in the
+//! tail" also implies the header write never ran, so the record that pass
+//! protects really is intact. (If the entry did land and was merely reclaimed
+//! out of the tail by a later checkpoint, the index snapshot taken by that same
+//! checkpoint no longer names the key, so this pass never sees it.)
 //!
-//! The tombstone rides the SAME barrier. [`TombstoneLog::record`] updates the
-//! in-RAM sharded index and buffers the on-disk append IN RAM only; the entry is
-//! written to disk and fsynced solely by [`TombstoneLog::persist`], invoked from
-//! the checkpoint. So a crash before checkpoint loses the un-persisted append
-//! exactly as it loses the delete — **Invariant TS-1: a tombstone for `k` exists
-//! on this node ⟺ this node's delete of `k` is durable.** Boot recovery adds a
-//! belt-and-suspenders [`TombstoneLog::reconcile_against_live`] that drops any
-//! tombstone whose key came back LIVE, so a dangling tombstone can never survive
-//! over a resurrected record.
+//! The tombstone rides the CHECKPOINT barrier. [`TombstoneLog::record`] updates
+//! the in-RAM sharded index and buffers the on-disk append IN RAM only; the
+//! entry is written to disk and fsynced solely by [`TombstoneLog::persist`],
+//! invoked from the checkpoint — deliberately, so a delete costs no extra
+//! hot-path fsync.
+//!
+//! **Invariant TS-1: for an AUTHORITATIVE delete on a node with a tombstone log
+//! attached, a tombstone for `k` exists ⟺ this node's delete of `k` is
+//! durable.** Both qualifiers are load-bearing, and there is one further
+//! timing gap; all three are deliberate:
+//!
+//! * **Authoritative only.** A held-copy reclaim
+//!   ([`crate::ops::engine::Engine::reclaim_held_copy`]) records NO tombstone,
+//!   permanently and by design — a tombstone is
+//!   the key's AUTHORITY vetoing re-delivery, and a node that merely holds a
+//!   replica copy is not that authority. Recording one would let a local space
+//!   reclaim permanently block the master's repair. So on a replica the delete
+//!   is durable and no tombstone will ever exist.
+//! * **Tombstone log attached only.** With tombstones disabled (and at RF = 1,
+//!   where reverse-heal is off and the log is not attached) `record` is a no-op,
+//!   so the biconditional does not apply at all. This one is UNBOUNDED in time,
+//!   not a window.
+//! * **A bounded timing gap.** The delete commits at its `FreeRegion` fsync; the
+//!   tombstone only at the next checkpoint. A crash in between leaves "deleted,
+//!   no tombstone" until the delete is re-driven or the peer converges.
+//!
+//! Every one of these leaves the same exposure, and it is worth naming
+//! precisely rather than filing under "eventual consistency": with no local
+//! tombstone there is no local FROZEN GENERATION to compare a heal candidate
+//! against, so [`TombstoneLog::blocks_heal_apply`] cannot veto anything. A
+//! Phase-2c reverse pull can then heal in a STALE peer image — one whose slots
+//! are UNSPENT where the deleted copy had them SPENT. That is an
+//! unspend-by-resurrection, not merely a resurrected record. It is bounded by
+//! the checkpoint interval for the timing gap (and is pre-existing for the
+//! other two, which the heal protocol handles by other means: a held copy is
+//! not an authority, and RF = 1 has no peer to heal from).
+//!
+//! What the invariant forbids OUTRIGHT is the reverse — a tombstone dangling
+//! over a LIVE record, which would wrongly veto legitimate repairs. Boot
+//! recovery enforces that with a belt-and-suspenders
+//! [`TombstoneLog::reconcile_against_live`] that drops any tombstone whose key
+//! came back LIVE.
 //!
 //! # On-disk layout
 //!

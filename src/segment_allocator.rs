@@ -770,8 +770,48 @@ impl SegmentAllocator {
     /// delete's only durable commit record.
     pub fn free(&mut self, offset: u64, size: u64) -> Result<()> {
         let (aligned_size, seg) = self.validate_free(offset, size)?;
-        self.segments[seg as usize].dead += aligned_size;
+        self.dead_mark(seg, aligned_size);
         Ok(())
+    }
+
+    /// Add `aligned_size` dead bytes to segment `seg`, SKIPPING a segment whose
+    /// `used` is 0.
+    ///
+    /// The guard is the same one [`Self::replay_free`] carries, for the same
+    /// reason: `dead > 0 && used == 0` is what [`Self::recover`] rejects as a
+    /// torn header, so persisting it bricks the next boot. Every LIVE dead-mark
+    /// path needs it too, because a segment can be reset to
+    /// `SegmentMeta::default()` underneath a dead-mark that is already in
+    /// flight:
+    ///
+    /// * `Engine::delete_inner` unregisters the key BEFORE it frees the region,
+    ///   so across the whole delete window the record contributes nothing to
+    ///   `reclaim_fully_dead_segments`' `has_live` ground truth while its bytes
+    ///   are still un-dead-marked. A checkpoint's `defrag_reclaim_fully_dead`
+    ///   landing in that window resets the segment (it looks fully dead if its
+    ///   `dead` is over-counted — see [`Self::replay_free`]), and the pending
+    ///   free then lands on `used == 0`.
+    /// * the spend relocate re-points the index to the NEW offset before
+    ///   dead-marking the old one, opening the identical window.
+    ///
+    /// Skipping only under-counts `dead`, which — exactly as documented on
+    /// [`Self::replay_free`] — skews compaction victim RANKING and nothing else:
+    /// whole-segment reclaim is gated on the live index, and the `dead >= used`
+    /// drain rule self-heals. A reset segment's bytes are already accounted as
+    /// reclaimed, so there is nothing left to mark dead.
+    fn dead_mark(&mut self, seg: u32, aligned_size: u64) {
+        if self.segments[seg as usize].used == 0 {
+            tracing::debug!(
+                target = "teraslab::segment_allocator",
+                segment = seg,
+                aligned_size,
+                "dead-mark skipped: the segment was reclaimed (used == 0) under an \
+                 in-flight free; counting dead into it would persist the \
+                 dead > 0 && used == 0 torn-header poison",
+            );
+            return;
+        }
+        self.segments[seg as usize].dead += aligned_size;
     }
 
     /// Dead-mark a region as a record DELETION's durable commit record.
@@ -793,7 +833,26 @@ impl SegmentAllocator {
     /// region; [`SegmentAllocatorError::RedoLogFailure`] if the journal
     /// append/flush fails.
     pub fn free_durable(&mut self, offset: u64, size: u64) -> Result<()> {
-        let (aligned_size, seg) = self.validate_free(offset, size)?;
+        let journaled = self.journal_free(offset, size)?;
+        self.apply_journaled_free(journaled)
+    }
+
+    /// The FIRST half of [`Self::free_durable`]: journal + fsync the
+    /// `FreeRegion` WITHOUT touching the dead-byte accounting.
+    ///
+    /// See [`crate::allocator::RecordAllocator::journal_free`] for why the
+    /// delete path splits the two halves (commit-before-destroy ordering).
+    ///
+    /// # Errors
+    /// [`SegmentAllocatorError::InvalidFree`] for a region outside the data
+    /// region; [`SegmentAllocatorError::RedoLogFailure`] if the journal
+    /// append/flush fails. No state is mutated in either case.
+    pub fn journal_free(
+        &mut self,
+        offset: u64,
+        size: u64,
+    ) -> Result<crate::allocator::JournaledFree> {
+        let (aligned_size, _seg) = self.validate_free(offset, size)?;
 
         // Journal the release BEFORE mutating the dead-byte accounting — on
         // fsync failure the in-memory state is left unchanged so callers never
@@ -819,7 +878,37 @@ impl SegmentAllocator {
             crate::fault_injection::check(crate::fault_injection::SyncPoint::MidAllocatorPersist);
         }
 
-        self.segments[seg as usize].dead += aligned_size;
+        Ok(crate::allocator::JournaledFree::new(
+            offset,
+            aligned_size,
+            self.redo_device_id,
+        ))
+    }
+
+    /// The SECOND half of [`Self::free_durable`]: fold the already-durable
+    /// release into the owning segment's dead-byte accounting.
+    ///
+    /// The dead-mark is skipped (successfully) for a segment reclaimed under
+    /// the in-flight free — see [`Self::dead_mark`].
+    ///
+    /// # Errors
+    /// [`SegmentAllocatorError::InvalidFree`] if the region no longer resolves
+    /// to a segment (impossible for a token this allocator issued).
+    pub fn apply_journaled_free(
+        &mut self,
+        journaled: crate::allocator::JournaledFree,
+    ) -> Result<()> {
+        debug_assert_eq!(
+            journaled.device_id(),
+            self.redo_device_id,
+            "JournaledFree applied to the wrong store's allocator: the token was \
+             journaled against store {} but this allocator is store {}",
+            journaled.device_id(),
+            self.redo_device_id,
+        );
+        let (aligned_size, seg) =
+            self.validate_free(journaled.offset(), journaled.aligned_size())?;
+        self.dead_mark(seg, aligned_size);
         Ok(())
     }
 
@@ -1530,6 +1619,19 @@ impl RecordAllocator for SegmentAllocator {
     }
     fn free_durable(&mut self, offset: u64, size: u64) -> crate::allocator::Result<()> {
         Ok(SegmentAllocator::free_durable(self, offset, size)?)
+    }
+    fn journal_free(
+        &mut self,
+        offset: u64,
+        size: u64,
+    ) -> crate::allocator::Result<crate::allocator::JournaledFree> {
+        Ok(SegmentAllocator::journal_free(self, offset, size)?)
+    }
+    fn apply_journaled_free(
+        &mut self,
+        journaled: crate::allocator::JournaledFree,
+    ) -> crate::allocator::Result<()> {
+        Ok(SegmentAllocator::apply_journaled_free(self, journaled)?)
     }
     fn persist(&self) -> crate::allocator::Result<()> {
         Ok(SegmentAllocator::persist(self)?)
@@ -2687,6 +2789,87 @@ mod tests {
         );
         assert!(r2.stats().used_bytes > 0);
         assert_eq!(r2.stats().dead_bytes, 4096);
+    }
+
+    /// P2-3: a dead-mark landing on a segment that was RECLAIMED (reset to
+    /// `used == 0`) underneath it must not plant the `dead > 0 && used == 0`
+    /// boot poison that [`SegmentAllocator::recover`] rejects as a torn header.
+    ///
+    /// `reclaim_fully_dead_segments` resets a segment to `SegmentMeta::default()`
+    /// the instant it is fully dead, holds no live index entry, and is not the
+    /// open segment. `Engine::delete_inner` unregisters the key BEFORE it frees
+    /// the region, so for the whole delete window the record contributes nothing
+    /// to `has_live` while its bytes are still un-dead-marked — and a checkpoint's
+    /// `defrag_reclaim_fully_dead` running in that window can reset the segment
+    /// out from under the pending free. The over-counted `dead` that makes the
+    /// segment look fully dead is documented on `replay_free` (a fuzzy checkpoint
+    /// can persist a free that is also still in the post-fence tail) and is
+    /// reproduced here through the public un-journaled dead-mark, which has no
+    /// overlap check.
+    ///
+    /// `replay_free` already carries this guard; the live dead-mark paths did
+    /// not. Both halves of the split free and the plain relocate dead-mark are
+    /// covered below.
+    #[test]
+    fn dead_mark_on_a_reclaimed_segment_does_not_poison_the_header() {
+        let device = dev(64);
+        let seg_size = 2 * 4096u64;
+        let mut a = SegmentAllocator::new(device.clone(), seg_size).unwrap();
+
+        let o1 = a.allocate(4096).unwrap(); // S0
+        let o2 = a.allocate(4096).unwrap(); // S0 (fills + seals it)
+        let o3 = a.allocate(4096).unwrap(); // S1 — becomes the open segment
+        assert_eq!(
+            a.open_segment(),
+            1,
+            "S0 must be sealed for reclaim to see it"
+        );
+
+        // Drive S0 into the documented over-counted state: `dead >= used` while
+        // o1's bytes are still LIVE and un-dead-marked. Two dead-marks of o2
+        // stand in for the fuzzy-checkpoint double-count.
+        a.free(o2, 4096).unwrap();
+        a.free(o2, 4096).unwrap();
+        assert_eq!(
+            a.stats().dead_bytes,
+            8192,
+            "S0 is now over-counted fully dead"
+        );
+
+        // The delete's commit record for o1 is durable; its dead-mark is not yet
+        // applied, and its index entry is already unregistered — so o1 is absent
+        // from the live set the reclaim cross-checks against.
+        let journaled = a.journal_free(o1, 4096).unwrap();
+        let reclaimed = a.reclaim_fully_dead_segments(&[o3]);
+        assert_eq!(
+            reclaimed,
+            vec![0],
+            "S0 must be reclaimed in the delete window"
+        );
+        assert_eq!(
+            a.stats().used_bytes,
+            4096,
+            "the reclaim reset S0 to used == 0 (only the open S1 remains)"
+        );
+
+        // THE BUG: this dead-mark lands on the reset segment.
+        a.apply_journaled_free(journaled).unwrap();
+
+        // The un-journaled relocate dead-mark reaches the same reset segment via
+        // the spend path (the index is re-pointed before the old region is freed).
+        a.free(o1, 4096).unwrap();
+
+        a.persist().unwrap();
+        let r = SegmentAllocator::recover(device).expect(
+            "a dead-mark on a reclaimed segment must not persist dead > 0 && \
+             used == 0 — recover rejects that as a torn header and the node \
+             cannot boot",
+        );
+        assert_eq!(
+            r.stats().dead_bytes,
+            0,
+            "the skipped dead-marks must not resurrect accounting on a reset segment"
+        );
     }
 
     /// A journal failure must leave the allocator untouched: callers never

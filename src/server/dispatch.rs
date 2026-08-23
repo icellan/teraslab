@@ -37981,6 +37981,102 @@ mod tests {
         (engine, redo_log, fail, metrics_test_lock())
     }
 
+    /// P2-6: a delete that COMMITTED but then hit a device error must tick
+    /// `deletes_committed_with_device_error`.
+    ///
+    /// This is the only error in the codebase meaning "the operation succeeded
+    /// AND the device is failing". Neither consumer can tell it apart from a
+    /// delete that did not happen — the client maps it to `ERR_STORAGE_IO`, and
+    /// the replication-compensation path keeps the intent PENDING — so without
+    /// this counter the case is invisible during an incident and reads as lost
+    /// deletes.
+    ///
+    /// The redo log is attached to the ALLOCATOR here (unlike
+    /// `write_failing_engine`) so the `FreeRegion` commit record is genuinely
+    /// journaled to a healthy redo device while the DATA device is armed to
+    /// fail: the delete really does commit, and only the deleted-record marker
+    /// write fails.
+    #[test]
+    fn delete_committed_with_device_error_is_counted_separately() {
+        use crate::ops::create::CreateRequest;
+
+        let m = test_metrics();
+        let _guard = metrics_test_lock();
+
+        let (data_dev, fail) = WriteFailingDevice::new(64 * 1024 * 1024, 4096);
+        let redo_dev = Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let redo_log = Arc::new(Mutex::new(
+            crate::redo::RedoLog::open(redo_dev as Arc<dyn BlockDevice>, 0, 4 * 1024 * 1024)
+                .unwrap(),
+        ));
+        let mut alloc = SlotAllocator::new(data_dev.clone() as Arc<dyn BlockDevice>).unwrap();
+        alloc.set_redo_log(redo_log.clone());
+        let engine = Engine::new(
+            data_dev.clone() as Arc<dyn BlockDevice>,
+            Index::new(10_000).unwrap(),
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+        );
+
+        let mut txid = [0u8; 32];
+        txid[0] = 0xE7;
+        let key = TxKey { txid };
+        engine
+            .create(&CreateRequest {
+                tx_id: txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 0,
+                size_in_bytes: 0,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &[[0x55u8; 32]],
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 0,
+                block_height: 0,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                external_ref: None,
+                parent_txids: &[],
+            })
+            .expect("seed create");
+
+        let before = m.deletes_committed_with_device_error.get();
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = engine
+            .delete(&crate::ops::remaining::DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .expect_err("the armed device must surface the post-commit failure");
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            matches!(err, SpendError::StorageError { .. }),
+            "expected a StorageError from the armed device, got {err:?}"
+        );
+
+        assert_eq!(
+            m.deletes_committed_with_device_error.get() - before,
+            1,
+            "a committed-but-device-failed delete must be counted separately \
+             from an ordinary storage error"
+        );
+        // …and the delete really did commit: the key is gone, so the Err does
+        // NOT mean the record survived.
+        assert!(
+            engine.lookup(&key).is_none(),
+            "the delete committed — the counter would be a lie if the record \
+             were still indexed"
+        );
+    }
+
     /// DC-1: a failing `write_utxo_slot` in the reassign rollback path makes
     /// `compensate_replication_failure` return `Err` (op reports a non-clean
     /// rollback) instead of silently swallowing the device error — and the

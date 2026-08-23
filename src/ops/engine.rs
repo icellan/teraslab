@@ -9029,28 +9029,48 @@ impl Engine {
     ///
     /// Removes from index, frees device space, and cleans up secondary indexes.
     ///
-    /// # Ordering (F-G2-001)
+    /// # Ordering (F-G2-001, W14 commit-before-destroy)
     ///
-    /// The on-device tombstone, primary-index removal, and allocator free
-    /// MUST happen in the order:
+    /// The primary-index removal, the durable commit record, the on-device
+    /// tombstone, and the allocator free MUST happen in the order:
     ///
-    /// 1. Tombstone the metadata header (so any rebuild-from-device can no
+    /// 2. Unregister the key from the primary index.
+    /// 3. Journal + fsync the `RedoOp::FreeRegion` — the delete's COMMIT POINT.
+    /// 4. Tombstone the metadata header (so any rebuild-from-device can no
     ///    longer parse the record).
-    /// 2. `sync()` the device so the tombstone is durable before any future
-    ///    overwrite of the same region.
-    /// 3. Unregister the key from the primary index.
-    /// 4. Return the region to the allocator.
+    /// 5. `sync()` the device so the tombstone is durable before any future
+    ///    overwrite of the same region (strict durability only).
+    /// 6. Return the region to the allocator's in-memory state.
     ///
-    /// Steps 3 and 4 are deliberately ordered: a concurrent reader that
-    /// holds an offset obtained from the primary index could otherwise see
-    /// the region after it has been re-allocated and rewritten by a parallel
-    /// `create_at_offset`, and would return an unrelated transaction's
-    /// metadata as if it belonged to the deleted key. Unregistering BEFORE
-    /// freeing closes the window — any subsequent `lookup(key)` returns
-    /// `None`, so no reader can dereference the post-free offset under this
-    /// key. Even if the ordering ever regresses, `read_metadata_for_key`
-    /// verifies `meta.tx_id == key.txid` and surfaces a mismatch as
-    /// `TxNotFound`.
+    /// (Numbering matches the `Step N` labels in `Self::delete_inner`, whose
+    /// step 1 is the locked lookup + re-validation.)
+    ///
+    /// Step 2 comes first among the mutations for two reasons. A concurrent reader that holds an
+    /// offset obtained from the primary index could otherwise see the region
+    /// after it has been re-allocated and rewritten by a parallel
+    /// `create_at_offset`, and would return an unrelated transaction's metadata
+    /// as if it belonged to the deleted key; it could equally observe the
+    /// half-zeroed header of step 4. Unregistering BEFORE both closes the
+    /// window — any subsequent `lookup(key)` returns `None`. Even if the
+    /// ordering ever regresses, `read_metadata_for_key` verifies
+    /// `meta.tx_id == key.txid` and surfaces a mismatch as `TxNotFound`.
+    ///
+    /// Step 3 comes before step 4 because step 4 DESTROYS the record and step 3
+    /// is the only durable evidence that the destruction was intended; and step
+    /// 6 comes last so the offset is never allocatable while step 4 is still
+    /// zeroing it. See `Self::delete_inner` for the full argument.
+    ///
+    /// # Errors
+    ///
+    /// [`SpendError::TxNotFound`] if the key is absent;
+    /// [`SpendError::StorageError`] on an index-backend or device failure.
+    ///
+    /// A `StorageError` raised BEFORE step 3 means the delete did not happen
+    /// (the record is left intact and indexed). A `StorageError` raised AFTER
+    /// step 3 reports a device failure on a delete that nonetheless COMMITTED:
+    /// every bookkeeping step still ran, and a retry resolves to `TxNotFound`.
+    /// The two are distinguished in metrics by
+    /// `deletes_committed_with_device_error`, which ticks only for the latter.
     ///
     /// # External blob reclamation is DEFERRED (IJ-LOW)
     ///
@@ -9139,19 +9159,18 @@ impl Engine {
     /// drop the master's copy — see `server::dispatch::handle_delete_batch`).
     /// This method itself replicates nothing.
     ///
-    /// Durability of the DELETE is not enforced here: a crash before the
-    /// physical cleanup just leaves the record present (and consistent —
-    /// record + parent-spent slots + allocated region all still agree), and the
-    /// pruner re-deletes it on its next pass (self-healing). For the replicated
-    /// client path that revert is one-sided — the replica journals its own
-    /// `RedoOp::Delete` before ACKing — so a master crash before its next
-    /// checkpoint can leave master-live / replica-absent; see spec §3.18 and
-    /// `docs/DURABILITY_CONTRACT.md` for why that is eventually consistent and
-    /// not a lost UTXO. Physically identical to [`Self::delete`] (RAM-index
-    /// unregister + header zero via the write-back cache + region free); the
-    /// distinct name documents the pruner's intent at the call site.
-    /// Returns `Ok(())` on success or when the record is already gone
-    /// (idempotent).
+    /// Physically identical to [`Self::delete`] — same ordering, same commit
+    /// point, same deferred-error contract; the distinct name documents the
+    /// pruner's intent at the call site.
+    ///
+    /// Crash behaviour is [`Self::delete`]'s: the fsynced `RedoOp::FreeRegion`
+    /// is the commit point, written BEFORE the record's header is destroyed. A
+    /// crash before it leaves the record present and consistent (record +
+    /// parent-spent slots + allocated region all still agree) and the pruner
+    /// re-deletes it on its next pass (self-healing); a crash after it resolves
+    /// DELETE-WINS and does not revert. See spec §3.18 and
+    /// `docs/DURABILITY_CONTRACT.md`. What IS deferred to the next checkpoint is
+    /// the deletion tombstone, not the delete — see `ops::tombstone` (TS-1).
     ///
     /// Two things this does NOT mean, both previously mis-stated here:
     ///
@@ -9168,6 +9187,25 @@ impl Engine {
     ///   [`delete_inner`](Self::delete_inner) records a generation-aware
     ///   deletion tombstone whenever a tombstone log is attached — which is the
     ///   default for RF > 1. Only [`Self::reclaim_held_copy`] skips it.
+    ///
+    /// # Errors
+    ///
+    /// [`SpendError::TxNotFound`] when the record is absent. NOTE: this is NOT
+    /// `Ok(())` — an earlier version of this doc claimed it was. Callers that
+    /// treat an already-gone record as success (the DAH sweep and the orphan
+    /// reclaim both do, since delete is idempotent GC) must match on
+    /// `TxNotFound` explicitly.
+    ///
+    /// [`SpendError::NotDue`] when `req.due_guard` is set and the record
+    /// re-validates as not sweep-eligible under the stripe lock — the record is
+    /// left completely untouched and NO tombstone is written.
+    ///
+    /// [`SpendError::StorageError`] on an index-backend or device failure, and
+    /// on a write-unhealthy (redo-poisoned) node for a guarded sweep delete
+    /// (fail-closed). As in [`Self::delete`], a `StorageError` raised after the
+    /// commit point reports a device failure on a delete that nonetheless
+    /// COMMITTED — the record IS gone; the
+    /// `deletes_committed_with_device_error` counter distinguishes the two.
     pub fn prune_delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
         self.delete_inner(req, RemovalAuthority::Authoritative, None, None)
     }
@@ -9216,12 +9254,14 @@ impl Engine {
     /// delete it emits a fsynced `RedoOp::FreeRegion` and a
     /// `RedoOp::SecondaryDahUpdate` intent (see [`Self::prune_delete`]). Neither
     /// names the key, so neither can leak into a migration delta.
-    /// Returns `Ok(())` on success or when the record is already gone
-    /// (idempotent).
     ///
     /// # Errors
     ///
-    /// Same contract as [`Self::prune_delete`]:
+    /// Same contract as [`Self::prune_delete`]. In particular an already-gone
+    /// record is `TxNotFound`, NOT `Ok(())` — this doc used to claim otherwise
+    /// two lines above its own error list. Delete is idempotent GC, so callers
+    /// that want "already gone is fine" must match on `TxNotFound` themselves.
+    ///
     /// [`SpendError::TxNotFound`] when the key is absent,
     /// [`SpendError::NotDue`] when `req.due_guard` is set and the under-lock
     /// re-validation finds the record no longer sweep-due, and
@@ -9271,14 +9311,52 @@ impl Engine {
     /// ([`Self::delete_compensated_create`], `CompensatedCreate`). Every other
     /// step is identical.
     ///
-    /// # Ordering (F-G2-001)
+    /// # Ordering (F-G2-001, W14 commit-before-destroy)
     ///
-    /// 1. Zero the on-device metadata header (rebuild skip-guard).
-    /// 2. `sync()` the data device so the zeroed header is durable before any
-    ///    future overwrite of the freed region.
-    /// 3. Unregister the key from the primary index.
-    /// 4. Return the region to the allocator (after the primary-index removal,
-    ///    so no `lookup(key)` can reach the post-free offset — F-G2-001).
+    /// The numbers below are the `Step N` labels in the body, so this block and
+    /// the code read as one sequence:
+    ///
+    /// 1. Take the per-tx stripe lock, resolve the index entry, and re-validate
+    ///    the delete under it (`due_guard` sweep predicate, `expected_generation`).
+    /// 2. Unregister the key from the primary index (RAM). Precedes every
+    ///    device write so a lock-free reader can never resolve this key to the
+    ///    about-to-be-zeroed header (it sees the intact record, or nothing).
+    /// 3. `journal_free` — append + fsync the `RedoOp::FreeRegion`. This is the
+    ///    delete's ONLY durable commit record (production journals no
+    ///    `RedoOp::Delete`) and it MUST precede step 4: see below.
+    /// 4. Zero the on-device metadata header (device-scan rebuild skip-guard).
+    /// 5. `sync()` the data device so the zeroed header is durable before any
+    ///    future overwrite of the freed region (strict durability only;
+    ///    buffered defers to the checkpoint barrier).
+    /// 6. `apply_journaled_free` — return the region to the allocator's
+    ///    in-memory state. Last, so (a) no `lookup(key)` can reach a
+    ///    freed-and-reused offset (F-G2-001) and (b) no concurrent `create` can
+    ///    claim the offset before step 4 zeroes it.
+    ///
+    /// ## Why 3 must precede 4 (W14 / CI scenario 09)
+    ///
+    /// Step 4 DESTROYS the record. Step 3 is the only evidence that the
+    /// destruction was intended. Pre-fix the order was 4-5-3, so a crash in
+    /// between made the destruction durable while the commit record was never
+    /// written. Recovery then restored the key from the pre-delete index
+    /// snapshot, no `FreeRegion` replay could evict it
+    /// (`recovery::evict_freed_region_owner` had nothing to replay), and the
+    /// key was left pointing at zeroed bytes forever — every read failing
+    /// `record corruption: CRC mismatch: expected 0x00000000`, every migration
+    /// baseline into the shard NACKing on it, the cluster wedged. Committing
+    /// first makes the window resolve DELETE-WINS instead: replay evicts the
+    /// entry whether or not the header write survived.
+    ///
+    /// It also repairs backup/restore, which is teed off the redo tail: any cut
+    /// that captures the destruction now necessarily contains the commit record
+    /// that explains it, so a restored image can no longer carry a phantom the
+    /// live node never had.
+    ///
+    /// The fix errs toward LOSING an uncommitted delete, never toward losing a
+    /// record: a crash before step 3 reverts the whole delete (the client was
+    /// never acked, since step 3 has not returned), while any delete that WAS
+    /// acked is durable at step 3 — strictly earlier than before, so the
+    /// acked-delete-survives guarantee is preserved, not weakened.
     fn delete_inner(
         &self,
         req: &DeleteRequest,
@@ -9390,23 +9468,33 @@ impl Engine {
         // (F-G2-001 — a freed+reused offset must never be reachable via a live
         // index entry), and it now also precedes the tombstone.
         //
-        // Crash recovery of a buffered delete: production journals NO
-        // `RedoOp::Delete` (deletes are local prune GC). The fsynced
-        // `FreeRegion` redo record written at the allocator `free_durable`
-        // below (both engines journal it there) is the
-        // delete's ONLY durable commit record; the tombstone header write and
-        // this index removal stay in the write-back cache until the next
-        // checkpoint. Recovery resolves that window DELETE-WINS: `FreeRegion`
-        // replay evicts every index entry still pointing at the freed slot
-        // (`recovery::evict_freed_region_owner`), so a delete that crossed the
-        // last index snapshot — or whose still-intact record a device-scan
-        // rebuild re-indexed as live — does not resurrect as a phantom over
-        // freed bytes. The freelist carve-out
-        // (`recovery::reconcile_freelist_against_live_index`) is NOT the
-        // delete's undo: it is the safety net for the no-`FreeRegion`-in-tail
-        // case only (e.g. a torn checkpoint sequence), keeping a future
-        // allocation from overwriting a live record whose free never became
-        // durable. The tombstone remains the device-scan-rebuild guard for a
+        // Crash recovery of a delete: production journals NO `RedoOp::Delete`
+        // (deletes are local prune GC). The fsynced `FreeRegion` redo record
+        // written at `journal_free` below (both engines journal it there) is
+        // the delete's ONLY durable commit record; the tombstone header write
+        // and this index removal stay in the write-back cache until the next
+        // checkpoint. Recovery resolves the post-commit window DELETE-WINS:
+        // `FreeRegion` replay evicts every index entry still pointing at the
+        // freed slot (`recovery::evict_freed_region_owner`), so a delete that
+        // crossed the last index snapshot — or whose still-intact record a
+        // device-scan rebuild re-indexed as live — does not resurrect as a
+        // phantom over freed bytes.
+        //
+        // W14: that guarantee holds ONLY because the commit record is written
+        // BEFORE the destructive header write. When the order was reversed, a
+        // crash between the two left the destruction durable with no commit
+        // record, and recovery had no way to tell a deleted record from a
+        // corrupt one: the pre-delete index snapshot restored the key over
+        // zeroed bytes and `reconcile_freelist_against_live_index` PINNED that
+        // phantom (its offset is not on the freelist — no `FreeRegion` ever
+        // replayed — so it was treated as a live record to protect). Every
+        // read of the key then failed `CRC mismatch: expected 0x00000000`
+        // forever. The carve-out is NOT the delete's undo: it is the safety net
+        // for the no-`FreeRegion`-in-tail case only (e.g. a torn checkpoint
+        // sequence), keeping a future allocation from overwriting a live record
+        // whose free never became durable — and with commit-before-destroy that
+        // case now genuinely IS a live record, because nothing destroyed it.
+        // The tombstone remains the device-scan-rebuild guard for a
         // CHECKPOINTED delete (durable tombstone ⇒ the record is not
         // re-indexed at all).
         //
@@ -9420,13 +9508,95 @@ impl Engine {
                 detail: format!("index unregister failed: {e}"),
             })?;
 
-        // Step 3: Tombstone the metadata header (now unreachable via the index) so
+        // Step 3 (W14 — THE COMMIT POINT): durably journal the region release.
+        //
+        // `journal_free` appends and fsyncs the `RedoOp::FreeRegion` that is the
+        // delete's ONLY durable commit record on BOTH engines, and returns a
+        // token WITHOUT making the region allocatable. Two things hang on it
+        // running HERE rather than after the header write:
+        //
+        //  * commit-before-destroy — step 4 destroys the record. If the
+        //    destruction can become durable while the commit record has not,
+        //    recovery cannot distinguish a deleted record from a corrupt one
+        //    and pins an unreadable phantom (the header block above).
+        //  * the region stays UN-allocatable until `apply_journaled_free`
+        //    below, so no concurrent `create` can be handed this offset and
+        //    then have its brand-new record zeroed by step 4.
+        //
+        // `journal_free`/`free_durable`, never plain `free`: the in-place
+        // SlotAllocator journals inside its plain `free` anyway; the segment
+        // allocator journals ONLY on the durable path — its plain `free` is the
+        // un-journaled relocate-on-spend dead-mark and must stay that way.
+        //
+        // Nothing durable or destructive has happened yet if this fails, so the
+        // delete aborts as a clean no-op: re-register the entry (the RAM-only
+        // unregister above is the single side effect to undo) and propagate.
+        let journaled_free = {
+            let mut alloc = self.allocator_for(entry.device_id).lock();
+            alloc.journal_free(entry.record_offset, record_size)
+        };
+        let journaled_free = match journaled_free {
+            Ok(j) => j,
+            Err(e) => {
+                if let Err(re) = self.register_with_shard_count(req.tx_key, entry) {
+                    tracing::error!(
+                        target: "teraslab::ops::delete",
+                        txid_prefix = ?&req.tx_key.txid[..4],
+                        device_id = entry.device_id,
+                        record_offset = entry.record_offset,
+                        error = %re,
+                        "delete abort could not re-register the key after its commit \
+                         record failed to journal; the record's bytes are intact and \
+                         the next boot restores it from the index snapshot, but it is \
+                         unreachable until then",
+                    );
+                }
+                return Err(SpendError::StorageError {
+                    detail: format!("{e}"),
+                });
+            }
+        };
+
+        // Step 4: Tombstone the metadata header (now unreachable via the index) so
         // a crash-time DEVICE-SCAN rebuild cannot resurrect this record from stale
         // bytes in freed space. The marker overwrites the full header, carrying
         // `record_size` so a device scan skips the WHOLE deleted record, not just
         // its first alignment block (multi-block boot-loop fix).
-        self.write_zeroed_metadata_header(entry.device_id, entry.record_offset, record_size)?;
-        // Step 4: Sync so the zeroed header is durable before any reuse.
+        //
+        // PAST THE COMMIT POINT. The delete is durable from here on whatever
+        // happens, so a failure below must NOT short-circuit the rest of the
+        // function: bailing out would skip the secondary-index cleanup (leaking
+        // dead DAH/preserve/conflicting entries and a mined slot for a record
+        // that is durably gone) and — worse — skip the deletion tombstone,
+        // leaving a durable delete with no tombstone. That is exactly the
+        // Invariant TS-1 violation `ops::tombstone` warns about, the one that
+        // lets Phase-2c reverse-heal resurrect the deleted record. So every
+        // post-commit device error is DEFERRED: the bookkeeping runs to
+        // completion and the first error is returned at the end, so callers
+        // still see the device failure (the compensating-delete path relies on
+        // it to report a non-clean rollback).
+        //
+        // The header marker itself is only the device-scan-rebuild guard; with
+        // the `FreeRegion` durable, replay evicts the index entry and a rebuild
+        // skips the freed region, so losing the marker costs defence in depth,
+        // not correctness.
+        let mut deferred: Option<SpendError> = None;
+        if let Err(e) =
+            self.write_zeroed_metadata_header(entry.device_id, entry.record_offset, record_size)
+        {
+            tracing::error!(
+                target: "teraslab::ops::delete",
+                txid_prefix = ?&req.tx_key.txid[..4],
+                device_id = entry.device_id,
+                record_offset = entry.record_offset,
+                error = %e,
+                "delete could not write the deleted-record marker; the delete is \
+                 already durably committed (FreeRegion fsynced) so it stands, but \
+                 this record's bytes are left readable until the region is reused",
+            );
+            deferred = Some(e);
+        }
+        // Step 5: Sync so the zeroed header is durable before any reuse.
         //
         // Under BUFFERED (relaxed) durability we skip this synchronous fsync on
         // the hot path: the zeroed-header write has already landed in the
@@ -9438,32 +9608,67 @@ impl Engine {
         // dropped. Pre-fix this per-delete fsync was the dominant component of
         // the delete-latency floor (the p99.9 blocker). Strict durability keeps
         // the synchronous sync exactly as before.
-        if !self.redo_buffered() {
-            self.device_for(entry.device_id)
-                .sync()
-                .map_err(|e| SpendError::StorageError {
-                    detail: format!("delete tombstone sync failed: {e}"),
-                })?;
+        //
+        // Past the commit point, as step 4: defer a sync failure and continue.
+        if !self.redo_buffered()
+            && let Err(e) = self.device_for(entry.device_id).sync()
+        {
+            tracing::error!(
+                target: "teraslab::ops::delete",
+                txid_prefix = ?&req.tx_key.txid[..4],
+                device_id = entry.device_id,
+                error = %e,
+                "delete could not fsync the deleted-record marker; the delete is \
+                 already durably committed (FreeRegion fsynced) so it stands",
+            );
+            deferred.get_or_insert(SpendError::StorageError {
+                detail: format!("delete tombstone sync failed: {e}"),
+            });
         }
 
-        // Step 5: Return the region to the allocator. From this point on
-        // the offset can be handed out to a future `create`/`create_at_offset`.
-        // Because step 2 already removed the primary-index entry, no
-        // reader can reach this offset via `lookup(req.tx_key)` any longer.
+        // Fault-injection sync point: "the record's bytes are destroyed on the
+        // device (and fsynced under strict durability), the freed region has
+        // not yet been returned to the allocator." A crash here must NOT leave
+        // the index claiming this record — the commit record above is what
+        // guarantees it.
+        crate::fault_injection::check(
+            crate::fault_injection::SyncPoint::AfterDeleteTombstoneBeforeFree,
+        );
+
+        // Step 6: Return the region to the allocator's IN-MEMORY state. From
+        // this point on the offset can be handed out to a future
+        // `create`/`create_at_offset` — which is why it comes last: step 2
+        // already removed the primary-index entry, so no reader can reach a
+        // reused offset via `lookup(req.tx_key)` (F-G2-001), and step 4 has
+        // finished zeroing the header, so a successor's record cannot be
+        // clobbered by it.
         //
-        // `free_durable`, not `free`: the fsynced `FreeRegion` this journals
-        // is the delete's ONLY durable commit record on BOTH engines. The
-        // in-place SlotAllocator journals inside its plain `free` anyway;
-        // the segment allocator journals ONLY here — its plain `free` is the
-        // un-journaled relocate-on-spend dead-mark and must stay that way
-        // (scenario-09 phantom fix).
+        // The `FreeRegion` is already durable, so a failure here must NOT abort
+        // the (committed) delete; it is deferred like every other post-commit
+        // error. The region is then leaked in memory until a boot whose replayed
+        // tail still carries the `FreeRegion` — NOT unconditionally "the next
+        // boot": if a checkpoint fences and reclaims the redo prefix past this
+        // entry first, the leak is permanent (space on the in-place engine,
+        // short dead-byte accounting on the segment engine). See
+        // `RecordAllocator::journal_free`.
         {
             let mut alloc = self.allocator_for(entry.device_id).lock();
-            alloc
-                .free_durable(entry.record_offset, record_size)
-                .map_err(|e| SpendError::StorageError {
+            if let Err(e) = alloc.apply_journaled_free(journaled_free) {
+                tracing::error!(
+                    target: "teraslab::ops::delete",
+                    txid_prefix = ?&req.tx_key.txid[..4],
+                    device_id = entry.device_id,
+                    record_offset = entry.record_offset,
+                    error = %e,
+                    "delete could not apply its already-durable FreeRegion to the \
+                     allocator; the region is leaked until a boot replays the \
+                     journal entry (permanently, if a checkpoint reclaims that \
+                     redo prefix first)",
+                );
+                deferred.get_or_insert(SpendError::StorageError {
                     detail: format!("{e}"),
-                })?;
+                });
+            }
         }
 
         // Clean up secondary indexes with two-phase durability, gated off the
@@ -9482,12 +9687,39 @@ impl Engine {
         // when EITHER the footer OR the live secondary height is non-zero.
         // (`update_dah_index`'s `remove` is by-key; `old_height` is only a
         // non-zero gate, so any non-zero value drives the removal.)
+        //
+        // These are PAST THE COMMIT POINT, so their errors are deferred like
+        // the header write's rather than propagated with `?`. A short-circuit
+        // here would skip the deletion tombstone below and leave a durable
+        // delete with no tombstone — the Invariant TS-1 violation that lets
+        // Phase-2c reverse-heal resurrect the record. The remaining steps are
+        // all in-RAM and independent of these, so continuing is safe.
         let live_dah = self.dah_index().get_height(&req.tx_key).unwrap_or(0);
-        if device_dah != 0 || live_dah != 0 {
-            self.update_dah_index(&req.tx_key, device_dah.max(live_dah), 0)?;
+        if (device_dah != 0 || live_dah != 0)
+            && let Err(e) = self.update_dah_index(&req.tx_key, device_dah.max(live_dah), 0)
+        {
+            tracing::error!(
+                target: "teraslab::ops::delete",
+                txid_prefix = ?&req.tx_key.txid[..4],
+                error = %e,
+                "delete could not remove the DAH secondary entry; the delete is \
+                 already durably committed so it stands, and the stale entry is \
+                 reconciled at the next boot",
+            );
+            deferred.get_or_insert(e);
         }
-        if device_preserve != 0 {
-            self.update_preserve_index(&req.tx_key, device_preserve, 0)?;
+        if device_preserve != 0
+            && let Err(e) = self.update_preserve_index(&req.tx_key, device_preserve, 0)
+        {
+            tracing::error!(
+                target: "teraslab::ops::delete",
+                txid_prefix = ?&req.tx_key.txid[..4],
+                error = %e,
+                "delete could not remove the preserve secondary entry; the delete \
+                 is already durably committed so it stands, and the stale entry is \
+                 reconciled at the next boot",
+            );
+            deferred.get_or_insert(e);
         }
 
         // Drop any conflicting-index entry for the deleted record. The
@@ -9510,13 +9742,15 @@ impl Engine {
 
         // Reverse-heal Phase 2a: record the deletion tombstone. Reached ONLY
         // after the KO-3 recheck passed (a NotDue/preserved delete returned
-        // `NotDue` early above, writing no tombstone — design §G/E3) and every
-        // destructive step succeeded. The record is an in-RAM insert + a
-        // RAM-buffered on-disk append that flushes on the SAME checkpoint
-        // barrier as the unregister + FreeRegion — no extra hot-path fsync, so
-        // the delete-latency floor is untouched, and a crash before checkpoint
-        // reverts BOTH the delete and the tombstone (Invariant TS-1). No-op when
-        // tombstones are disabled (no log attached).
+        // `NotDue` early above, writing no tombstone — design §G/E3) and the
+        // delete durably COMMITTED (`journal_free` above). It is deliberately
+        // NOT gated on `deferred`: a post-commit device error does not un-delete
+        // the record, and a durable delete without a tombstone is the TS-1
+        // violation that lets reverse-heal resurrect it. The record is an in-RAM
+        // insert + a RAM-buffered on-disk append that flushes on the SAME
+        // checkpoint barrier as the unregister — no extra hot-path fsync, so the
+        // delete-latency floor is untouched. No-op when tombstones are disabled
+        // (no log attached).
         //
         // SKIPPED ENTIRELY for a `RemovalAuthority::HeldCopy` reclaim: a
         // tombstone is an authority's veto over any future re-delivery of the
@@ -9541,7 +9775,25 @@ impl Engine {
             log.record(&req.tx_key, frozen_generation, deletion_height, cause);
         }
 
-        Ok(())
+        // Surface the first POST-COMMIT device error, if any. The delete itself
+        // stood (its `FreeRegion` is durable) and every bookkeeping step above
+        // ran, but the caller is told the node hit a device failure — the
+        // compensating-delete path reports that as a non-clean rollback, and a
+        // retry of the delete resolves benignly to `TxNotFound`.
+        //
+        // Neither consumer can distinguish this from "the delete did not
+        // happen" (the client maps it to `ERR_STORAGE_IO`), so it is counted
+        // separately: `deletes_committed_with_device_error` is the only signal
+        // that the record IS gone and the DEVICE is what is failing.
+        match deferred {
+            Some(e) => {
+                if let Some(m) = crate::server::dispatch::dispatch_metrics_handle() {
+                    m.deletes_committed_with_device_error.inc();
+                }
+                Err(e)
+            }
+            None => Ok(()),
+        }
     }
 
     /// Expire a preservation whose `preserve_until` height has been reached.
@@ -17802,6 +18054,236 @@ mod tests {
         assert!(
             matches!(gone, Err(SpendError::TxNotFound)),
             "unmapped key → benign race must resolve to TxNotFound, got {gone:?}"
+        );
+    }
+
+    /// W14 Layer A (scenario-09 phantom): a delete whose durable COMMIT RECORD
+    /// could not be written must not have destroyed the record's bytes.
+    ///
+    /// Production journals no `RedoOp::Delete`; the fsynced `RedoOp::FreeRegion`
+    /// the allocator writes is the delete's ONLY durable commit record. Pre-fix
+    /// `delete_inner` zeroed the on-device metadata header BEFORE writing it, so
+    /// the destructive write could land with nothing on the redo log saying the
+    /// delete ever happened. A pre-delete index snapshot then resurrected the
+    /// entry over zeroed bytes — a PHANTOM whose every read fails with
+    /// `record corruption: CRC mismatch: expected 0x00000000` forever, and which
+    /// no `FreeRegion` replay can evict because none was ever written.
+    ///
+    /// Poisoning the redo log makes that window deterministic: the commit record
+    /// cannot be written at all. The delete must therefore abort having touched
+    /// NO device byte, and leave the key exactly as it found it.
+    #[test]
+    fn delete_does_not_destroy_the_record_before_its_commit_record_is_durable() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let redo = Arc::new(parking_lot::Mutex::new(
+            crate::redo::RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap(),
+        ));
+
+        // Wire the log to the ALLOCATOR (the FreeRegion journaler) exactly as
+        // production startup does, and to the engine.
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        alloc.set_redo_log(redo.clone());
+        let engine = Arc::new(Engine::new(
+            dev.clone(),
+            Index::new(64).unwrap(),
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+        ));
+        engine.set_redo_logs(vec![redo.clone()]);
+
+        // Seed one live record.
+        let utxo_count = 2u32;
+        let mut txid = [0u8; 32];
+        txid[0] = 0x5D;
+        let key = TxKey { txid };
+        let record_size = TxMetadata::record_size_for(utxo_count);
+        let offset = engine
+            .allocator_for(0)
+            .lock()
+            .allocate(record_size)
+            .unwrap();
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = txid;
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = (i as u8) + 1;
+                UtxoSlot::new_unspent(h)
+            })
+            .collect();
+        io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
+        engine
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+
+        // Poison the redo log: the delete's `FreeRegion` journal — its only
+        // durable commit record — now fails deterministically.
+        redo.lock().poison();
+
+        let err = engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .expect_err("delete must fail when its commit record cannot be journaled");
+        assert!(
+            matches!(err, SpendError::StorageError { .. }),
+            "expected a StorageError from the failed journal, got {err:?}"
+        );
+
+        // The record's bytes must be INTACT: nothing may be destroyed before
+        // the delete's commit record is durable.
+        let after = io::read_metadata(&*dev, offset).unwrap_or_else(|e| {
+            panic!(
+                "delete destroyed the record before its commit record was durable — \
+                 exactly the scenario-09 phantom (a pre-delete index snapshot would \
+                 now point at unreadable bytes): {e}"
+            )
+        });
+        assert_eq!(
+            { after.tx_id },
+            txid,
+            "the surviving header must still be this record's"
+        );
+        assert_eq!(
+            { after.utxo_count },
+            utxo_count,
+            "the surviving header must still carry the record's utxo_count"
+        );
+
+        // …and the failed delete is a true no-op: the key is still indexed at
+        // the same offset, so the live record stays reachable.
+        let entry = engine
+            .lookup(&key)
+            .expect("a delete that could not commit must leave the key indexed");
+        assert_eq!(
+            entry.record_offset, offset,
+            "the restored index entry must still point at the record"
+        );
+        assert_eq!(entry.device_id, 0, "the restored entry must keep its store");
+        let via_index = engine
+            .read_metadata(&key)
+            .expect("the still-indexed record must remain readable");
+        assert_eq!(
+            { via_index.tx_id },
+            txid,
+            "reading through the index must return this record"
+        );
+    }
+
+    /// The LOG-STRUCTURED (segment) engine's half of
+    /// [`Self::delete_does_not_destroy_the_record_before_its_commit_record_is_durable`].
+    ///
+    /// Both engines share the one `delete_inner` call site, but they journal
+    /// their `FreeRegion` in different places (the in-place SlotAllocator inside
+    /// its plain `free`; the segment allocator ONLY on the durable path, because
+    /// its plain `free` is the un-journaled relocate-on-spend dead-mark). The
+    /// commit-before-destroy ordering therefore has to be re-proved here rather
+    /// than inferred — this is the engine CI scenario 09 ran on.
+    #[test]
+    fn segment_delete_does_not_destroy_the_record_before_its_commit_record_is_durable() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let redo = Arc::new(parking_lot::Mutex::new(
+            crate::redo::RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap(),
+        ));
+
+        let mut seg =
+            crate::segment_allocator::SegmentAllocator::new(dev.clone(), 8 * 1024 * 1024).unwrap();
+        crate::allocator::RecordAllocator::set_redo_log(&mut seg, redo.clone());
+        let engine = Arc::new(Engine::new(
+            dev.clone(),
+            Index::new(64).unwrap(),
+            seg,
+            StripedLocks::new(64),
+            DahIndex::new(),
+        ));
+        engine.set_redo_logs(vec![redo.clone()]);
+        assert!(
+            engine.store_is_log_structured(0),
+            "this test must run on the segment engine"
+        );
+
+        let utxo_count = 2u32;
+        let mut txid = [0u8; 32];
+        txid[0] = 0x6E;
+        let key = TxKey { txid };
+        let record_size = TxMetadata::record_size_for(utxo_count);
+        let offset = engine
+            .allocator_for(0)
+            .lock()
+            .allocate(record_size)
+            .unwrap();
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = txid;
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = (i as u8) + 1;
+                UtxoSlot::new_unspent(h)
+            })
+            .collect();
+        io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
+        engine
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                },
+            )
+            .unwrap();
+
+        redo.lock().poison();
+
+        let err = engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .expect_err("delete must fail when its commit record cannot be journaled");
+        assert!(
+            matches!(err, SpendError::StorageError { .. }),
+            "expected a StorageError from the failed journal, got {err:?}"
+        );
+
+        let after = io::read_metadata(&*dev, offset).unwrap_or_else(|e| {
+            panic!(
+                "segment engine: delete destroyed the record before its commit \
+                 record was durable — the scenario-09 phantom: {e}"
+            )
+        });
+        assert_eq!({ after.tx_id }, txid, "the record's header must survive");
+
+        let entry = engine
+            .lookup(&key)
+            .expect("a delete that could not commit must leave the key indexed");
+        assert_eq!(entry.record_offset, offset);
+        // The segment engine's dead-byte accounting must be untouched too: the
+        // aborted delete may not have dead-marked the region.
+        let dead = engine
+            .allocator_for(0)
+            .lock()
+            .segment_stats()
+            .expect("segment engine reports segment stats")
+            .dead_bytes;
+        assert_eq!(
+            dead, 0,
+            "an aborted delete must not dead-mark the region it failed to free"
         );
     }
 
