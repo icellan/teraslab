@@ -311,6 +311,30 @@ pub struct MigrationProgress {
     /// coordination state: NOT serialized by `serialize_outbound` (restored
     /// entries are re-stamped, and no pre-restart capture survives a boot).
     pub attempt: u64,
+    /// W16 review P1-1 — the [`Self::attempt`] generation that stamped the
+    /// CURRENT `snapshot_sequence`, or `None` when no live reader holds a redo
+    /// read position for this entry.
+    ///
+    /// `snapshot_sequence` alone cannot answer "is a reader holding the redo log
+    /// at this position right now": [`MigrationManager::retry_failed`] flips a
+    /// parked entry back to `Streaming` and bumps `attempt` but LEAVES the
+    /// previous attempt's `snapshot_sequence` in place, and
+    /// [`MigrationManager::take_failed_tasks`] does that for every parked entry
+    /// at once. A state-only holder test would therefore re-arm N
+    /// permanently-unsatisfiable floors (sequences already below the log's
+    /// earliest surviving entry) the instant the retry queue drains, and hold
+    /// them for the whole re-drive latency — pool queueing plus connect ladders.
+    /// Keying the hold to the attempt makes every re-drive invalidate it
+    /// automatically, whatever the state machine does.
+    ///
+    /// Cleared by [`MigrationManager::release_delta_reader_hold`] as soon as
+    /// Phase 3 has read the window (review P2-2), so the manifest fold and the
+    /// completion handshake do not keep pinning the log.
+    ///
+    /// Process-local like `attempt`, and likewise NOT serialized by
+    /// `serialize_outbound`: a restored entry gets `None`, so nothing carried
+    /// across a boot can hold the floor.
+    pub snapshot_hold_attempt: Option<u64>,
 }
 
 impl MigrationProgress {
@@ -328,6 +352,7 @@ impl MigrationProgress {
             snapshot_sequence: 0,
             fence_sequence: 0,
             attempt: 0,
+            snapshot_hold_attempt: None,
         }
     }
 
@@ -2089,10 +2114,29 @@ impl MigrationManager {
     }
 
     /// Set the snapshot sequence checkpoint for a migration task.
+    ///
+    /// W16 — this is Phase 1, where the worker starts holding a redo READ
+    /// position at `seq`: it will not read the window until Phase 3, with the
+    /// whole baseline stream in between. The hold is stamped with the entry's
+    /// current [`MigrationProgress::attempt`] so any re-drive invalidates it
+    /// (see [`MigrationProgress::snapshot_hold_attempt`]), and published to the
+    /// checkpoint reset guard through [`Self::delta_reader_redo_floor`].
+    ///
+    /// The worker reads `current_sequence()` and calls this as two separate
+    /// statements, so the hold is published a moment after the position is
+    /// captured. That gap cannot lose a race with a checkpoint (review P2-4):
+    /// the checkpoint samples `entries_before` at its START and only evaluates
+    /// the guard at its END, after the snapshot, so a capture low enough to be
+    /// harmed (`seq < entries_before`) necessarily happened before the
+    /// checkpoint began — and this publish would have to be delayed past the
+    /// checkpoint's ENTIRE duration to be missed. Closing it outright would mean
+    /// taking the redo lock inside the migration lock, inverting the ordering
+    /// this module enforces everywhere else; not worth it.
     pub fn set_snapshot_sequence(&mut self, task: &MigrationTask, seq: u64) {
         let prev_state = self.find_task_mut(task).map(|p| p.state.clone());
         if let Some(p) = self.find_task_mut(task) {
             p.snapshot_sequence = seq;
+            p.snapshot_hold_attempt = Some(p.attempt);
             p.state = MigrationState::Streaming;
         }
         if let Some(m) = migration_metrics() {
@@ -2274,6 +2318,15 @@ impl MigrationManager {
     /// earlier batch's end-of-batch abandoned sweep would see its captured
     /// stamp match and park the entry out from under the retry batch —
     /// lifting its fence mid fence-to-completion window.
+    ///
+    /// W16 review P1-1 — the fresh `attempt` stamp is ALSO what invalidates this
+    /// entry's redo read hold. `snapshot_sequence` is deliberately left as-is
+    /// (the re-drive overwrites it at its own Phase 1), so it is stale from the
+    /// instant this returns; because
+    /// [`MigrationProgress::snapshot_hold_attempt`] still names the PREVIOUS
+    /// attempt, [`Self::delta_reader_redo_floor`] stops counting it here rather
+    /// than pinning the redo log at an unsatisfiable position for the whole
+    /// re-drive latency. Do not "fix" that by re-stamping the hold.
     ///
     /// Returns true if the migration was found and reset, false otherwise.
     pub fn retry_failed(&mut self, task: &MigrationTask) -> bool {
@@ -2649,11 +2702,21 @@ impl MigrationManager {
     /// target table whose repair is gated behind `active_count() == 0` plus a
     /// 30 s cooldown.
     ///
-    /// Only `Streaming` and `Fenced` entries hold: `Preparing` has not captured
-    /// a position yet (`snapshot_sequence == 0`), and `Complete` / `Failed`
-    /// entries keep a STALE `snapshot_sequence` that no live reader needs — a
-    /// parked entry in the durable retry queue would otherwise pin the log at a
-    /// position its re-drive will replace with a fresh Phase-1 stamp.
+    /// # What qualifies as a holder
+    ///
+    /// An entry holds iff its [`MigrationProgress::snapshot_hold_attempt`]
+    /// matches its CURRENT `attempt` — i.e. the live driver is the one that
+    /// stamped the position — and it is still in `Streaming`/`Fenced`.
+    ///
+    /// The attempt stamp is the load-bearing half, and the state test alone is
+    /// NOT sufficient (review P1-1): `retry_failed` flips a parked entry back to
+    /// `Streaming` while leaving the PREVIOUS attempt's `snapshot_sequence` in
+    /// place, and `take_failed_tasks` does that to every parked entry at once —
+    /// so a state-only test re-arms a burst of permanently-unsatisfiable floors
+    /// the moment the retry queue drains. `Preparing` has no stamp,
+    /// `Complete`/`Failed` are excluded by both tests, restored entries get
+    /// `None`, and [`Self::release_delta_reader_hold`] clears the stamp the
+    /// instant Phase 3 has read the window.
     ///
     /// The returned sequence is the lowest one still NEEDED (inclusive), not an
     /// ACK watermark; see
@@ -2664,7 +2727,7 @@ impl MigrationManager {
         let mut holders = 0usize;
         let mut floor: Option<u64> = None;
         for p in &self.active {
-            if p.snapshot_sequence == 0 {
+            if p.snapshot_sequence == 0 || p.snapshot_hold_attempt != Some(p.attempt) {
                 continue;
             }
             if p.state != MigrationState::Streaming && p.state != MigrationState::Fenced {
@@ -2674,6 +2737,28 @@ impl MigrationManager {
             floor = Some(floor.map_or(p.snapshot_sequence, |f: u64| f.min(p.snapshot_sequence)));
         }
         (holders, floor)
+    }
+
+    /// W16 review P2-2 — release this task's redo read hold, without touching
+    /// the migration state machine or the recorded `snapshot_sequence`.
+    ///
+    /// Called by the migration worker the moment Phase 3 has resolved the delta
+    /// window (`collect_migration_delta_ops` returned, either way). Pre-fix the
+    /// hold lived until the task reached `Complete`/`Failed`, so it kept pinning
+    /// the redo log across the manifest fold, the completion handshake, and its
+    /// retries — long after nothing needed the window. On the failure path the
+    /// release is equally correct: the task is about to be parked, and its
+    /// re-drive stamps a fresh position at its own Phase 1.
+    ///
+    /// Returns `true` when a live hold was actually cleared.
+    pub fn release_delta_reader_hold(&mut self, task: &MigrationTask) -> bool {
+        match self.find_task_mut(task) {
+            Some(p) if p.snapshot_hold_attempt.is_some() => {
+                p.snapshot_hold_attempt = None;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Number of shards pending inbound data.
@@ -3837,6 +3922,109 @@ mod tests {
             mgr.delta_reader_redo_floor(),
             (0, None),
             "a failed/parked entry must not pin the redo log",
+        );
+    }
+
+    /// W16 review P1-1 — the retry drain must NOT republish a stale hold.
+    ///
+    /// `take_failed_tasks` calls `retry_failed` for EVERY parked entry at once,
+    /// and `retry_failed` flips the state back to `Streaming` and bumps
+    /// `attempt` but leaves `snapshot_sequence` at the PREVIOUS attempt's value
+    /// — typically already below the log's earliest surviving sequence. A
+    /// state-only holder filter therefore re-arms N permanently-unsatisfiable
+    /// floors the instant the retry queue drains, and holds them until each
+    /// worker reaches its own Phase 1 (pool queueing plus connect ladders, up
+    /// to ~19 s per unreachable target). The hold must be keyed to the
+    /// ATTEMPT that stamped it, so any re-drive invalidates it automatically.
+    #[test]
+    fn take_failed_tasks_does_not_republish_a_stale_redo_hold() {
+        let mut mgr = MigrationManager::new();
+        let self_id = NodeId(1);
+        let task = MigrationTask {
+            shard: 5,
+            from_node: self_id,
+            to_node: NodeId(3),
+            is_master: false,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&task),
+            self_id,
+            &std::collections::HashSet::new(),
+        );
+        mgr.set_snapshot_sequence(&task, 4242);
+        mgr.mark_failed(&task);
+
+        let drained = mgr.take_failed_tasks();
+        assert_eq!(drained.len(), 1, "the parked entry is drained for re-drive");
+        assert_eq!(
+            mgr.active_migrations()[0].state,
+            MigrationState::Streaming,
+            "precondition: retry_failed flipped it back to Streaming",
+        );
+        assert_eq!(
+            mgr.active_migrations()[0].snapshot_sequence,
+            4242,
+            "precondition: retry_failed leaves the PREVIOUS attempt's sequence in place",
+        );
+        assert_eq!(
+            mgr.delta_reader_redo_floor(),
+            (0, None),
+            "a re-driven entry holds nothing until its own Phase 1 stamps a fresh \
+             sequence — the old one is unsatisfiable and would pin the log for the \
+             whole re-drive latency",
+        );
+
+        // Its own Phase 1 re-arms the hold at the CURRENT position.
+        mgr.set_snapshot_sequence(&task, 9000);
+        assert_eq!(mgr.delta_reader_redo_floor(), (1, Some(9000)));
+    }
+
+    /// W16 review P2-2 — a `Fenced` entry keeps holding the floor long after
+    /// its delta has been collected (manifest fold, completion handshake,
+    /// retries). The natural release point is delta collection, not task
+    /// completion.
+    #[test]
+    fn releasing_the_hold_at_delta_collection_frees_the_floor_before_completion() {
+        let mut mgr = MigrationManager::new();
+        let self_id = NodeId(1);
+        let task = MigrationTask {
+            shard: 9,
+            from_node: self_id,
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&task),
+            self_id,
+            &std::collections::HashSet::new(),
+        );
+        mgr.set_snapshot_sequence(&task, 6875);
+        mgr.mark_fenced(&task, 8000);
+        assert_eq!(mgr.delta_reader_redo_floor(), (1, Some(6875)));
+
+        // Phase 3 has read the window; nothing needs `[6875, 8000)` any more.
+        assert!(
+            mgr.release_delta_reader_hold(&task),
+            "releasing a live hold reports the change",
+        );
+        assert_eq!(
+            mgr.delta_reader_redo_floor(),
+            (0, None),
+            "the floor must be free before the completion handshake, not after it",
+        );
+        assert_eq!(
+            mgr.active_migrations()[0].state,
+            MigrationState::Fenced,
+            "releasing the redo hold must not disturb the migration state machine",
+        );
+        assert_eq!(
+            mgr.active_migrations()[0].snapshot_sequence,
+            6875,
+            "nor the recorded snapshot sequence itself",
+        );
+        assert!(
+            !mgr.release_delta_reader_hold(&task),
+            "releasing twice reports no change",
         );
     }
 

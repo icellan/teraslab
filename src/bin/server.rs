@@ -2598,19 +2598,42 @@ fn main() {
             // R13: capture the replication factor by value (u8 is Copy) so the
             // reset-guard closure stays 'static without borrowing `config`.
             let replication_factor = config.replication_factor;
-            // W16 direction 1: the guard now folds TWO classes of redo
-            // consumer, so it needs the log's live usage (to bound the soft
-            // migration hold) and the emergency mark to compare it against.
-            // The usage expression MIRRORS `run_checkpoint_loop`'s exactly
-            // (busiest per-store log, falling back to the single handle): this
-            // is the only bound on an abandoned migration hold, so it must not
-            // silently read 0.0 if a future refactor stops attaching per-store
-            // logs.
+            // W16: the guard folds TWO classes of redo consumer, so it needs the
+            // log's live usage and starved-appender state (to bound the soft
+            // migration hold). The usage expression MIRRORS
+            // `run_checkpoint_loop`'s exactly (busiest per-store log, falling
+            // back to the single handle): the pressure override is the only
+            // bound on an abandoned migration hold, so it must not silently read
+            // 0.0 if a future refactor stops attaching per-store logs.
+            //
+            // W16 review P2-5 — the DECISION itself lives in
+            // `dispatch::evaluate_redo_reset`, not here. This closure is
+            // deliberately nothing but I/O: gather, call, log, publish. Both of
+            // this change's review blockers landed in the logic that used to be
+            // inline here, where no test could reach it.
             let engine_for_reset = engine.clone();
             let log_for_reset = log.clone();
-            let emergency_water = config.checkpoint_emergency_water;
+            // W16 review P2-1 — mirror the loop's own clamp
+            // (`emergency_high_water.max(high_water).min(0.99)`); config
+            // validation permits (0.99, 1.0), which would otherwise make the
+            // loop escalate while this guard kept holding.
+            let emergency_water = teraslab::server::dispatch::effective_emergency_water(
+                config.checkpoint_emergency_water,
+                config.checkpoint_high_water,
+            );
+            // W16 review P1-2 — budget for the BOUNDED migration-mutex read. A
+            // blocking checkpoint holds the exclusive visibility barrier across
+            // this guard, so an unbounded wait would fence out all serving for
+            // as long as some other holder keeps the mutex (the empty-shard
+            // recheck holds it across a full index pass). On expiry the guard
+            // degrades to its ACK-only, pre-W16 behaviour.
+            const DELTA_FLOOR_READ_BUDGET: std::time::Duration =
+                std::time::Duration::from_millis(50);
             let reset_guard: std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync + 'static> =
                 std::sync::Arc::new(move |floor_sequence| {
+                    use teraslab::server::dispatch::{
+                        RedoPressure, RedoResetObservation, evaluate_redo_reset,
+                    };
                     let acked = tracker.all_acked();
                     // C3: seed the reclaim denominator from the topology's
                     // EXPECTED replica set, not just the replicas already
@@ -2622,12 +2645,6 @@ fn main() {
                         .as_ref()
                         .map(|c| c.expected_replica_addrs())
                         .unwrap_or_default();
-                    let min_acked = teraslab::server::dispatch::min_acked_over_expected(
-                        &acked,
-                        &expected,
-                        floor_sequence,
-                        replication_factor,
-                    );
                     // W16 direction 1: replication ACKs are NOT the only redo
                     // consumer. A migration worker captures its baseline
                     // `snapshot_sequence` at Phase 1 and does not read the
@@ -2639,56 +2656,83 @@ fn main() {
                     // checkpoint's own `entries_before`, 67 ms earlier — each
                     // failure calling `rollback_shard` and leaving the node's
                     // target table diverged from every peer's.
-                    let (delta_holders, delta_floor) = cluster_for_reset
-                        .as_ref()
-                        .map(|c| c.migration_delta_reader_redo_floor())
-                        .unwrap_or((0, None));
-                    let redo_usage = if engine_for_reset.has_per_store_redo() {
+                    let delta_reader_floor = match cluster_for_reset.as_ref() {
+                        Some(c) => {
+                            c.migration_delta_reader_redo_floor_bounded(DELTA_FLOOR_READ_BUDGET)
+                        }
+                        // Single-node: no migrations, so nothing holds — this is
+                        // a genuine "read succeeded, zero holders", not a timeout.
+                        None => Some((0, None)),
+                    };
+                    let usage = if engine_for_reset.has_per_store_redo() {
                         engine_for_reset.max_redo_usage_fraction()
                     } else {
                         log_for_reset.lock().usage_fraction()
                     };
-                    let decision = teraslab::server::dispatch::redo_reset_decision(
-                        floor_sequence,
-                        min_acked,
-                        delta_holders,
-                        delta_floor,
-                        redo_usage,
+                    let pressure = RedoPressure {
+                        usage,
                         emergency_water,
-                    );
+                        // The lost-wakeup-free correctness signal the checkpoint
+                        // loop uses to force an emergency drain.
+                        appenders_starved: engine_for_reset
+                            .redo_backpressure()
+                            .is_some_and(|bp| bp.blocked_appenders() > 0),
+                    };
+                    let decision = evaluate_redo_reset(RedoResetObservation {
+                        floor_sequence,
+                        acked: &acked,
+                        expected: &expected,
+                        delta_reader_floor,
+                        pressure,
+                        replication_factor,
+                    });
+                    let (holders, floor) = delta_reader_floor.unwrap_or((0, None));
                     if let Some(m) = teraslab::metrics::redo_metrics() {
                         m.redo_delta_reader_holders.store(
-                            delta_holders.min(u32::MAX as usize) as u32,
+                            holders.min(u32::MAX as usize) as u32,
                             std::sync::atomic::Ordering::Relaxed,
                         );
-                        m.redo_delta_reader_floor.store(
-                            delta_floor.unwrap_or(0),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
+                        m.redo_delta_reader_floor
+                            .store(floor.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
                         if decision.hold_overridden {
                             m.redo_delta_hold_overridden_total.inc();
                         }
+                        if decision.floor_read_timed_out {
+                            m.redo_delta_floor_read_timeouts_total.inc();
+                        }
+                    }
+                    if decision.floor_read_timed_out {
+                        tracing::warn!(
+                            floor_sequence,
+                            budget_ms = DELTA_FLOOR_READ_BUDGET.as_millis() as u64,
+                            "migration delta-reader floor unreadable within budget (migration \
+                             mutex contended); this checkpoint falls back to the ACK-only \
+                             guard and may truncate a live delta reader",
+                        );
                     }
                     if decision.hold_overridden {
                         tracing::warn!(
                             floor_sequence,
-                            delta_reader_holders = delta_holders,
-                            delta_reader_floor = delta_floor,
-                            emergency_water,
-                            "redo log at the emergency mark: dropping the migration \
-                             delta-reader hold so the log can drain (in-flight migration \
-                             deltas will need a full resync)",
+                            delta_reader_holders = holders,
+                            delta_reader_floor = floor,
+                            usage,
+                            starved = pressure.appenders_starved,
+                            release_mark = pressure.soft_hold_release_mark(),
+                            "redo log at the pressure mark: dropping the migration \
+                             delta-reader hold so the log can drain — in-flight deltas will \
+                             fail and roll their shard back (see \
+                             teraslab_redo_delta_hold_overridden_total: alert on any value)",
                         );
                     }
                     if !decision.allow {
                         tracing::warn!(
                             floor_sequence,
-                            min_acked,
+                            min_acked = decision.min_acked,
                             watermark = decision.watermark,
                             expected_replicas = expected.len(),
                             acked_replicas = acked.len(),
-                            delta_reader_holders = delta_holders,
-                            delta_reader_floor = delta_floor,
+                            delta_reader_holders = holders,
+                            delta_reader_floor = floor,
                             "checkpoint reset deferred until redo consumers release the floor",
                         );
                     }

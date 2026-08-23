@@ -1408,6 +1408,11 @@ pub(crate) fn render_metrics_text(
             "teraslab_redo_delta_hold_overridden_total",
             r.redo_delta_hold_overridden_total.get(),
         );
+        prom_counter(
+            &mut out,
+            "teraslab_redo_delta_floor_read_timeouts_total",
+            r.redo_delta_floor_read_timeouts_total.get(),
+        );
         // BC-01: background-checkpoint observability. `triggered_total`
         // increments at the START of each checkpoint, `failed_total`
         // only on error — so `triggered - failed` is the successful
@@ -5677,6 +5682,7 @@ mod tests {
             "teraslab_redo_delta_reader_holders",
             "teraslab_redo_delta_reader_floor",
             "teraslab_redo_delta_hold_overridden_total",
+            "teraslab_redo_delta_floor_read_timeouts_total",
             "teraslab_migration_bytes_transferred_total",
             "teraslab_migration_entries_applied_total",
             "teraslab_migration_active",

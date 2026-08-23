@@ -1339,11 +1339,31 @@ pub struct RedoMetrics {
     pub redo_delta_reader_floor: AtomicU64,
     /// W16 direction 1 — count of checkpoint reset-guard evaluations that
     /// DROPPED the (soft) migration delta-reader hold because the redo log had
-    /// reached the emergency water mark. Each increment means a migration is
-    /// about to fail with `redo log truncated` so that the log can drain — a
-    /// deliberate trade, but sustained growth means migrations and checkpoints
-    /// are fighting and the log is undersized for the write rate.
+    /// reached the pressure mark, or because an appender was already parked in
+    /// the backpressure gate.
+    ///
+    /// # ALERT ON `> 0` — this is a CORRECTNESS signal, not a tuning one
+    ///
+    /// Every increment means an in-flight migration delta is about to fail with
+    /// `redo log truncated`, and every such failure calls
+    /// `ShardTable::rollback_shard` — a NODE-LOCAL mutation of the target
+    /// assignment table taken with no peer agreement. That is a live path back
+    /// into the target-table divergence this counter's fix exists to prevent
+    /// (armed scenario 06 left one node at target_master=1081 /
+    /// target_replica=1070 against 1024/1024 on every peer, with repair gated
+    /// behind `active_count() == 0` plus a 30 s cooldown). Trading a migration
+    /// for the log is the right call in the moment — a full log bricks the node
+    /// — but a node that reaches this point has taken on real divergence risk
+    /// and should be investigated, not just tuned.
     pub redo_delta_hold_overridden_total: PaddedCounter,
+    /// W16 review P1-2 — count of checkpoint reset-guard evaluations whose
+    /// BOUNDED read of the migration delta-reader floor timed out on the
+    /// migration mutex. Each increment is one checkpoint that fell back to the
+    /// pre-W16, ACK-only guard and could therefore truncate a live delta reader.
+    /// A non-zero rate means the migration mutex is being held longer than the
+    /// guard's budget (e.g. the empty-shard recheck's `keys_by_shard_filtered`
+    /// index pass) — pair with `redo_delta_hold_overridden_total`.
+    pub redo_delta_floor_read_timeouts_total: PaddedCounter,
 }
 
 impl Default for RedoMetrics {
@@ -1368,6 +1388,7 @@ impl RedoMetrics {
             redo_delta_reader_holders: AtomicU32::new(0),
             redo_delta_reader_floor: AtomicU64::new(0),
             redo_delta_hold_overridden_total: PaddedCounter::new(),
+            redo_delta_floor_read_timeouts_total: PaddedCounter::new(),
         }
     }
 }

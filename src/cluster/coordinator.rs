@@ -14545,13 +14545,25 @@ fn run_migration_batch_with_origin(
                         }
                         let snapshot_seq = snapshot_seqs[i];
                         let mut delta_failed = false;
-                        match collect_migration_delta_ops(
+                        let delta_result = collect_migration_delta_ops(
                             redo_log,
                             snapshot_seq,
                             fence_seq,
                             task.shard,
                             &engine,
-                        ) {
+                        );
+                        // W16 review P2-2 — the redo window has now been READ (or
+                        // proven unreadable), so release this task's read hold on
+                        // the reclaim floor immediately. Holding it until the task
+                        // reaches Complete/Failed kept the log pinned across the
+                        // manifest fold, the completion handshake and its retries,
+                        // long after nothing needed the window. Released on BOTH
+                        // arms: a failing task is about to be parked, and its
+                        // re-drive stamps a fresh position at its own Phase 1.
+                        {
+                            migration.lock().release_delta_reader_hold(task);
+                        }
+                        match delta_result {
                             Ok(delta_ops) => {
                                 if !delta_ops.is_empty()
                                     && let Err(e) = send_delta_ops(
@@ -23069,17 +23081,31 @@ impl RunningCluster {
     /// [`crate::server::dispatch::redo_reset_decision`] for how the two floors
     /// are folded (and why only this one is soft).
     ///
-    /// # Lock order
+    /// # Lock order and why this is BOUNDED
     ///
     /// A BLOCKING checkpoint evaluates its reset guard while holding the
     /// exclusive dispatch visibility barrier, so this takes the migration mutex
-    /// UNDER that barrier. That matches the direction the rest of the migration
-    /// code already enforces — the migration mutex is deliberately released
-    /// before every `drain_in_flight_mutations` (see that function's callers) —
-    /// so no thread holds the migration mutex while waiting for the barrier and
-    /// there is no cycle. Do not invert it.
-    pub fn migration_delta_reader_redo_floor(&self) -> (usize, Option<u64>) {
-        self.migration.lock().delta_reader_redo_floor()
+    /// UNDER that barrier. The ORDER is right — the migration mutex is
+    /// deliberately released before every `drain_in_flight_mutations` (see that
+    /// function's callers), so no thread holds it while waiting for the barrier
+    /// and there is no cycle. The DURATION is the hazard: the empty-shard
+    /// recheck holds this same mutex across `keys_by_shard_filtered`, a full
+    /// index pass plus a device read per key, and an unbounded wait here would
+    /// fence out every client read and write for its duration.
+    ///
+    /// So this waits at most `timeout` and returns `None` on expiry, mirroring
+    /// [`Self::active_migrations_bounded`] (added for exactly this "a wedged
+    /// holder keeps the migration mutex" case). `None` degrades the guard to its
+    /// pre-W16, ACK-only behaviour — bounded harm, and the same trade the soft
+    /// hold already makes. It cannot be rescued by the pressure override, which
+    /// is evaluated downstream of this read.
+    pub fn migration_delta_reader_redo_floor_bounded(
+        &self,
+        timeout: Duration,
+    ) -> Option<(usize, Option<u64>)> {
+        self.migration
+            .try_lock_for(timeout)
+            .map(|mgr| mgr.delta_reader_redo_floor())
     }
 
     /// Task #75 — bounded [`RunningCluster::active_migrations`]: waits at
@@ -28621,8 +28647,11 @@ mod tests {
                     u64::MAX,
                     holders,
                     floor,
-                    0.5,
-                    0.9,
+                    crate::server::dispatch::RedoPressure {
+                        usage: 0.5,
+                        emergency_water: 0.9,
+                        appenders_starved: false,
+                    },
                 )
                 .allow
             },
