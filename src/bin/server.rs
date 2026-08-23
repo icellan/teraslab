@@ -2601,7 +2601,13 @@ fn main() {
             // W16 direction 1: the guard now folds TWO classes of redo
             // consumer, so it needs the log's live usage (to bound the soft
             // migration hold) and the emergency mark to compare it against.
+            // The usage expression MIRRORS `run_checkpoint_loop`'s exactly
+            // (busiest per-store log, falling back to the single handle): this
+            // is the only bound on an abandoned migration hold, so it must not
+            // silently read 0.0 if a future refactor stops attaching per-store
+            // logs.
             let engine_for_reset = engine.clone();
+            let log_for_reset = log.clone();
             let emergency_water = config.checkpoint_emergency_water;
             let reset_guard: std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync + 'static> =
                 std::sync::Arc::new(move |floor_sequence| {
@@ -2637,12 +2643,17 @@ fn main() {
                         .as_ref()
                         .map(|c| c.migration_delta_reader_redo_floor())
                         .unwrap_or((0, None));
+                    let redo_usage = if engine_for_reset.has_per_store_redo() {
+                        engine_for_reset.max_redo_usage_fraction()
+                    } else {
+                        log_for_reset.lock().usage_fraction()
+                    };
                     let decision = teraslab::server::dispatch::redo_reset_decision(
                         floor_sequence,
                         min_acked,
                         delta_holders,
                         delta_floor,
-                        engine_for_reset.max_redo_usage_fraction(),
+                        redo_usage,
                         emergency_water,
                     );
                     if let Some(m) = teraslab::metrics::redo_metrics() {

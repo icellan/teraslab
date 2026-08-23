@@ -23068,6 +23068,16 @@ impl RunningCluster {
     /// for what qualifies as a holder and
     /// [`crate::server::dispatch::redo_reset_decision`] for how the two floors
     /// are folded (and why only this one is soft).
+    ///
+    /// # Lock order
+    ///
+    /// A BLOCKING checkpoint evaluates its reset guard while holding the
+    /// exclusive dispatch visibility barrier, so this takes the migration mutex
+    /// UNDER that barrier. That matches the direction the rest of the migration
+    /// code already enforces — the migration mutex is deliberately released
+    /// before every `drain_in_flight_mutations` (see that function's callers) —
+    /// so no thread holds the migration mutex while waiting for the barrier and
+    /// there is no cycle. Do not invert it.
     pub fn migration_delta_reader_redo_floor(&self) -> (usize, Option<u64>) {
         self.migration.lock().delta_reader_redo_floor()
     }
