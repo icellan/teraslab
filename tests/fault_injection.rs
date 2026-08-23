@@ -973,3 +973,202 @@ fn before_redo_fsync_caller_sees_durable_only_after_sync() {
         let _ = guard.take();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Test 8 — W14 Layer A: a crash between the delete's destructive header write
+// and the return of the freed region must leave NO phantom index entry.
+// ---------------------------------------------------------------------------
+
+/// Reproduces the scenario-09 phantom end-to-end through the PRODUCTION delete
+/// path, a real index snapshot, and the real recovery pipeline.
+///
+/// Production journals no `RedoOp::Delete`: the fsynced `RedoOp::FreeRegion`
+/// the allocator writes is the delete's ONLY durable commit record. Pre-fix
+/// `delete_inner` overwrote the record's on-device metadata header with the
+/// deleted-record marker — and, under STRICT durability, fsynced it — BEFORE
+/// journaling that commit record. A crash in between (a SIGTERM landing
+/// mid-quiesce, in CI) therefore made the DESTRUCTION durable while the COMMIT
+/// never happened. The last index snapshot, taken before the delete, then
+/// restored the entry, no `FreeRegion` replay could evict it
+/// (`recovery::evict_freed_region_owner` never saw one), and the key was left
+/// permanently pointing at zeroed bytes: every read returned
+/// `record corruption: CRC mismatch: expected 0x00000000`.
+///
+/// The invariant asserted here is the one that was violated: **after recovery
+/// the index must never claim a record whose bytes are destroyed.** Either the
+/// key is gone (delete-wins, the commit record was durable) or it is present
+/// and readable (delete lost, nothing was destroyed) — never present and
+/// unreadable.
+///
+/// Strict durability is deliberate: it removes any argument that the zeroed
+/// header merely "happened to survive" in a write-back cache. It is fsynced.
+#[test]
+fn delete_crash_after_header_destroyed_leaves_no_phantom_index_entry() {
+    use teraslab::device::BlockDevice;
+    use teraslab::locks::StripedLocks;
+    use teraslab::ops::create::CreateRequest;
+    use teraslab::ops::engine::Engine;
+    use teraslab::ops::remaining::DeleteRequest;
+
+    const DATA_SIZE: u64 = 16 * 1024 * 1024;
+    const REDO_SIZE: u64 = 1024 * 1024;
+
+    let data_dev = Arc::new(MemoryDevice::new_volatile(DATA_SIZE, 4096).unwrap());
+    let redo_dev = Arc::new(MemoryDevice::new_volatile(REDO_SIZE, 4096).unwrap());
+    let redo = Arc::new(Mutex::new(
+        RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, REDO_SIZE).unwrap(),
+    ));
+
+    let mut alloc = SlotAllocator::new(data_dev.clone() as Arc<dyn BlockDevice>).unwrap();
+    // The allocator is the FreeRegion journaler — wire it exactly as boot does.
+    alloc.set_redo_log(redo.clone());
+    let engine = Arc::new(Engine::new(
+        data_dev.clone() as Arc<dyn BlockDevice>,
+        PrimaryBackend::new_in_memory(4096).unwrap(),
+        alloc,
+        StripedLocks::new(64),
+        DahBackend::new_in_memory(),
+    ));
+    engine.set_redo_logs(vec![redo.clone()]);
+    // STRICT: the zeroed header is fsynced before the crash point below, so its
+    // survival is a durability guarantee, not an accident of caching.
+    engine.set_buffered_durability(false);
+
+    let mut tx_id = [0u8; 32];
+    tx_id[0] = 0x77;
+    tx_id[1] = 0xC3;
+    let k = TxKey { txid: tx_id };
+    let hashes: Vec<[u8; 32]> = (0..2u32)
+        .map(|v| {
+            let mut h = [0u8; 32];
+            h[0] = 0x77;
+            h[1] = (v + 1) as u8;
+            h
+        })
+        .collect();
+    engine
+        .create(&CreateRequest {
+            tx_id,
+            tx_version: 1,
+            locktime: 0,
+            fee: 500,
+            size_in_bytes: 250,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            utxo_hashes: &hashes,
+            inputs: None,
+            outputs: None,
+            inpoints: None,
+            is_external: false,
+            created_at: 1_710_000_000_000,
+            block_height: 1000,
+            mined_block_infos: &[],
+            frozen: false,
+            conflicting: false,
+            locked: false,
+            external_ref: None,
+            parent_txids: &[],
+        })
+        .expect("seed create must succeed");
+    let off = engine
+        .lookup(&k)
+        .expect("seeded record indexed")
+        .record_offset;
+
+    // Checkpoint: index snapshot + allocator header + device syncs. This is the
+    // pre-delete snapshot the phantom is resurrected from.
+    let dir = tempfile::tempdir().unwrap();
+    let snap = dir.path().join("index.snap");
+    engine.snapshot_index(&snap).expect("index snapshot");
+    engine.persist_allocator().expect("allocator persist");
+    redo.lock().flush().unwrap();
+    data_dev.sync().unwrap();
+    redo_dev.sync().unwrap();
+
+    // Crash with the record's header destroyed (and fsynced) on the data device.
+    let engine_for_panic = engine.clone();
+    let outcome = armed(
+        FaultMode::PanicAt(SyncPoint::AfterDeleteTombstoneBeforeFree),
+        move || {
+            let _ = engine_for_panic.delete(&DeleteRequest {
+                tx_key: k,
+                due_guard: None,
+            });
+        },
+    );
+    outcome.expect_err(
+        "AfterDeleteTombstoneBeforeFree must remain on the delete path — without \
+         the panic this test exercises no crash window at all",
+    );
+    // Power loss: everything not fsynced is reverted on BOTH devices.
+    assert!(data_dev.simulate_power_loss());
+    assert!(redo_dev.simulate_power_loss());
+    drop(engine);
+
+    // Recover exactly as boot does: restore the index from the snapshot, reopen
+    // the redo log, replay.
+    let mut recovered_alloc: teraslab::allocator::BoxedAllocator =
+        Box::new(SlotAllocator::recover(data_dev.clone() as Arc<dyn BlockDevice>).unwrap());
+    let (index, dah_idx, _flags) =
+        ShardedIndex::restore_all(&snap, 1).expect("index snapshot must restore");
+    let mut dah = DahBackend::from(dah_idx);
+    let redo_reopened =
+        RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, REDO_SIZE).unwrap();
+    teraslab::recovery::recover_all_with_allocator(
+        &*data_dev as &dyn BlockDevice,
+        &redo_reopened,
+        &index,
+        &mut dah,
+        Some(&mut recovered_alloc),
+    )
+    .expect("recovery must not fail");
+
+    let recovered = Arc::new(Engine::new_with_sharded_index(
+        data_dev.clone() as Arc<dyn BlockDevice>,
+        index,
+        recovered_alloc,
+        StripedLocks::new(64),
+        dah,
+    ));
+
+    // THE INVARIANT. The index must not claim a record whose bytes are gone.
+    if let Some(entry) = recovered.lookup(&k) {
+        let meta = recovered.read_metadata(&k).unwrap_or_else(|e| {
+            panic!(
+                "PHANTOM: the index still claims the record at offset {} but its \
+                 bytes are destroyed — every read of this key fails forever and no \
+                 FreeRegion replay can evict it: {e}",
+                entry.record_offset,
+            )
+        });
+        assert_eq!(
+            { meta.tx_id },
+            tx_id,
+            "a surviving entry must resolve to this record"
+        );
+        assert_eq!(
+            entry.record_offset, off,
+            "a surviving entry must still point at the seeded offset"
+        );
+    }
+
+    // Non-vacuity: the invariant above must hold because the delete COMMITTED
+    // before it destroyed anything, not because the crash happened to revert
+    // everything. The durable `FreeRegion` is the commit record, so recovery
+    // resolves the window DELETE-WINS: the key is evicted and its region is
+    // back on the freelist.
+    assert!(
+        recovered.lookup(&k).is_none(),
+        "delete-wins: the durable FreeRegion must evict the snapshot's entry",
+    );
+    assert!(
+        recovered
+            .allocator()
+            .lock()
+            .free_region_containing(off)
+            .is_some(),
+        "delete-wins: the committed delete's region must be back on the freelist \
+         (if it is not, no FreeRegion replayed and this test proved nothing)",
+    );
+}

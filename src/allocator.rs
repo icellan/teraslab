@@ -255,6 +255,48 @@ pub struct AllocatedRegion {
     pub size: u64,
 }
 
+/// A region release whose [`RedoOp::FreeRegion`] is already DURABLE but which
+/// has not yet been applied to the allocator's in-memory state.
+///
+/// Returned by [`RecordAllocator::journal_free`] and consumed by
+/// [`RecordAllocator::apply_journaled_free`]. Between the two the region is
+/// committed-as-freed on the redo log yet still un-allocatable in memory, which
+/// is exactly the window `Engine::delete_inner` needs: it destroys the record's
+/// on-device metadata header there, with the delete's durable commit record
+/// already written (so a crash resolves DELETE-WINS) and no concurrent `create`
+/// able to claim the offset (so the header write cannot clobber a successor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a journaled free that is never applied leaks the region in memory until the next boot"]
+pub struct JournaledFree {
+    /// Device byte offset of the released region.
+    offset: u64,
+    /// The release size AFTER `align_reservation` — the value journaled in the
+    /// `FreeRegion` entry, so the applied free covers exactly the durable one.
+    aligned_size: u64,
+}
+
+impl JournaledFree {
+    /// Build a token for an already-journaled release. Crate-internal: only an
+    /// allocator's `journal_free` may mint one, because the token asserts the
+    /// `FreeRegion` is durable.
+    pub(crate) fn new(offset: u64, aligned_size: u64) -> Self {
+        Self {
+            offset,
+            aligned_size,
+        }
+    }
+
+    /// Device byte offset of the released region.
+    pub(crate) fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// The journaled (post-`align_reservation`) release size.
+    pub(crate) fn aligned_size(&self) -> u64 {
+        self.aligned_size
+    }
+}
+
 /// A batch of regions reserved IN MEMORY but not yet durably journaled, returned
 /// by [`SlotAllocator::reserve_batch`]. The freelist already reflects the
 /// reservations; the caller must journal [`Self::allocate_region_redo_ops`]
@@ -967,14 +1009,122 @@ impl SlotAllocator {
     /// is appended and fsynced BEFORE any freelist mutation. On fsync
     /// failure the freelist is left untouched and
     /// [`AllocatorError::RedoLogFailure`] is returned.
+    ///
+    /// This is exactly [`Self::journal_free`] followed by
+    /// [`Self::apply_journaled_free`]; a record DELETION splits the two so it
+    /// can destroy the record's on-device header strictly BETWEEN them (see
+    /// [`RecordAllocator::journal_free`]).
     pub fn free(&mut self, offset: u64, size: u64) -> Result<()> {
+        let journaled = self.journal_free(offset, size)?;
+        self.apply_journaled_free(journaled)
+    }
+
+    /// Durably journal a region release WITHOUT touching the freelist.
+    ///
+    /// Validates the range (including the IJ-7 double-free rejection), then —
+    /// when a redo log is attached — appends and fsyncs the
+    /// [`RedoOp::FreeRegion`] entry. The returned [`JournaledFree`] must be
+    /// handed to [`Self::apply_journaled_free`] to make the region allocatable;
+    /// until then no allocation can hand the offset out, which is what lets the
+    /// delete path do its destructive header write in between.
+    ///
+    /// # Errors
+    /// [`AllocatorError::InvalidFree`] for a zero-length or out-of-range
+    /// region; [`AllocatorError::DoubleFree`] when the range overlaps a region
+    /// already on the freelist; [`AllocatorError::RedoLogFailure`] when the
+    /// journal append/flush fails. No state is mutated in any error case.
+    pub fn journal_free(&mut self, offset: u64, size: u64) -> Result<JournaledFree> {
         // Align the SAME way the region was reserved (`align_reservation`): in
         // packed mode that is the record granularity, NOT the device block, so
         // freeing one packed record returns exactly its byte range and never
         // over-frees the block-neighbours it shares a 4 KiB block with. In
         // non-packed mode this is `align_up` (device block), unchanged.
         let aligned_size = self.align_reservation(size);
+        self.validate_free(offset, aligned_size)?;
 
+        // Journal the release BEFORE mutating the freelist — on fsync
+        // failure the in-memory state is left unchanged so callers never
+        // see a free that isn't durably journaled.
+        if let Some(log_arc) = self.redo_log.clone() {
+            let op = RedoOp::FreeRegion {
+                offset,
+                size: aligned_size,
+                device_id: self.redo_device_id,
+            };
+            let flush_result = {
+                let mut log = log_arc.lock();
+                log.append_and_flush(op)
+            };
+            if let Err(e) = flush_result {
+                return Err(AllocatorError::RedoLogFailure {
+                    detail: format!("free redo append/flush failed: {e}"),
+                });
+            }
+            // Fault-injection sync point: "redo durable, freelist not yet
+            // mutated." Simulates a crash in the exact C6 window.
+            crate::fault_injection::check(crate::fault_injection::SyncPoint::MidAllocatorPersist);
+        }
+
+        Ok(JournaledFree {
+            offset,
+            aligned_size,
+        })
+    }
+
+    /// Make a [`JournaledFree`]'s region allocatable again, merging with
+    /// adjacent free regions.
+    ///
+    /// # Errors
+    /// Re-runs the range + double-free validation and returns the same errors
+    /// as [`Self::journal_free`] if state changed underneath (it cannot in the
+    /// delete path, which holds the record's stripe lock and this allocator's
+    /// mutex around both halves). The `FreeRegion` is already durable at this
+    /// point, so an error here leaks the region in memory only — recovery's
+    /// replay reinstates it — and never double-counts it.
+    pub fn apply_journaled_free(&mut self, journaled: JournaledFree) -> Result<()> {
+        let JournaledFree {
+            offset,
+            aligned_size,
+        } = journaled;
+        self.validate_free(offset, aligned_size)?;
+
+        let mut final_offset = offset;
+        let mut final_size = aligned_size;
+
+        // Merge with the next region if adjacent.
+        let next_boundary = offset + aligned_size;
+        if let Some((next_off, next_sz)) = self.freelist.next_from(next_boundary)
+            && next_off == next_boundary
+        {
+            self.freelist.remove(next_off);
+            final_size += next_sz;
+        }
+
+        // Merge with the previous region if adjacent.
+        if let Some((prev_off, prev_sz)) = self.freelist.prev_before(offset)
+            && prev_off + prev_sz == offset
+        {
+            self.freelist.remove(prev_off);
+            final_offset = prev_off;
+            final_size += prev_sz;
+        }
+
+        self.freelist.insert(final_offset, final_size);
+        self.freelist.maybe_promote();
+
+        if let Some(m) = allocator_metrics() {
+            m.free_total.inc();
+            m.free_bytes_total.inc_by(aligned_size);
+            self.refresh_freelist_gauges(m);
+        }
+
+        Ok(())
+    }
+
+    /// Shared range + overlap validation for both halves of a free.
+    ///
+    /// `aligned_size` has already been through `align_reservation`.
+    fn validate_free(&self, offset: u64, aligned_size: u64) -> Result<()> {
         if aligned_size == 0 {
             return Err(AllocatorError::InvalidFree {
                 offset,
@@ -1021,60 +1171,6 @@ impl SlotAllocator {
                 free_size,
             });
         }
-
-        // Journal the release BEFORE mutating the freelist — on fsync
-        // failure the in-memory state is left unchanged so callers never
-        // see a free that isn't durably journaled.
-        if let Some(log_arc) = self.redo_log.clone() {
-            let op = RedoOp::FreeRegion {
-                offset,
-                size: aligned_size,
-                device_id: self.redo_device_id,
-            };
-            let flush_result = {
-                let mut log = log_arc.lock();
-                log.append_and_flush(op)
-            };
-            if let Err(e) = flush_result {
-                return Err(AllocatorError::RedoLogFailure {
-                    detail: format!("free redo append/flush failed: {e}"),
-                });
-            }
-            // Fault-injection sync point: "redo durable, freelist not yet
-            // mutated." Simulates a crash in the exact C6 window.
-            crate::fault_injection::check(crate::fault_injection::SyncPoint::MidAllocatorPersist);
-        }
-
-        let mut final_offset = offset;
-        let mut final_size = aligned_size;
-
-        // Merge with the next region if adjacent.
-        let next_boundary = offset + aligned_size;
-        if let Some((next_off, next_sz)) = self.freelist.next_from(next_boundary)
-            && next_off == next_boundary
-        {
-            self.freelist.remove(next_off);
-            final_size += next_sz;
-        }
-
-        // Merge with the previous region if adjacent.
-        if let Some((prev_off, prev_sz)) = self.freelist.prev_before(offset)
-            && prev_off + prev_sz == offset
-        {
-            self.freelist.remove(prev_off);
-            final_offset = prev_off;
-            final_size += prev_sz;
-        }
-
-        self.freelist.insert(final_offset, final_size);
-        self.freelist.maybe_promote();
-
-        if let Some(m) = allocator_metrics() {
-            m.free_total.inc();
-            m.free_bytes_total.inc_by(aligned_size);
-            self.refresh_freelist_gauges(m);
-        }
-
         Ok(())
     }
 
@@ -2091,8 +2187,42 @@ pub trait RecordAllocator: Send {
     /// [`AllocatorError::RedoLogFailure`] when the journal append/flush fails
     /// (no state is mutated in that case).
     fn free_durable(&mut self, offset: u64, size: u64) -> Result<()> {
-        self.free(offset, size)
+        let journaled = self.journal_free(offset, size)?;
+        self.apply_journaled_free(journaled)
     }
+
+    /// The FIRST half of [`Self::free_durable`]: durably journal the release
+    /// (`RedoOp::FreeRegion` appended + fsynced) WITHOUT making the region
+    /// allocatable.
+    ///
+    /// `Engine::delete_inner` splits the two halves because the `FreeRegion` is
+    /// the delete's ONLY durable commit record (production journals no
+    /// `RedoOp::Delete`), and the delete also has to DESTROY the record's
+    /// on-device metadata header. Those two writes must be ordered
+    /// commit-before-destroy: if the destruction is durable and the commit
+    /// record is not, the pre-delete index snapshot resurrects the key over
+    /// zeroed bytes — an unreadable phantom no `FreeRegion` replay can evict
+    /// (CI scenario 09). Splitting also keeps the region un-allocatable across
+    /// the header write, so no concurrent `create` can claim the offset and
+    /// have its fresh record zeroed by this delete's tombstone.
+    ///
+    /// # Errors
+    /// Same contract as [`Self::free`], plus
+    /// [`AllocatorError::RedoLogFailure`] when the journal append/flush fails.
+    /// No state is mutated in any error case, so a failed journal aborts the
+    /// delete before a single device byte is touched.
+    fn journal_free(&mut self, offset: u64, size: u64) -> Result<JournaledFree>;
+
+    /// The SECOND half of [`Self::free_durable`]: apply a
+    /// [`JournaledFree`] to the allocator's in-memory state, making the region
+    /// allocatable again.
+    ///
+    /// # Errors
+    /// Same range/overlap errors as [`Self::journal_free`] if state changed
+    /// underneath. The `FreeRegion` is already durable, so an error here leaks
+    /// the region in memory only (recovery's replay reinstates it).
+    fn apply_journaled_free(&mut self, journaled: JournaledFree) -> Result<()>;
+
     /// Persist allocator state to the device header and fsync.
     fn persist(&self) -> Result<()>;
     /// Write the header without the durability fsync (checkpoint hoists the sync).
@@ -2286,6 +2416,12 @@ impl RecordAllocator for BoxedAllocator {
         // impl's `free` and lose the inner allocator's override.
         (**self).free_durable(offset, size)
     }
+    fn journal_free(&mut self, offset: u64, size: u64) -> Result<JournaledFree> {
+        (**self).journal_free(offset, size)
+    }
+    fn apply_journaled_free(&mut self, journaled: JournaledFree) -> Result<()> {
+        (**self).apply_journaled_free(journaled)
+    }
     fn persist(&self) -> Result<()> {
         (**self).persist()
     }
@@ -2400,6 +2536,12 @@ impl RecordAllocator for SlotAllocator {
     }
     fn free(&mut self, offset: u64, size: u64) -> Result<()> {
         SlotAllocator::free(self, offset, size)
+    }
+    fn journal_free(&mut self, offset: u64, size: u64) -> Result<JournaledFree> {
+        SlotAllocator::journal_free(self, offset, size)
+    }
+    fn apply_journaled_free(&mut self, journaled: JournaledFree) -> Result<()> {
+        SlotAllocator::apply_journaled_free(self, journaled)
     }
     fn persist(&self) -> Result<()> {
         SlotAllocator::persist(self)

@@ -10,21 +10,36 @@
 //!
 //! # Durability model (Invariant TS-1)
 //!
-//! A delete is LOCAL, buffered prune GC: it fsyncs only the allocator
-//! `FreeRegion`, while the primary-index unregister and the on-device header
-//! tombstone stay in the write-back cache and become durable at the next
-//! checkpoint. A crash before that checkpoint reverts them and
-//! `recovery::reconcile_freelist_against_live_index` restores the record LIVE.
+//! A delete is LOCAL prune GC and journals no `RedoOp::Delete`. Its ONE durable
+//! commit record is the allocator's fsynced `FreeRegion`, written by
+//! `Engine::delete_inner` BEFORE it destroys the record's on-device header
+//! (`RecordAllocator::journal_free`); the primary-index unregister and the
+//! header marker stay in the write-back cache until the next checkpoint. A
+//! crash after that fsync therefore resolves DELETE-WINS, not "the delete never
+//! happened": `FreeRegion` replay evicts any index entry still pointing at the
+//! freed slot (`recovery::evict_freed_region_owner`).
+//! `recovery::reconcile_freelist_against_live_index` is NOT the delete's undo —
+//! it is the safety net for live-and-free skew arriving with no `FreeRegion` in
+//! the replayed tail (a torn checkpoint sequence), where nothing destroyed the
+//! record either.
 //!
-//! The tombstone rides the SAME barrier. [`TombstoneLog::record`] updates the
-//! in-RAM sharded index and buffers the on-disk append IN RAM only; the entry is
-//! written to disk and fsynced solely by [`TombstoneLog::persist`], invoked from
-//! the checkpoint. So a crash before checkpoint loses the un-persisted append
-//! exactly as it loses the delete — **Invariant TS-1: a tombstone for `k` exists
-//! on this node ⟺ this node's delete of `k` is durable.** Boot recovery adds a
-//! belt-and-suspenders [`TombstoneLog::reconcile_against_live`] that drops any
-//! tombstone whose key came back LIVE, so a dangling tombstone can never survive
-//! over a resurrected record.
+//! The tombstone rides the CHECKPOINT barrier. [`TombstoneLog::record`] updates
+//! the in-RAM sharded index and buffers the on-disk append IN RAM only; the
+//! entry is written to disk and fsynced solely by [`TombstoneLog::persist`],
+//! invoked from the checkpoint — deliberately, so a delete costs no extra
+//! hot-path fsync.
+//!
+//! **Invariant TS-1: a tombstone for `k` exists on this node ⟺ this node's
+//! delete of `k` is durable** — with ONE bounded, deliberate asymmetry. The
+//! delete commits at its `FreeRegion` fsync; the tombstone only at the next
+//! checkpoint. A crash in between leaves "deleted, no tombstone". That is the
+//! SAFE direction: a missing tombstone merely lets a peer heal re-push the
+//! key's replicated copy (eventually consistent, spec §3.18), whereas the
+//! reverse — a tombstone dangling over a live record — would wrongly veto
+//! repairs. The reverse is what the invariant forbids outright, and boot
+//! recovery enforces it with a belt-and-suspenders
+//! [`TombstoneLog::reconcile_against_live`] that drops any tombstone whose key
+//! came back LIVE.
 //!
 //! # On-disk layout
 //!

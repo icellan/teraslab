@@ -793,7 +793,26 @@ impl SegmentAllocator {
     /// region; [`SegmentAllocatorError::RedoLogFailure`] if the journal
     /// append/flush fails.
     pub fn free_durable(&mut self, offset: u64, size: u64) -> Result<()> {
-        let (aligned_size, seg) = self.validate_free(offset, size)?;
+        let journaled = self.journal_free(offset, size)?;
+        self.apply_journaled_free(journaled)
+    }
+
+    /// The FIRST half of [`Self::free_durable`]: journal + fsync the
+    /// `FreeRegion` WITHOUT touching the dead-byte accounting.
+    ///
+    /// See [`crate::allocator::RecordAllocator::journal_free`] for why the
+    /// delete path splits the two halves (commit-before-destroy ordering).
+    ///
+    /// # Errors
+    /// [`SegmentAllocatorError::InvalidFree`] for a region outside the data
+    /// region; [`SegmentAllocatorError::RedoLogFailure`] if the journal
+    /// append/flush fails. No state is mutated in either case.
+    pub fn journal_free(
+        &mut self,
+        offset: u64,
+        size: u64,
+    ) -> Result<crate::allocator::JournaledFree> {
+        let (aligned_size, _seg) = self.validate_free(offset, size)?;
 
         // Journal the release BEFORE mutating the dead-byte accounting — on
         // fsync failure the in-memory state is left unchanged so callers never
@@ -819,6 +838,21 @@ impl SegmentAllocator {
             crate::fault_injection::check(crate::fault_injection::SyncPoint::MidAllocatorPersist);
         }
 
+        Ok(crate::allocator::JournaledFree::new(offset, aligned_size))
+    }
+
+    /// The SECOND half of [`Self::free_durable`]: fold the already-durable
+    /// release into the owning segment's dead-byte accounting.
+    ///
+    /// # Errors
+    /// [`SegmentAllocatorError::InvalidFree`] if the region no longer resolves
+    /// to a segment (impossible for a token this allocator issued).
+    pub fn apply_journaled_free(
+        &mut self,
+        journaled: crate::allocator::JournaledFree,
+    ) -> Result<()> {
+        let (aligned_size, seg) =
+            self.validate_free(journaled.offset(), journaled.aligned_size())?;
         self.segments[seg as usize].dead += aligned_size;
         Ok(())
     }
@@ -1530,6 +1564,19 @@ impl RecordAllocator for SegmentAllocator {
     }
     fn free_durable(&mut self, offset: u64, size: u64) -> crate::allocator::Result<()> {
         Ok(SegmentAllocator::free_durable(self, offset, size)?)
+    }
+    fn journal_free(
+        &mut self,
+        offset: u64,
+        size: u64,
+    ) -> crate::allocator::Result<crate::allocator::JournaledFree> {
+        Ok(SegmentAllocator::journal_free(self, offset, size)?)
+    }
+    fn apply_journaled_free(
+        &mut self,
+        journaled: crate::allocator::JournaledFree,
+    ) -> crate::allocator::Result<()> {
+        Ok(SegmentAllocator::apply_journaled_free(self, journaled)?)
     }
     fn persist(&self) -> crate::allocator::Result<()> {
         Ok(SegmentAllocator::persist(self)?)

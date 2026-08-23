@@ -147,6 +147,23 @@ pub enum SyncPoint {
     /// ordering.
     AfterSnapshotRenameBeforeReclaim,
 
+    /// Inside `Engine::delete_inner`, AFTER the record's on-device metadata
+    /// header has been overwritten with the deleted-record marker (and, under
+    /// strict durability, fsynced) but BEFORE the freed region has been
+    /// returned to the allocator's in-memory state. Panicking here simulates a
+    /// crash with the record's bytes DESTROYED on the device.
+    ///
+    /// Post-recovery: the index must NOT claim a record whose bytes are
+    /// destroyed. That holds only because the delete's durable commit record
+    /// (the fsynced `RedoOp::FreeRegion`) is journaled BEFORE the destructive
+    /// header write, so replay evicts the entry
+    /// (`recovery::evict_freed_region_owner`). This is the regression lock for
+    /// the scenario-09 phantom: pre-fix the journal came AFTER the header
+    /// write, so a crash here left a pre-delete index snapshot pointing at
+    /// zeroed bytes and every read of the key failed
+    /// `record corruption: CRC mismatch: expected 0x00000000` forever.
+    AfterDeleteTombstoneBeforeFree,
+
     /// Inside `compensate_replication_failure`, AFTER the engine effect
     /// (e.g. `engine.unspend`) has been applied to in-memory/device
     /// state but BEFORE the compensating redo entry has been appended to
@@ -277,6 +294,7 @@ mod tests {
         check(SyncPoint::BeforeSecondaryRedbCommit);
         check(SyncPoint::AfterSecondaryRedbCommit);
         check(SyncPoint::AfterSnapshotRenameBeforeReclaim);
+        check(SyncPoint::AfterDeleteTombstoneBeforeFree);
         check(SyncPoint::MidCompensationBeforeRedoAppend);
         assert_eq!(current(), FaultMode::None);
     }
