@@ -180,9 +180,11 @@ fn probe_drain_block(prod: &str) -> String {
 ///
 /// The arm lives just after the single assignment to `retained_exchange_view`.
 /// Reverting it to the bare `event_repair_trigger.observe(...)` — which
-/// self-gates on `under_replication_sweep_enabled` — silently removes the only
-/// event-driven driver a default cluster has, and every other test stays
-/// green. That is exactly the #95 defect.
+/// self-gates on `under_replication_sweep_enabled` — silently removes the
+/// driver's exchange arm ENTIRELY, so arming
+/// `under_replication_repair_enabled` (default OFF since W15) would do
+/// nothing, and every other test stays green. The flag is a qualification
+/// switch, so a mechanism it can no longer reach is the #95 defect back.
 #[test]
 fn the_exchange_completion_site_arms_the_repair_driver() {
     let src = coordinator_src();
@@ -203,8 +205,9 @@ fn the_exchange_completion_site_arms_the_repair_driver() {
         &block,
         "arm_exchange_repair(",
         "the exchange-completion site must call `arm_exchange_repair` — without it the arm \
-         self-gates on `under_replication_sweep_enabled` (default OFF) and a default cluster \
-         has no holder-driven repair driver at all (#95, CI 32084447959 / 32630545533)",
+         self-gates on `under_replication_sweep_enabled` (default OFF), so arming \
+         `under_replication_repair_enabled` reaches nothing and the driver is unqualifiable \
+         (#95, CI 32084447959 / 32630545533)",
     );
 }
 

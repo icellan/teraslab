@@ -184,9 +184,9 @@ fn create_cluster_node_with_ack_policy(
         replication_factor: 2,
         committed_master_election_enabled: true,
         under_replication_sweep_enabled: true,
-        // #95 — mirror the shipped default: a completed exchange arms
-        // one holder-driven under-replication repair pass.
-        under_replication_repair_enabled: true,
+        // #95 (W15) — mirror the shipped default: the holder-driven
+        // under-replication repair driver ships INERT.
+        under_replication_repair_enabled: false,
         replica_abort_forced_resync_enabled: true,
         migration_vetoed_reduction_enabled: false,
         migration_weak_veto_arbitration_enabled: true,

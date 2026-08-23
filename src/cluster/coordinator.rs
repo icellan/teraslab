@@ -551,10 +551,11 @@ fn event_repair_take_fire(
 /// - `trigger`: the loop-local event-repair trigger to arm.
 /// - `now`/`epoch`: the arm instant and the term the exchange completed under.
 /// - `exchange_repair_enabled`: mirrors
-///   `Config::under_replication_repair_enabled` (default ON). When
-///   OFF this degrades to the pre-#95 [`EventRepairTrigger::observe`], i.e.
-///   the arm self-gates on the sweep flag again — so an operator disabling
-///   the driver gets the old behaviour in BOTH sweep modes, not a new one.
+///   `Config::under_replication_repair_enabled` (default OFF since W15).
+///   When OFF — the shipped disposition — this degrades to the pre-#95
+///   [`EventRepairTrigger::observe`], i.e. the arm self-gates on the sweep
+///   flag again, so a default node gets the old behaviour in BOTH sweep
+///   modes, not a new one.
 ///
 /// Returns whether a pass is armed after the call.
 fn arm_exchange_repair(
@@ -751,8 +752,9 @@ impl UnderReplicationProbe {
 /// Extracted from the event loop so the gate set is a tested predicate rather
 /// than an inline condition no test can reach (review P2-4).
 ///
-/// * `repair_enabled` — the operator's rollback switch
-///   (`Config::under_replication_repair_enabled`).
+/// * `repair_enabled` — the operator's ARMING switch
+///   (`Config::under_replication_repair_enabled`, default OFF since W15).
+///   Every default node fails this gate.
 /// * `probe_due` — [`UnderReplicationProbe::due`], which owns pacing,
 ///   single-flight and the no-progress backoff.
 /// * `pipeline` — reads `(active_migrations, resync_inflight_len)`. An
@@ -764,9 +766,8 @@ impl UnderReplicationProbe {
 /// round 2): reading it takes two mutexes (the migration manager and the
 /// resync in-flight set) and the event loop evaluates this gate ~10x/s
 /// forever. Eager arguments made a node with the driver DISARMED pay exactly
-/// what an armed one pays — the wrong shape for a flag whose whole purpose is
-/// to be a zero-cost rollback switch. It is called only once both cheap gates
-/// pass.
+/// what an armed one pays — the wrong shape for a flag that is OFF on every
+/// default node. It is called only once both cheap gates pass.
 ///
 /// A refused launch leaves the probe DUE — the caller records a skip only
 /// after the expensive membership/holdings snapshot declines — so these cheap
@@ -3255,11 +3256,14 @@ pub struct ClusterConfig {
     pub under_replication_sweep_enabled: bool,
     /// #95 — holder-driven under-replication repair arming (see `Config`
     /// `under_replication_repair_enabled` for the full rationale and the CI
-    /// evidence). Default ON, so a shard's master can notice it is
-    /// under-replicated and drive the fill without a migration plan or a
-    /// replica abort. Gates BOTH evidence sources: [`arm_exchange_repair`] at
-    /// the exchange-completion site, and the paced [`UnderReplicationProbe`]
-    /// that re-collects the partition view on a quiescent cluster.
+    /// evidence). Default OFF since W15 (ship-inert): ARMED, a shard's master
+    /// notices it is under-replicated and drives the fill without a migration
+    /// plan or a replica abort — which fixes scenario 08 and, measured at the
+    /// same commit, diverges scenario 11's election and correlates with
+    /// armed-05 zero-holder loss. Gates BOTH evidence sources:
+    /// [`arm_exchange_repair`] at the exchange-completion site, and the paced
+    /// [`UnderReplicationProbe`] that re-collects the partition view on a
+    /// quiescent cluster.
     pub under_replication_repair_enabled: bool,
     /// W9 Part B — replica-abort forced resync arming (see `Config`
     /// `replica_abort_forced_resync_enabled` for the full rationale).
@@ -3596,10 +3600,12 @@ impl ClusterCoordinator {
             committed_master_election_enabled: config.committed_master_election_enabled,
             under_replication_sweep_enabled: config.under_replication_sweep_enabled,
             // #95 — MUST be `config.under_replication_repair_enabled`.
-            // Its neighbour above defaults OFF; feeding that field here
-            // type-checks, keeps every other test green, and silently
-            // restores the configuration whose scenario-08 shard served at
-            // one holder under RF=2 forever. Pinned by test in `bin/server.rs`.
+            // Its neighbour BELOW (`replica_abort_forced_resync_enabled`)
+            // defaults ON; feeding that field here type-checks, keeps every
+            // other test green, and silently ARMS on every default node a
+            // driver CI measured diverging the election. Pinned by
+            // `coordinator_wires_the_under_replication_repair_flag_from_its_own_field`
+            // (hop 2) and by the `bin/server.rs` test (hop 1).
             under_replication_repair_enabled: config.under_replication_repair_enabled,
             node_addrs: Arc::new(RwLock::new(addrs)),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -6113,12 +6119,14 @@ impl ClusterCoordinator {
                     // would burn the arm AND push back the periodic sweep
                     // timer for nothing.
                     //
-                    // #95 — this arm is the HOLDER-DRIVEN repair driver, and
-                    // it is default-ON (`arm_exchange_repair`): the plain
-                    // `observe` used here before self-gated on the sweep
-                    // flag, which left a default cluster with no driver at
-                    // all for a shard its master under-replicates without a
-                    // migration plan or a replica abort.
+                    // #95 — this arm is the HOLDER-DRIVEN repair driver
+                    // (`arm_exchange_repair`), default OFF since W15. ARMED,
+                    // it replaces the plain `observe` that self-gates on the
+                    // sweep flag, giving a sweep-off cluster a driver for a
+                    // shard its master under-replicates without a migration
+                    // plan or a replica abort. DISARMED — the shipped
+                    // disposition — `arm_exchange_repair` degrades to exactly
+                    // that `observe`, so a default node behaves pre-#95.
                     if !partition_view.is_empty() {
                         arm_exchange_repair(
                             &mut event_repair_trigger,
@@ -25557,7 +25565,7 @@ mod tests {
         );
         assert!(
             !probe_launch_admissible(false, true, || (0, 0)),
-            "the driver flag is the operator's rollback switch",
+            "the driver flag is the operator's arming switch",
         );
         assert!(
             !probe_launch_admissible(true, false, || (0, 0)),
@@ -25579,8 +25587,8 @@ mod tests {
     /// the driver DISARMED, or simply not due yet, must not pay for it.
     ///
     /// Eager argument evaluation made the disarmed path cost exactly as much
-    /// as the armed one, which is the wrong shape for a flag whose entire
-    /// purpose is to be a zero-cost rollback switch.
+    /// as the armed one, which is the wrong shape for a flag that is OFF on
+    /// every default node.
     #[test]
     fn probe_launch_reads_the_pipeline_only_once_the_cheap_gates_pass() {
         for (repair_enabled, probe_due) in [(false, true), (true, false), (false, false)] {
@@ -25783,7 +25791,7 @@ mod tests {
         for (sweep, exchange_repair, must_fire) in [
             // The #95 defect shape: no driver at all.
             (false, false, false),
-            // The new default: fresh exchange evidence drives the fill.
+            // ARMED (opt-in): fresh exchange evidence drives the fill.
             (false, true, true),
             // Armed clusters keep the arm they already had.
             (true, false, true),
@@ -25807,9 +25815,9 @@ mod tests {
     /// #95 — the exchange-driven arm is bounded by the EVIDENCE, not by a
     /// timer: a flurry of exchange completions under one epoch coalesces
     /// into a single pass, and a fired pass does not re-fire without a new
-    /// exchange. This is what keeps a default-on driver from becoming a
-    /// repair storm on a re-healing cluster (wave-10/11 observed same-term
-    /// re-heal exchanges 41-65 ms apart).
+    /// exchange. This is what keeps an ARMED driver from becoming a repair
+    /// storm on a re-healing cluster (wave-10/11 observed same-term re-heal
+    /// exchanges 41-65 ms apart).
     #[test]
     fn exchange_repair_arms_coalesce_into_one_pass_per_epoch() {
         let window = Duration::from_millis(10);
@@ -29507,9 +29515,9 @@ mod tests {
             replication_factor: 2,
             committed_master_election_enabled: false,
             under_replication_sweep_enabled: false,
-            // #95 — mirror the shipped default: a completed exchange arms
-            // one holder-driven under-replication repair pass.
-            under_replication_repair_enabled: true,
+            // #95 (W15) — mirror the shipped default: the holder-driven
+            // under-replication repair driver ships INERT.
+            under_replication_repair_enabled: false,
             replica_abort_forced_resync_enabled: true,
             migration_vetoed_reduction_enabled: false,
             migration_weak_veto_arbitration_enabled,
@@ -29581,6 +29589,66 @@ mod tests {
             );
             assert!(mgr.weak_veto_arbitration_enabled());
         }
+    }
+
+    /// #95 (W15), hop 2 of 2 (`ClusterConfig` -> `ClusterCoordinator`).
+    ///
+    /// Hop 1 (`ServerConfig` -> `ClusterConfig`) is pinned in `bin/server.rs`;
+    /// until W15 this hop was guarded only by a comment. It carries the same
+    /// mis-wire class: the field is copied out of a wall of near-identical
+    /// `field: config.field` lines whose immediate neighbours are
+    /// `under_replication_sweep_enabled` (default off) and
+    /// `replica_abort_forced_resync_enabled` (default ON). Feeding either one
+    /// in type-checks and moves the driver's disposition on every node — and
+    /// since W15 the direction that matters is ARMING an inert driver, which
+    /// CI measured diverging the election (run 32637568483, scenario 11:
+    /// `masters=4094/4096`).
+    ///
+    /// Pins both directions, and both siblings against cross-talk.
+    #[test]
+    fn coordinator_wires_the_under_replication_repair_flag_from_its_own_field() {
+        // Disarmed driver, with the default-ON sibling ARMED: if the sibling
+        // were wired into the driver, the coordinator would come up armed.
+        let mut disarmed_cfg = cluster_config_for_test(false, true);
+        disarmed_cfg.under_replication_repair_enabled = false;
+        disarmed_cfg.replica_abort_forced_resync_enabled = true;
+        disarmed_cfg.under_replication_sweep_enabled = false;
+        let disarmed = ClusterCoordinator::new(disarmed_cfg, 1);
+        assert!(
+            !disarmed.under_replication_repair_enabled,
+            "a disarmed ClusterConfig must produce a DISARMED coordinator — a \
+             default-ON sibling was wired into the repair field",
+        );
+        assert!(
+            !disarmed.under_replication_sweep_enabled,
+            "the sweep must keep its own value (guards the reverse swap)",
+        );
+
+        // Arming the SWEEP alone must not arm the driver.
+        let mut sweep_only_cfg = cluster_config_for_test(false, true);
+        sweep_only_cfg.under_replication_repair_enabled = false;
+        sweep_only_cfg.under_replication_sweep_enabled = true;
+        let sweep_only = ClusterCoordinator::new(sweep_only_cfg, 1);
+        assert!(
+            !sweep_only.under_replication_repair_enabled,
+            "the repair field tracked the SWEEP field",
+        );
+        assert!(sweep_only.under_replication_sweep_enabled);
+
+        // Armed config → armed coordinator (the opt-in must still work).
+        let mut armed_cfg = cluster_config_for_test(false, true);
+        armed_cfg.under_replication_repair_enabled = true;
+        armed_cfg.under_replication_sweep_enabled = false;
+        let armed = ClusterCoordinator::new(armed_cfg, 1);
+        assert!(
+            armed.under_replication_repair_enabled,
+            "an explicitly armed ClusterConfig must arm the coordinator — the \
+             sweep field (also off here) was wired in its place",
+        );
+        assert!(
+            !armed.under_replication_sweep_enabled,
+            "arming the driver must not drag the sweep along",
+        );
     }
 
     /// W13 review item 5 — arming re-enables a path with KNOWN data-loss

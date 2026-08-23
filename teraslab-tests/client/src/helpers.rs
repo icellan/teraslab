@@ -87,11 +87,16 @@ fn docker_migration_batch_size_from_env() -> Result<usize, ClientError> {
 const ENV_DOCKER_COMMITTED_ELECTION: &str = "TERASLAB_DOCKER_COMMITTED_ELECTION";
 const ENV_DOCKER_UNDER_REPLICATION_SWEEP: &str = "TERASLAB_DOCKER_UNDER_REPLICATION_SWEEP";
 
-// #95 review P2-5 — the holder-driven under-replication repair driver.
-// Unlike the two above this ships ARMED, so this knob is a DISARM switch:
-// unset means the shipped default (on), and `0`/`false` turns it off. A run
-// investigating whether the driver is implicated can now isolate it without
-// rebuilding the image, and the generated TOML always states which way it ran.
+// #95 — the holder-driven under-replication repair driver. W15 flipped its
+// shipped default to OFF, so this is now an ARM knob with exactly the same
+// polarity as the two above: unset means the shipped default (off), `1`/`true`
+// arms it. Scenario 08 is the case that needs it armed to pass, so the
+// qualification path must stay one env var away — no image rebuild — and the
+// generated TOML always states which way the run measured.
+//
+// The polarity flip is a no-op for anyone passing an EXPLICIT value: `0` meant
+// disarmed before and means disarmed now, `1` meant armed and still does. Only
+// the UNSET case moved, which is the point.
 const ENV_DOCKER_UNDER_REPLICATION_REPAIR: &str = "TERASLAB_DOCKER_UNDER_REPLICATION_REPAIR";
 
 fn parse_docker_arming_flag(env_name: &str, raw: &str) -> Result<bool, String> {
@@ -102,30 +107,6 @@ fn parse_docker_arming_flag(env_name: &str, raw: &str) -> Result<bool, String> {
             "{env_name} must be one of 1/true/0/false, got {other:?}"
         )),
     }
-}
-
-/// #95 review P2-5 — parse a DISARM knob for a flag that ships ON.
-///
-/// Mirrors [`parse_docker_arming_flag`]'s spellings and its
-/// reject-typos-loudly posture, but defaults the OTHER way: unset (or blank)
-/// means "leave the shipped default alone", which for
-/// `under_replication_repair_enabled` is `true`. A typo must still fail the
-/// run rather than silently measure the opposite configuration from the one
-/// the operator asked for.
-fn parse_docker_disarm_flag(env_name: &str, raw: &str) -> Result<bool, String> {
-    match raw.trim() {
-        "" => Ok(true),
-        "1" | "true" => Ok(true),
-        "0" | "false" => Ok(false),
-        other => Err(format!(
-            "{env_name} must be one of 1/true/0/false, got {other:?}"
-        )),
-    }
-}
-
-fn docker_disarm_flag_from_env(env_name: &str) -> Result<bool, ClientError> {
-    let raw = std::env::var(env_name).unwrap_or_default();
-    parse_docker_disarm_flag(env_name, &raw).map_err(ClientError::Connection)
 }
 
 fn docker_arming_flag_from_env(env_name: &str) -> Result<bool, ClientError> {
@@ -243,16 +224,12 @@ enable_admin_endpoints = true
 admin_token = "{admin_token}"
 
 # Armed-qualification opt-ins (TERASLAB_DOCKER_COMMITTED_ELECTION /
-# TERASLAB_DOCKER_UNDER_REPLICATION_SWEEP). Both flags default off in the
-# shipped config; pinned explicitly here so every generated config states
+# TERASLAB_DOCKER_UNDER_REPLICATION_SWEEP /
+# TERASLAB_DOCKER_UNDER_REPLICATION_REPAIR). All three flags default off in
+# the shipped config; pinned explicitly here so every generated config states
 # which path — armed or default — the run actually measured.
 committed_master_election_enabled = {committed_master_election_enabled}
 under_replication_sweep_enabled = {under_replication_sweep_enabled}
-# #95 — the holder-driven under-replication repair driver. This one ships
-# ARMED, so TERASLAB_DOCKER_UNDER_REPLICATION_REPAIR is a DISARM knob
-# (unset = on). Pinned explicitly for the same reason as the two above: a
-# generated config must state which way the run measured, and a run that
-# suspects the driver must be able to isolate it without a rebuild.
 under_replication_repair_enabled = {under_replication_repair_enabled}
 "#,
         admin_token = DOCKER_TEST_ADMIN_TOKEN,
@@ -535,7 +512,7 @@ services:
         let under_replication_sweep_enabled =
             docker_arming_flag_from_env(ENV_DOCKER_UNDER_REPLICATION_SWEEP)?;
         let under_replication_repair_enabled =
-            docker_disarm_flag_from_env(ENV_DOCKER_UNDER_REPLICATION_REPAIR)?;
+            docker_arming_flag_from_env(ENV_DOCKER_UNDER_REPLICATION_REPAIR)?;
         let (swim_probe_interval_ms, swim_suspicion_timeout_ms) =
             swim_timing_for_scenario(self.scenario_id);
 
@@ -1143,23 +1120,41 @@ mod tests {
         assert!(!parse_docker_arming_flag(ENV_DOCKER_UNDER_REPLICATION_SWEEP, "   ").unwrap());
     }
 
-    /// #95 review P2-5 — the DISARM knob defaults the other way: unset means
-    /// the shipped default (ON). Typos must still fail the run loudly rather
-    /// than silently measure the opposite configuration.
+    /// #95 (W15) — the repair knob is an ARM knob, like the other two, and an
+    /// UNSET knob must reproduce whatever the daemon actually ships.
+    ///
+    /// This is pinned against `ServerConfig::default()` rather than against a
+    /// hard-coded `false` on purpose. The knob was a DISARM knob while the
+    /// driver shipped ON; flipping the shipped default without flipping the
+    /// knob would have left every scheduled nightly measuring the ARMED path
+    /// while the run log claimed it measured the default — the vacuous-pass
+    /// failure mode this harness has been burned by. Tying the two together
+    /// makes the next default flip fail here first.
     #[test]
-    fn docker_disarm_flag_parse_defaults_on_and_rejects_typos() {
-        assert!(parse_docker_disarm_flag(ENV_DOCKER_UNDER_REPLICATION_REPAIR, "").unwrap());
-        assert!(parse_docker_disarm_flag(ENV_DOCKER_UNDER_REPLICATION_REPAIR, "   ").unwrap());
-        assert!(parse_docker_disarm_flag(ENV_DOCKER_UNDER_REPLICATION_REPAIR, "1").unwrap());
-        assert!(parse_docker_disarm_flag(ENV_DOCKER_UNDER_REPLICATION_REPAIR, "true").unwrap());
-        assert!(!parse_docker_disarm_flag(ENV_DOCKER_UNDER_REPLICATION_REPAIR, "0").unwrap());
-        assert!(!parse_docker_disarm_flag(ENV_DOCKER_UNDER_REPLICATION_REPAIR, "false").unwrap());
+    fn docker_repair_knob_is_an_arm_knob_tracking_the_shipped_default() {
+        use teraslab::config::ServerConfig;
+
+        let shipped = ServerConfig::default().under_replication_repair_enabled;
+        for raw in ["", "   "] {
+            assert_eq!(
+                parse_docker_arming_flag(ENV_DOCKER_UNDER_REPLICATION_REPAIR, raw).unwrap(),
+                shipped,
+                "an UNSET repair knob must reproduce the shipped default \
+                 ({shipped}) — the knob's polarity went stale against \
+                 `under_replication_repair_enabled`",
+            );
+        }
+        assert!(parse_docker_arming_flag(ENV_DOCKER_UNDER_REPLICATION_REPAIR, "1").unwrap());
+        assert!(parse_docker_arming_flag(ENV_DOCKER_UNDER_REPLICATION_REPAIR, "true").unwrap());
+        assert!(!parse_docker_arming_flag(ENV_DOCKER_UNDER_REPLICATION_REPAIR, "0").unwrap());
+        assert!(!parse_docker_arming_flag(ENV_DOCKER_UNDER_REPLICATION_REPAIR, "false").unwrap());
         let err =
-            parse_docker_disarm_flag(ENV_DOCKER_UNDER_REPLICATION_REPAIR, "disarmed").unwrap_err();
+            parse_docker_arming_flag(ENV_DOCKER_UNDER_REPLICATION_REPAIR, "armed").unwrap_err();
         assert!(
             err.contains(ENV_DOCKER_UNDER_REPLICATION_REPAIR),
             "err was: {err}",
         );
+        assert!(err.contains("armed"), "err must echo the bad value: {err}");
     }
 
     #[test]
@@ -1207,14 +1202,14 @@ mod tests {
         assert!(config.contains("swim_suspicion_timeout_ms = 1000"));
     }
 
-    /// Armed-qualification opt-in: a default render must pin both topology
-    /// flags to their shipped default (off) so scheduled nightlies keep
-    /// measuring the default path, and an armed render must flip exactly
-    /// those two flags AND survive the `ServerConfig` round-trip plus
+    /// Armed-qualification opt-in: a default render must pin all THREE
+    /// topology flags to their shipped default (off) so scheduled nightlies
+    /// keep measuring the default path, and an armed render must flip exactly
+    /// those flags AND survive the `ServerConfig` round-trip plus
     /// safe-defaults gate — an armed TOML that the daemon refuses to boot
     /// would fail every scenario at `wait_cluster_ready`.
     #[test]
-    fn node_config_arms_election_and_sweep_only_when_requested() {
+    fn node_config_arms_election_sweep_and_repair_only_when_requested() {
         use teraslab::config::ServerConfig;
 
         let disarmed = render_node_config(
@@ -1237,19 +1232,18 @@ mod tests {
             disarmed.contains("under_replication_sweep_enabled = false"),
             "disarmed render must pin the sweep OFF explicitly",
         );
-        // #95 review P2-5 — the repair driver ships ARMED, so the harness
-        // needs a way to turn it OFF; a run that suspects it must be able to
-        // isolate it without rebuilding the image.
+        // #95 (W15) — the repair driver ships INERT, so the disarmed render
+        // must say so explicitly rather than relying on the daemon default.
         assert!(
             disarmed.contains("under_replication_repair_enabled = false"),
-            "the harness must be able to DISARM the under-replication repair \
-             driver, and say so in the generated config",
+            "the disarmed render must pin the under-replication repair driver \
+             OFF explicitly, and say so in the generated config",
         );
         let disarmed_cfg: ServerConfig = toml::from_str(&disarmed)
             .expect("disarmed docker node config must be a valid ServerConfig TOML payload");
         assert!(
             !disarmed_cfg.under_replication_repair_enabled,
-            "the disarm knob must actually reach ServerConfig",
+            "the disarmed render must actually reach ServerConfig",
         );
 
         let armed = render_node_config(
@@ -1276,7 +1270,8 @@ mod tests {
         );
         assert!(
             cfg.under_replication_repair_enabled,
-            "the repair driver stays armed in the armed render",
+            "armed render must flip under_replication_repair_enabled on — \
+             scenario 08's qualification path runs through this knob",
         );
         cfg.validate_safe_defaults()
             .expect("armed docker node config must still pass safe-defaults validation");

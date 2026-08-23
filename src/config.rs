@@ -1520,10 +1520,33 @@ pub struct ServerConfig {
     ///  2. a paced, single-flight PROBE re-collects the partition view on a
     ///     quiescent cluster, where nothing else ever refreshes it.
     ///
-    /// # Default ON, and why a default-off flag would be pointless here
+    /// # Default OFF (ship-inert), and the measurement that put it there
     ///
-    /// The configuration that fails is the DEFAULT one. CI run 32084447959
-    /// (default scenario 08): shard 1561 at epoch 4 is
+    /// This flag shipped ON for one wave, on the argument that the
+    /// configuration which fails is the DEFAULT one and that the driver is
+    /// create-only. A three-way CI A/B at commit 7573f07 — same commit, one
+    /// variable — replaced that inference with measurement:
+    ///
+    /// | run | config | 08 | 11 | 05 |
+    /// |---|---|---|---|---|
+    /// | 32637568483 | default, repair ON | PASS | FAIL | n/a |
+    /// | 32639946439 | default, repair OFF | FAIL | PASS | n/a |
+    /// | 32637576348 | armed sweep, repair ON | PASS | n/a | FAIL |
+    /// | 32639877944 | armed sweep, repair OFF | FAIL | FAIL | PASS |
+    ///
+    /// The driver demonstrably FIXES scenario 08 and demonstrably CAUSES
+    /// scenario 11's election divergence (`masters=4094/4096` — two shards
+    /// mastered by NOBODY, with every node agreeing on term and version, so
+    /// no re-election heals it). It also correlates with armed-05's
+    /// zero-holder data loss. Under-replication is recoverable and its own
+    /// repair path is what this flag disarms; election divergence and acked
+    /// records at zero holders are not. For a UTXO store that is not a close
+    /// call.
+    ///
+    /// # What ARMING buys
+    ///
+    /// The steady-state under-replication residue that nothing else repairs.
+    /// CI run 32084447959 (default scenario 08): shard 1561 at epoch 4 is
     /// `master=node3, replicas=[node2]`, node2 holds nothing, and the final
     /// census reads `[n1:N, n2:N, n3:Y]` — one holder under RF=2,
     /// permanently. Run 32630545533 is the same shape at its sharpest: all
@@ -1533,44 +1556,70 @@ pub struct ServerConfig {
     /// 32630553766's scenario 17 corroborates:
     /// `holder_count_histogram=[1:1, 3:757]`.
     ///
-    /// Nothing drove those fills, because all three candidate drivers miss
-    /// that shape: `replica_migration_plan` emits no task (the tables carry
-    /// the same members, so its "already a holder" skip fires),
-    /// `replica_abort_forced_resync_enabled` needs a replica-side terminal
-    /// abort that never happened, and every remaining arm — the 20 s sweep,
-    /// the membership arm, the failed-batch arm — is gated on
-    /// `under_replication_sweep_enabled`, default OFF. For a UTXO store, a
-    /// shard whose only copy is one node away from loss is the worse of the
-    /// two risks.
+    /// Nothing drives those fills with this flag off, because all three
+    /// remaining candidates miss that shape: `replica_migration_plan` emits
+    /// no task (the tables carry the same members, so its "already a holder"
+    /// skip fires), `replica_abort_forced_resync_enabled` needs a
+    /// replica-side terminal abort that never happened, and every other arm —
+    /// the 20 s sweep, the membership arm, the failed-batch arm — is gated on
+    /// `under_replication_sweep_enabled`, also default OFF. So OFF is the
+    /// pre-#95 disposition EXACTLY: no probe runs, the exchange arm
+    /// self-gates on the sweep flag again in both sweep modes, and a shard
+    /// stays under RF until a migration plan, a replica abort, or operator
+    /// action moves it.
     ///
-    /// # What this does NOT do
+    /// # What arming COSTS: the `#29` prune composition hazard
     ///
-    /// It never deletes or overwrites a copy. The pass it drives only
-    /// CREATES missing replicas, by signalling full-shard resync backfills
-    /// through the ordinary migration pipeline; over-replication is not its
-    /// business and it touches no deletion path.
+    /// In ISOLATION this driver is create-only — the pass it drives only
+    /// signals missing replicas, touches no deletion path, and weakens no
+    /// gate (the freshness fence, dead-peer guard, in-flight dedup, per-pass
+    /// cap, no-active-migration gate and drain gate all still refuse). Under
+    /// COMPOSITION it is not, and that is the reversal:
     ///
-    /// It does NOT arm the periodic sweep. The sweep's measured toxicity
+    /// its fills are dispatched as full-shard MIGRATIONS, so each one ends in
+    /// an `OP_MIGRATION_COMPLETE` that runs the target-side `#29` prune with
+    /// the driving master as the `source_is_authoritative_complete` source
+    /// (it IS the committed master at the current epoch — the gate is
+    /// satisfied by construction). The prune's safety proof,
+    /// `prune_safe_at_cutoff` in `crate::server::dispatch`, is scoped to
+    /// THIS source's stream (`node:{src}`). If the target acquired keys from
+    /// a DIFFERENT source between the probe view — up to 15 s stale — and the
+    /// completion, the cutoff proof does not cover them, the manifest does
+    /// not list them, and the fill DELETES them. That is the armed-05 shape
+    /// (5 records on zero nodes), and a reviewer flagged it at medium
+    /// confidence before CI reproduced it.
+    ///
+    /// # Re-arming by default: the precise condition
+    ///
+    /// Fix the `#29` prune composition hazard, by EITHER of:
+    ///
+    ///  * marking driver-originated fills NON-AUTHORITATIVE-FOR-PRUNE, so a
+    ///    repair completion can never take the destructive arm (it is a
+    ///    backfill, not a handoff — it has no reason to prune at all); OR
+    ///  * widening the cutoff proof ACROSS SOURCES, so
+    ///    `prune_safe_at_cutoff` speaks for every stream the target applied
+    ///    from, not just the completing one.
+    ///
+    /// Until one of those lands, arming this flag re-opens a data-loss path,
+    /// and the election divergence in scenario 11 needs its own root-cause
+    /// before the flag is a candidate for default-on again.
+    ///
+    /// # The cost side of an ARMED node, stated plainly
+    ///
+    /// An armed node puts a read-only `OP_PARTITION_VERSION_REPORT` query on
+    /// the wire every 15 s per ALIVE COMMITTED PEER while it masters
+    /// non-empty shards, and can dispatch up to 128 full-shard resync
+    /// backfills per probe that it otherwise never dispatches. Those runs
+    /// hold `active_count() > 0` — which blocks reactivation — and compete
+    /// with client traffic for migration threads (capped at 8 connections for
+    /// resync-origin runs).
+    ///
+    /// Arming does NOT arm the periodic sweep. The sweep's measured toxicity
     /// (armed-04: identical `signaled:128, dropped:820` every 1.55 s, ~77%
     /// duty cycle, 128/4096 shards write-fenced per node) came from
     /// RE-FIRING ON A TIMER against a retained view that a repair never
     /// updates. Both arms here are EVIDENCE-driven: one pass per view
     /// refresh, and the probe's own cadence carries a no-progress backoff.
-    ///
-    /// It also weakens no gate. The fired pass keeps the freshness fence,
-    /// the dead-peer guard, the in-flight dedup, the per-pass cap, the
-    /// no-active-migration gate and the drain gate; a fill refused by an
-    /// authority gate stays refused.
-    ///
-    /// # The risk, stated plainly
-    ///
-    /// A default node now puts a read-only `OP_PARTITION_VERSION_REPORT`
-    /// query on the wire every 15 s per ALIVE COMMITTED PEER while it masters
-    /// non-empty shards, and can dispatch up to 128 full-shard resync
-    /// backfills per probe that it previously never dispatched. Those runs
-    /// hold `active_count() > 0` — which blocks reactivation — and compete
-    /// with client traffic for migration threads (capped at 8 connections for
-    /// resync-origin runs).
     ///
     /// The probe query itself is deliberately CHEAP, and keeping it that way
     /// took work (review P1-1). Answering a partition-version report normally
@@ -1597,17 +1646,13 @@ pub struct ServerConfig {
     /// from the commit path's `exchange_peer_failure_*` health counters so a
     /// background repair cannot make activation look like it is starving).
     ///
-    /// The E2E harness can disarm this without an image rebuild:
-    /// `TERASLAB_DOCKER_UNDER_REPLICATION_REPAIR=0` (nightly input
-    /// `disarm_repair`), and every generated node config states which way the
+    /// The whole mechanism — driver, probe, origin byte, metrics and tests —
+    /// stays shipped and reachable behind this knob, so the qualification
+    /// work above can be run without resurrecting deleted code. The E2E
+    /// harness arms it without an image rebuild:
+    /// `TERASLAB_DOCKER_UNDER_REPLICATION_REPAIR=1` (nightly input
+    /// `arm_repair`), and every generated node config states which way the
     /// run measured.
-    ///
-    /// Turning it OFF restores the pre-#95 disposition EXACTLY: no probe
-    /// runs, and the exchange arm self-gates on
-    /// `under_replication_sweep_enabled` again in both sweep modes. The
-    /// documented trade is a shard that stays under RF until a migration
-    /// plan, a replica abort, or operator action moves it — which is the
-    /// state CI keeps reproducing.
     pub under_replication_repair_enabled: bool,
 
     /// W9 Part B (review P1-2c) — when a REPLICA-side migration task is
@@ -2067,7 +2112,7 @@ impl Default for ServerConfig {
             replication_factor: 1,
             committed_master_election_enabled: false,
             under_replication_sweep_enabled: false,
-            under_replication_repair_enabled: true,
+            under_replication_repair_enabled: false,
             replica_abort_forced_resync_enabled: true,
             migration_vetoed_reduction_enabled: false,
             migration_weak_veto_arbitration_enabled: true,
@@ -4495,39 +4540,52 @@ otlp_endpoint = "http://set-via-toml:4317"
         );
     }
 
-    /// #95 — the holder-driven under-replication driver ships ARMED, and the
-    /// PERIODIC sweep it borrows the pass from stays disarmed.
+    /// #95 (W15) — the holder-driven under-replication driver ships INERT,
+    /// alongside the PERIODIC sweep it borrows the pass from.
     ///
-    /// A driver that defaults off does not fix the configuration that fails:
-    /// CI run 32084447959's default scenario 08 ends with a shard serving at
-    /// ONE holder under RF=2 with no driver at all. The two flags are pinned
-    /// together because they are one keystroke apart and wiring the driver
-    /// to the sweep's default would silently re-open the gap.
+    /// The three-way A/B at commit 7573f07 measured what the default-ON
+    /// argument could only infer: run 32637568483 (repair ON) passes
+    /// scenario 08 and FAILS 11 with `masters=4094/4096` — two shards
+    /// mastered by nobody while every node agrees on term and version — and
+    /// run 32639946439 (repair OFF, same commit) is the exact mirror: 08
+    /// fails, 11 passes. The armed-sweep pair repeats it on scenario 05
+    /// (32637576348 repair ON: 5 records on ZERO nodes; 32639877944 repair
+    /// OFF: pass). Under-replication is recoverable; election divergence and
+    /// zero-holder records are not.
+    ///
+    /// The two flags stay pinned together because they are one keystroke
+    /// apart — a copy-paste that sourced either from the other would
+    /// type-check and silently move the OTHER one's disposition.
     #[test]
-    fn under_replication_exchange_repair_defaults_on_and_the_sweep_stays_off() {
+    fn under_replication_exchange_repair_and_the_sweep_both_default_off() {
         let defaults = ServerConfig::default();
         assert!(
-            defaults.under_replication_repair_enabled,
-            "the exchange-driven under-replication repair must default ON",
+            !defaults.under_replication_repair_enabled,
+            "the exchange-driven under-replication repair must ship INERT — \
+             armed, it diverged the election in CI run 32637568483",
         );
         assert!(
             !defaults.under_replication_sweep_enabled,
-            "the PERIODIC sweep must stay default OFF — #95 arms the \
-             evidence-driven arm, not the 20s cadence",
+            "the PERIODIC sweep must stay default OFF",
         );
 
         let omitted: ServerConfig = toml::from_str("node_id = 1\n").unwrap();
         assert!(
-            omitted.under_replication_repair_enabled,
-            "a config that omits the key must still get the driver",
+            !omitted.under_replication_repair_enabled,
+            "a config that omits the key must leave the driver disarmed",
         );
         assert!(!omitted.under_replication_sweep_enabled);
 
-        let disarmed: ServerConfig =
-            toml::from_str("node_id = 1\nunder_replication_repair_enabled = false\n").unwrap();
+        let armed: ServerConfig =
+            toml::from_str("node_id = 1\nunder_replication_repair_enabled = true\n").unwrap();
         assert!(
-            !disarmed.under_replication_repair_enabled,
-            "an explicit opt-out must disarm the driver (the rollback path)",
+            armed.under_replication_repair_enabled,
+            "an explicit opt-in must still arm the driver (the qualification \
+             path — the whole mechanism stays shipped and reachable)",
+        );
+        assert!(
+            !armed.under_replication_sweep_enabled,
+            "arming the driver must not drag the sweep along",
         );
     }
 

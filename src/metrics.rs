@@ -1424,12 +1424,14 @@ pub struct MigrationMetrics {
     /// `under_replication_sweep_enabled` is on.
     pub under_replication_event_repairs: PaddedCounter,
     /// #95 — under-replication repair passes ARMED by a completed exchange
-    /// (`under_replication_repair_enabled`, default ON). Counted at
-    /// the arm, like `replica_abort_forced_resyncs`, so it is non-zero in
-    /// sweep-off clusters: this is the operator-visible evidence that the
-    /// holder-driven driver exists at all. A cluster whose shards sit under
-    /// RF with this counter FLAT is not being refused — it is never being
-    /// asked, which points at the exchange cadence rather than at a gate.
+    /// (`under_replication_repair_enabled`, default OFF since W15). Counted
+    /// at the arm, like `replica_abort_forced_resyncs`, so on an ARMED node
+    /// it is non-zero even in sweep-off clusters: this is the
+    /// operator-visible evidence that the holder-driven driver is running at
+    /// all. On a default (inert) node it stays flat by construction. On an
+    /// armed one, shards sitting under RF with this counter FLAT are not
+    /// being refused — they are never being asked, which points at the
+    /// exchange cadence rather than at a gate.
     pub under_replication_exchange_repairs: PaddedCounter,
     /// #95 — holder-driven under-replication PROBES launched: partition-view
     /// re-collections a master ran on its own cadence because a quiescent

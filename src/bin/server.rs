@@ -408,10 +408,11 @@ fn build_cluster_config(
         committed_master_election_enabled: config.committed_master_election_enabled,
         under_replication_sweep_enabled: config.under_replication_sweep_enabled,
         // #95 — MUST be `config.under_replication_repair_enabled`.
-        // The line above defaults OFF; sourcing this from it type-checks and
-        // silently removes the only holder-driven repair driver a default
-        // node has. Pinned by
-        // `cluster_config_projects_the_exchange_repair_driver_armed_by_default`.
+        // The line BELOW (`replica_abort_forced_resync_enabled`) defaults ON;
+        // sourcing this from it type-checks and silently ARMS on every
+        // default node a driver CI measured diverging the election and
+        // correlating with zero-holder records. Pinned by
+        // `cluster_config_projects_the_exchange_repair_driver_inert_by_default`.
         under_replication_repair_enabled: config.under_replication_repair_enabled,
         replica_abort_forced_resync_enabled: config.replica_abort_forced_resync_enabled,
         migration_vetoed_reduction_enabled: config.migration_vetoed_reduction_enabled,
@@ -3021,21 +3022,27 @@ mod tests {
         assert!(!sibling_off.replica_abort_forced_resync_enabled);
     }
 
-    /// #95 — the holder-driven under-replication driver must reach the
-    /// coordinator ARMED on a default node, sourced from its OWN field.
+    /// #95 (W15) — the holder-driven under-replication driver must reach the
+    /// coordinator INERT on a default node, sourced from its OWN field.
     ///
-    /// The mis-wire that matters here is the mirror of W13's: this flag sits
-    /// one line from `under_replication_sweep_enabled`, which defaults OFF.
-    /// Feeding the sweep field in here type-checks, keeps every other test
-    /// green, and silently restores the exact configuration whose scenario-08
-    /// shard served at one holder under RF=2 forever.
+    /// The mis-wire class survived the W15 default flip, it only changed
+    /// direction. Two of this line's neighbours default to `true`
+    /// (`replica_abort_forced_resync_enabled`,
+    /// `migration_weak_veto_arbitration_enabled`); a copy-paste feeding
+    /// either one in here type-checks, keeps every other test green, and
+    /// silently ARMS on every default deployment a driver that CI measured
+    /// diverging the election (run 32637568483, scenario 11:
+    /// `masters=4094/4096`) and correlating with zero-holder records
+    /// (32637576348, armed scenario 05). Wiring the SWEEP field in — the
+    /// pre-W15 hazard — is now polarity-invisible at the default, so the
+    /// opt-in leg below is what catches it.
     #[test]
-    fn cluster_config_projects_the_exchange_repair_driver_armed_by_default() {
+    fn cluster_config_projects_the_exchange_repair_driver_inert_by_default() {
         let defaults = cluster_config_from(&ServerConfig::default());
         assert!(
-            defaults.under_replication_repair_enabled,
-            "a default ServerConfig MUST project an ARMED exchange repair \
-             driver — the sweep flag was wired in its place",
+            !defaults.under_replication_repair_enabled,
+            "a default ServerConfig MUST project a DISARMED exchange repair \
+             driver — a default-ON sibling was wired in its place",
         );
         assert!(
             !defaults.under_replication_sweep_enabled,
@@ -3047,26 +3054,31 @@ mod tests {
             under_replication_sweep_enabled: true,
             ..ServerConfig::default()
         });
-        assert!(sweep_armed.under_replication_repair_enabled);
+        assert!(
+            !sweep_armed.under_replication_repair_enabled,
+            "arming the periodic sweep must not drag the holder-driven driver \
+             along — the two arms are qualified separately",
+        );
         assert!(sweep_armed.under_replication_sweep_enabled);
 
-        // The rollback path: disarming the driver moves ONLY the driver.
-        let driver_off = cluster_config_from(&ServerConfig {
-            under_replication_repair_enabled: false,
+        // The qualification path: arming the driver moves ONLY the driver.
+        let driver_on = cluster_config_from(&ServerConfig {
+            under_replication_repair_enabled: true,
             ..ServerConfig::default()
         });
         assert!(
-            !driver_off.under_replication_repair_enabled,
-            "an explicit opt-out must project disarmed",
+            driver_on.under_replication_repair_enabled,
+            "an explicit opt-in must project ARMED — the sweep field (also \
+             default-off) was wired in its place",
         );
         assert_eq!(
-            driver_off.under_replication_sweep_enabled, defaults.under_replication_sweep_enabled,
-            "disarming the driver must not disturb the sweep flag",
+            driver_on.under_replication_sweep_enabled, defaults.under_replication_sweep_enabled,
+            "arming the driver must not disturb the sweep flag",
         );
         assert_eq!(
-            driver_off.replica_abort_forced_resync_enabled,
+            driver_on.replica_abort_forced_resync_enabled,
             defaults.replica_abort_forced_resync_enabled,
-            "disarming the driver must not disturb the abort-forced resync",
+            "arming the driver must not disturb the abort-forced resync",
         );
     }
 
