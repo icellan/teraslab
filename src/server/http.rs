@@ -1560,6 +1560,11 @@ pub(crate) fn render_metrics_text(
         );
         prom_counter(
             &mut out,
+            "teraslab_migration_prune_records_deleted_total",
+            mm.migration_prune_records_deleted.get(),
+        );
+        prom_counter(
+            &mut out,
             "teraslab_migration_transfer_request_refused_total",
             mm.migration_transfer_request_refused.get(),
         );
@@ -1599,6 +1604,12 @@ pub(crate) fn render_metrics_text(
             &mut out,
             "teraslab_orphan_cleanup_retained_no_evidence",
             mm.orphan_cleanup_retained_no_evidence
+                .load(Ordering::Relaxed) as u64,
+        );
+        prom_gauge(
+            &mut out,
+            "teraslab_orphan_cleanup_retained_abort_veto",
+            mm.orphan_cleanup_retained_abort_veto
                 .load(Ordering::Relaxed) as u64,
         );
         // W12 — the two outcomes of the proof-of-elsewhere path that drains
@@ -5648,6 +5659,7 @@ mod tests {
             "teraslab_migration_weak_veto_arbitration_refused_total",
             "teraslab_migration_prune_weak_declared_retained_total",
             "teraslab_migration_prune_skipped_cutoff_gate_total",
+            "teraslab_migration_prune_records_deleted_total",
             "teraslab_migration_transfer_request_refused_total",
             "teraslab_migration_dangling_inbound_dropped_total",
             "teraslab_migration_inbound_refused_retained",
@@ -5656,6 +5668,7 @@ mod tests {
             "teraslab_topology_proposal_revalidation_emptied_total",
             "teraslab_topology_catch_up_reproposal_skipped_total",
             "teraslab_orphan_cleanup_retained_no_evidence",
+            "teraslab_orphan_cleanup_retained_abort_veto",
             "teraslab_reheal_live_confirm_rounds_total",
             "teraslab_reheal_live_confirm_shards_total",
             "teraslab_reheal_live_confirm_deferred_total",

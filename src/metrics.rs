@@ -1564,6 +1564,16 @@ pub struct MigrationMetrics {
     /// dormant there and its anti-stale role rests on the escalation's
     /// fresh-fold path. Rising steadily = that dormancy, not a defect.
     pub migration_prune_skipped_cutoff_gate: PaddedCounter,
+    /// W15 — records the #29 completion prune actually DESTROYED.
+    ///
+    /// Its two siblings above count what the prune DECLINED to do; until now
+    /// nothing counted what it did, so the one question triage actually asks —
+    /// "did a deleting path run at all?" — could not be answered from a metrics
+    /// scrape. Reconstructing that from `dead_bytes` arithmetic is exactly how
+    /// the scenario-05 acked-loss chain (CI run 32637576348) had to be traced.
+    /// Read together with the per-shard INFO audit line the prune now emits:
+    /// this counter says whether to go looking for it.
+    pub migration_prune_records_deleted: PaddedCounter,
     /// W11 FIX 4(a) — `OP_MIGRATION_TRANSFER_REQUEST` frames this source
     /// refused shards for: either a WHOLE-frame refusal (the requester is
     /// neither a target holder nor the intended master for ANY requested
@@ -1624,6 +1634,19 @@ pub struct MigrationMetrics {
     /// pass (event-driven or batch-completion); a pass that reclaims (or
     /// finds no retained shard) resets it to the new census.
     pub orphan_cleanup_retained_no_evidence: AtomicU32,
+    /// W15 review P2-2 — gauge: non-owned shards the LAST orphan-cleanup pass
+    /// retained because a handoff of the shard TERMINALLY ABORTED at this
+    /// epoch, split out of `orphan_cleanup_retained_no_evidence`.
+    ///
+    /// The two states are materially different and W11 FIX 4(b)'s rule is that
+    /// a census gap must be attributable to the gate that caused it. "No
+    /// evidence" is the SIGKILL / never-handed-off case that the
+    /// proof-of-elsewhere path exists to earn its way out of, and it is
+    /// expected to be large and slow-moving. An abort veto is POSITIVE
+    /// knowledge that a target refused a record this node holds: it is a
+    /// data-safety hold, it should be rare, and a non-zero value points at a
+    /// specific failing handoff rather than at generic over-replication.
+    pub orphan_cleanup_retained_abort_veto: AtomicU32,
     /// W12 — shards reclaimed by the proof-of-elsewhere path: the #28
     /// committed-handoff evidence was missing (and, in the SIGKILL /
     /// never-handed-off case, unearnable), but every CURRENT committed holder
@@ -1757,6 +1780,7 @@ impl MigrationMetrics {
             migration_weak_veto_arbitration_refused: PaddedCounter::new(),
             migration_prune_weak_declared_retained: PaddedCounter::new(),
             migration_prune_skipped_cutoff_gate: PaddedCounter::new(),
+            migration_prune_records_deleted: PaddedCounter::new(),
             migration_transfer_request_refused: PaddedCounter::new(),
             migration_dangling_inbound_dropped: PaddedCounter::new(),
             migration_inbound_refused_retained: AtomicU32::new(0),
@@ -1765,6 +1789,7 @@ impl MigrationMetrics {
             topology_proposal_revalidation_emptied: PaddedCounter::new(),
             topology_catch_up_reproposal_skipped: PaddedCounter::new(),
             orphan_cleanup_retained_no_evidence: AtomicU32::new(0),
+            orphan_cleanup_retained_abort_veto: AtomicU32::new(0),
             orphan_cleanup_proof_reclaimed: PaddedCounter::new(),
             orphan_cleanup_proof_refused: PaddedCounter::new(),
             orphan_cleanup_proof_stale_no_delete: PaddedCounter::new(),

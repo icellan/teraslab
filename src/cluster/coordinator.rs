@@ -15847,6 +15847,11 @@ fn run_orphan_cleanup(
     // evidence permanently, the guard (correctly, fail-closed) never passes;
     // the gauge makes that census gap visible instead of silent.
     let mut retained_no_evidence = 0u32;
+    // W15 review P2-2 — the subset of the retained census held back by an ABORT
+    // VETO rather than by absent evidence. Split out because the two states
+    // call for different operator responses: one waits for the proof phase or
+    // an epoch bump, the other names a handoff that needs looking at.
+    let mut retained_abort_veto = 0u32;
     // W11 FIX 4(b) — the skips ABOVE the #28 evidence check were silent
     // `continue`s, so a node sitting on stale copies reported
     // `orphan_cleanup_retained_no_evidence = 0` and looked healthy while
@@ -15922,7 +15927,29 @@ fn run_orphan_cleanup(
             // copy. Delete only with positive evidence the data is safe
             // elsewhere: a committed handoff of this shard from this node.
             if !mgr.has_committed_handoff(shard, topology_epoch) {
-                retained_no_evidence = retained_no_evidence.saturating_add(1);
+                // W15 review P2-2 — ATTRIBUTE the retention. `has_committed_handoff`
+                // is now false for two materially different reasons, and W11 FIX
+                // 4(b)'s rule is that a census gap must be attributable to the
+                // gate that caused it. "No evidence" is the SIGKILL /
+                // never-handed-off case the proof phase exists to earn its way
+                // out of — expected to be large and slow-moving. An ABORT VETO is
+                // positive knowledge that a target refused a record this node
+                // holds: rare, a data-safety hold, and it names a specific
+                // failing handoff. Folding them into one gauge reads the second
+                // as generic over-replication.
+                //
+                // Attribution ONLY: an abort-vetoed shard is still queued for
+                // the proof phase below, exactly as before. The abort's target
+                // need not even be a committed holder (a repair push is not),
+                // so a unanimous confirmation from the holders that ARE
+                // committed remains a legitimate way to earn the reclaim. This
+                // hunk changes what the census SAYS, not what the pass does.
+                let abort_vetoed = mgr.has_aborted_handoff(shard, topology_epoch);
+                if abort_vetoed {
+                    retained_abort_veto = retained_abort_veto.saturating_add(1);
+                } else {
+                    retained_no_evidence = retained_no_evidence.saturating_add(1);
+                }
                 // W12 — the evidence is missing, but it may be EARNABLE. Queue
                 // the shard for the proof-of-elsewhere phase together with the
                 // holder set the table currently commits it to; `self` is
@@ -15944,7 +15971,12 @@ fn run_orphan_cleanup(
                 debug_shard_log(
                     shard,
                     format!(
-                        "orphan_cleanup RETAIN (no committed handoff) self={} master={} replicas={:?} records={}",
+                        "orphan_cleanup RETAIN ({}) self={} master={} replicas={:?} records={}",
+                        if abort_vetoed {
+                            "handoff terminally ABORTED at this epoch — source keeps authority"
+                        } else {
+                            "no committed handoff"
+                        },
                         self_id.0,
                         assignment.master.0,
                         assignment.replicas.iter().map(|n| n.0).collect::<Vec<_>>(),
@@ -16250,6 +16282,10 @@ fn run_orphan_cleanup(
     if let Some(m) = crate::metrics::migration_metrics() {
         m.orphan_cleanup_retained_no_evidence
             .store(retained_no_evidence, Ordering::Relaxed);
+        // W15 review P2-2 — same contract: published every pass including zero,
+        // so a resolved veto leaves the gauge.
+        m.orphan_cleanup_retained_abort_veto
+            .store(retained_abort_veto, Ordering::Relaxed);
         // W11 FIX 4(b) — same contract as the gauge above (published every
         // pass, including zero, so a cleared skip leaves the gauge).
         m.orphan_cleanup_skipped_pending_inbound
@@ -16306,6 +16342,29 @@ fn run_orphan_cleanup(
         if shard_table.read().version != topology_epoch {
             tracing::info!("cluster: orphan cleanup aborted — topology epoch changed");
             break;
+        }
+        // W15 review P2-3 — RE-CHECK the per-shard evidence, not just the epoch.
+        // The candidate list was fixed during the scan phase, and the proof
+        // phase between then and here runs with NO locks held and can take
+        // network round-trips; a handoff of this shard can terminally abort in
+        // that window, or its `Failed` entry be reaped (P1-1), and the pass
+        // would still delete on the strength of a decision made before either.
+        // The version alone does not catch it: `commit_shard`/`rollback_shard`
+        // and every handoff outcome move at CONSTANT version. One lock
+        // acquisition per candidate shard — the same price the proof path
+        // already pays.
+        if !migration
+            .lock()
+            .has_committed_handoff(shard, topology_epoch)
+        {
+            if let Some(m) = crate::metrics::migration_metrics() {
+                m.orphan_cleanup_shard_skipped.inc();
+            }
+            debug_shard_log(
+                shard,
+                "orphan_cleanup SKIP (evidence withdrawn after the scan)",
+            );
+            continue;
         }
 
         let keys = engine.keys_for_shard(shard);
@@ -31850,6 +31909,158 @@ mod tests {
         );
     }
 
+    /// W15 review P2-2 — the census must ATTRIBUTE a retention to the gate that
+    /// caused it (W11 FIX 4(b)'s standing rule).
+    ///
+    /// `has_committed_handoff` is now false for two materially different
+    /// reasons. "No evidence" is the SIGKILL / never-handed-off case the proof
+    /// phase exists to earn its way out of; an ABORT VETO is positive knowledge
+    /// that a target refused a record this node holds. Folding the second into
+    /// `retained_no_evidence` reads it as generic over-replication and hides a
+    /// specific failing handoff.
+    #[test]
+    fn orphan_cleanup_census_separates_an_abort_veto_from_absent_evidence() {
+        let _guard = migration_metrics_test_guard();
+        let metrics = install_test_migration_metrics();
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let lost: Vec<u16> = (0..NUM_SHARDS as u16)
+            .filter(|&s| {
+                let old = old_table.target_assignment(s);
+                let new = new_table.target_assignment(s);
+                (old.master == NodeId(1) || old.replicas.contains(&NodeId(1)))
+                    && new.master != NodeId(1)
+                    && !new.replicas.contains(&NodeId(1))
+            })
+            .take(2)
+            .collect();
+        assert_eq!(lost.len(), 2);
+        let (vetoed, no_evidence) = (lost[0], lost[1]);
+
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(vetoed, 91));
+        create_test_record(&engine, tx_key_for_shard(no_evidence, 92));
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let epoch = new_table.version;
+        {
+            let mut mgr = migration.lock();
+            // A committed sibling handoff AND an abort — the veto shape.
+            mgr.record_committed_handoff(vetoed, NodeId(2), epoch);
+            mgr.record_aborted_handoff(vetoed, NodeId(3), epoch);
+            // The other shard has nothing at all.
+        }
+
+        run_orphan_cleanup(NodeId(1), &engine, &shard_table, &migration, epoch, None);
+
+        assert_eq!(engine.shard_record_count(vetoed), 1, "both are retained");
+        assert_eq!(engine.shard_record_count(no_evidence), 1);
+        assert_eq!(
+            metrics
+                .orphan_cleanup_retained_abort_veto
+                .load(Ordering::Relaxed),
+            1,
+            "the abort-vetoed shard must be gauged as such",
+        );
+        assert_eq!(
+            metrics
+                .orphan_cleanup_retained_no_evidence
+                .load(Ordering::Relaxed),
+            1,
+            "and must NOT be double-counted into the absent-evidence gauge — \
+             exactly one shard is retained for that reason",
+        );
+    }
+
+    /// W15 review P2-3 — the delete loop must re-check the PER-SHARD evidence,
+    /// not just the table version.
+    ///
+    /// The candidate list is fixed during the scan; the proof phase then runs
+    /// with NO locks held and can take network round-trips. A handoff can
+    /// terminally abort in that window (or its `Failed` entry be reaped), and
+    /// the pass would still delete on the strength of a decision made before
+    /// either. The version does not catch it — `commit_shard`/`rollback_shard`
+    /// and every handoff outcome move at CONSTANT version.
+    ///
+    /// The probe hook is the injection point, and it is the REAL one: it is the
+    /// production window, not a synthetic seam.
+    #[test]
+    fn orphan_cleanup_delete_loop_rechecks_evidence_withdrawn_during_the_probe() {
+        let _guard = migration_metrics_test_guard();
+        let _metrics = install_test_migration_metrics();
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let lost: Vec<u16> = (0..NUM_SHARDS as u16)
+            .filter(|&s| {
+                let old = old_table.target_assignment(s);
+                let new = new_table.target_assignment(s);
+                (old.master == NodeId(1) || old.replicas.contains(&NodeId(1)))
+                    && new.master != NodeId(1)
+                    && !new.replicas.contains(&NodeId(1))
+            })
+            .take(2)
+            .collect();
+        assert_eq!(lost.len(), 2);
+        // `candidate` passes the scan and is queued for deletion; `probed` has
+        // no evidence, so it is what the proof phase asks about — and the
+        // asking is what gives the abort its window.
+        let (candidate, probed) = (lost[0], lost[1]);
+
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(candidate, 93));
+        create_test_record(&engine, tx_key_for_shard(probed, 94));
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let epoch = new_table.version;
+        {
+            let mut mgr = migration.lock();
+            mgr.record_committed_handoff(candidate, NodeId(2), epoch);
+            mgr.set_orphan_cleanup_proof_reclaim_enabled(true);
+        }
+
+        // Nothing confirms, so `probed` is merely refused — the point is the
+        // hook, which fires mid-pass while no lock is held.
+        let racing = Arc::clone(&migration);
+        let proof = ScriptedProof {
+            confirming: std::collections::HashSet::new(),
+            asked: Mutex::new(Vec::new()),
+            on_probe: Some(Box::new(move |_shard| {
+                racing
+                    .lock()
+                    .record_aborted_handoff(candidate, NodeId(3), epoch);
+            })),
+        };
+
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            epoch,
+            Some(&proof),
+        );
+
+        assert!(
+            !proof.asked_for_shard(probed).is_empty(),
+            "the fixture must actually probe, or the abort never gets its \
+             window and the test proves nothing",
+        );
+        assert!(
+            migration.lock().has_aborted_handoff(candidate, epoch),
+            "the racing abort must have landed",
+        );
+        assert_eq!(
+            engine.shard_record_count(candidate),
+            1,
+            "the delete loop must re-read the evidence: it was withdrawn after \
+             the scan put this shard on the candidate list",
+        );
+    }
+
     #[test]
     fn quiesce_signals_topology_activation_without_pre_mutating_local_state() {
         let members = vec![NodeId(1), NodeId(2), NodeId(3)];
@@ -41309,20 +41520,11 @@ mod tests {
     //    live epoch (proves the source-side leg of the same Arc).
     // ----------------------------------------------------------------------
 
-    fn install_test_migration_metrics() -> &'static crate::metrics::MigrationMetrics {
-        use crate::metrics::{MigrationMetrics, init_migration_metrics, migration_metrics};
-        use std::sync::OnceLock;
-        static TEST_METRICS: OnceLock<MigrationMetrics> = OnceLock::new();
-        let m_ref: &'static MigrationMetrics = TEST_METRICS.get_or_init(MigrationMetrics::new);
-        init_migration_metrics(m_ref);
-        migration_metrics().expect("metrics installed")
-    }
-
-    fn migration_metrics_test_guard() -> parking_lot::MutexGuard<'static, ()> {
-        use std::sync::OnceLock;
-        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD.get_or_init(|| Mutex::new(())).lock()
-    }
+    // Both live in `crate::test_metrics` so `server::dispatch` can install and
+    // serialize on the SAME global metrics + mutex (review P2-5); they were
+    // private here, which is why it previously could not assert on a migration
+    // counter at all.
+    use crate::test_metrics::{install_test_migration_metrics, migration_metrics_test_guard};
 
     /// Serializes the tests that assert on the PROCESS-GLOBAL
     /// `REHEAL_SKIPPED_DEGENERATE_VIEW_TOTAL` counter. Every
