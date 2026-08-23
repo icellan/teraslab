@@ -1653,6 +1653,11 @@ pub struct ServerConfig {
     /// `TERASLAB_DOCKER_UNDER_REPLICATION_REPAIR=1` (nightly input
     /// `arm_repair`), and every generated node config states which way the
     /// run measured.
+    ///
+    /// Arming is never silent: `ClusterCoordinator::new` emits a boot WARN
+    /// naming this flag, what it costs and the CI runs that measured it, so
+    /// a qualification run records what was accepted in its own log. A
+    /// default (disarmed) node boots quiet.
     pub under_replication_repair_enabled: bool,
 
     /// W9 Part B (review P1-2c) — when a REPLICA-side migration task is

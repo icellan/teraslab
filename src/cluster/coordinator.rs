@@ -3553,6 +3553,35 @@ impl ClusterCoordinator {
         let mut addrs = std::collections::HashMap::new();
         addrs.insert(config.self_id, config.self_addr);
 
+        if config.under_replication_repair_enabled {
+            // #95 (W15) — arming re-opens a path CI measured LOSING acked
+            // records. Same posture as the orphan-proof reclaim warn below:
+            // the boot log, not only a config file nobody re-reads during an
+            // incident. Disarmed (default) nodes stay silent. The run IDs are
+            // in the message deliberately — an operator reading a log must be
+            // able to reach the evidence without reading this source.
+            tracing::warn!(
+                "cluster: under_replication_repair_enabled=true — the \
+                 holder-driven under-replication repair driver is ARMED. It \
+                 closes the steady-state under-replication residue nothing \
+                 else repairs (E2E scenario 08), but CI measured it diverging \
+                 master election — run 32637568483, scenario 11, \
+                 masters=4094/4096: two shards mastered by NOBODY while every \
+                 node agrees on term and version, so no re-election heals it \
+                 — and correlating with data loss: run 32637576348, armed \
+                 scenario 05, 5 acked records on ZERO nodes. The driver is \
+                 create-only in isolation but NOT under composition: its \
+                 fills ride full-shard migrations whose OP_MIGRATION_COMPLETE \
+                 runs the target-side #29 prune with this node \
+                 authoritative-complete, and that prune's cutoff proof covers \
+                 only the completing source's stream — keys the target took \
+                 from ANOTHER source after the (up to 15s stale) probe view \
+                 are neither proven nor listed, and get deleted. Ships \
+                 disabled; disable it unless you are deliberately qualifying \
+                 it.",
+            );
+        }
+
         Self {
             self_id: config.self_id,
             self_addr: config.self_addr,
@@ -29683,6 +29712,60 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("orphan_cleanup_proof_reclaim_enabled")),
             "a DISARMED node must not warn about the reclaim: {disarmed_warnings:?}",
+        );
+    }
+
+    /// #95 (W15) — arming the holder-driven repair driver re-opens a path CI
+    /// measured LOSING acked records, so it must be visible in the boot log,
+    /// not only in a config file nobody re-reads during an incident. Same
+    /// posture as [`arming_the_orphan_proof_reclaim_warns_at_startup`]: fires
+    /// only when armed, disarmed nodes stay silent (no warning fatigue).
+    ///
+    /// The message must carry the CI run IDs. An operator reading a log at
+    /// 3am must be able to find the evidence for what they are running
+    /// without reading the source of the node that printed it.
+    #[test]
+    fn arming_the_under_replication_repair_driver_warns_at_startup() {
+        let mut armed_cfg = cluster_config_for_test(false, true);
+        armed_cfg.under_replication_repair_enabled = true;
+        let armed_warnings = capture_tracing_lines(tracing::Level::WARN, || {
+            let _ = ClusterCoordinator::new(armed_cfg, 1);
+        });
+        let arming_line: Vec<&String> = armed_warnings
+            .iter()
+            .filter(|l| l.contains("under_replication_repair_enabled"))
+            .collect();
+        assert_eq!(
+            arming_line.len(),
+            1,
+            "arming the repair driver must emit exactly one boot WARN naming \
+             the flag; captured WARNs: {armed_warnings:?}",
+        );
+        assert!(
+            arming_line[0].contains("data loss"),
+            "the boot WARN must say what the operator is accepting: {}",
+            arming_line[0],
+        );
+        for run_id in ["32637568483", "32637576348"] {
+            assert!(
+                arming_line[0].contains(run_id),
+                "the boot WARN must name CI run {run_id} so the evidence is \
+                 reachable from the log alone: {}",
+                arming_line[0],
+            );
+        }
+
+        let mut disarmed_cfg = cluster_config_for_test(false, true);
+        disarmed_cfg.under_replication_repair_enabled = false;
+        let disarmed_warnings = capture_tracing_lines(tracing::Level::WARN, || {
+            let _ = ClusterCoordinator::new(disarmed_cfg, 1);
+        });
+        assert!(
+            !disarmed_warnings
+                .iter()
+                .any(|l| l.contains("under_replication_repair_enabled")),
+            "a DISARMED node must not warn about the repair driver — the \
+             shipped default must boot silent: {disarmed_warnings:?}",
         );
     }
 
