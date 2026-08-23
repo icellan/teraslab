@@ -9643,12 +9643,39 @@ impl Engine {
         // when EITHER the footer OR the live secondary height is non-zero.
         // (`update_dah_index`'s `remove` is by-key; `old_height` is only a
         // non-zero gate, so any non-zero value drives the removal.)
+        //
+        // These are PAST THE COMMIT POINT, so their errors are deferred like
+        // the header write's rather than propagated with `?`. A short-circuit
+        // here would skip the deletion tombstone below and leave a durable
+        // delete with no tombstone — the Invariant TS-1 violation that lets
+        // Phase-2c reverse-heal resurrect the record. The remaining steps are
+        // all in-RAM and independent of these, so continuing is safe.
         let live_dah = self.dah_index().get_height(&req.tx_key).unwrap_or(0);
-        if device_dah != 0 || live_dah != 0 {
-            self.update_dah_index(&req.tx_key, device_dah.max(live_dah), 0)?;
+        if (device_dah != 0 || live_dah != 0)
+            && let Err(e) = self.update_dah_index(&req.tx_key, device_dah.max(live_dah), 0)
+        {
+            tracing::error!(
+                target: "teraslab::ops::delete",
+                txid_prefix = ?&req.tx_key.txid[..4],
+                error = %e,
+                "delete could not remove the DAH secondary entry; the delete is \
+                 already durably committed so it stands, and the stale entry is \
+                 reconciled at the next boot",
+            );
+            deferred.get_or_insert(e);
         }
-        if device_preserve != 0 {
-            self.update_preserve_index(&req.tx_key, device_preserve, 0)?;
+        if device_preserve != 0
+            && let Err(e) = self.update_preserve_index(&req.tx_key, device_preserve, 0)
+        {
+            tracing::error!(
+                target: "teraslab::ops::delete",
+                txid_prefix = ?&req.tx_key.txid[..4],
+                error = %e,
+                "delete could not remove the preserve secondary entry; the delete \
+                 is already durably committed so it stands, and the stale entry is \
+                 reconciled at the next boot",
+            );
+            deferred.get_or_insert(e);
         }
 
         // Drop any conflicting-index entry for the deleted record. The
