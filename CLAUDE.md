@@ -41,6 +41,32 @@ own branch (amend or drop the commit later) — never `git stash`. This is the
 worktree-specific corollary of the global "never destroy the working tree" rule:
 `stash` is safe advice in a single checkout and unsafe here.
 
+### Undoing a temporary edit: copy the file first, never `git checkout --`
+
+The two rules above ban `git stash` here, and the global rule bans
+`git checkout`/`restore`/`reset` over uncommitted edits. Together they can read as
+leaving no way to undo a deliberate temporary edit — so state the answer
+explicitly, because an agent has already fallen into the gap:
+
+**Mutation testing is the common case.** You edit production code to prove a test
+actually fails (revert a guard, drop a filter, break an ordering), then undo it.
+`git checkout -- <file>` undoes the mutation *and every other uncommitted change in
+that file*. In a session doing review fixes, that is hundreds of lines of unrelated
+work, and it is unrecoverable: content that was never staged has no blob, so
+`git fsck --unreachable` finds nothing.
+
+Do this instead:
+
+```bash
+cp src/path/file.rs "$CLAUDE_JOB_DIR/tmp/file.rs.bak"   # before mutating
+# ... mutate, run the test, observe the red ...
+cp "$CLAUDE_JOB_DIR/tmp/file.rs.bak" src/path/file.rs   # restore
+```
+
+Or commit the real work to the worktree's branch first, so the mutation is the only
+uncommitted change and `git checkout --` becomes safe. Either is fine; reaching for
+`git checkout --` while other edits are live is not.
+
 ## Project structure
 
 ```
