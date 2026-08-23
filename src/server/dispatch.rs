@@ -466,6 +466,328 @@ pub fn min_acked_over_expected(
         .unwrap_or(floor)
 }
 
+/// W16 direction 1 — the outcome of one checkpoint reset-guard evaluation.
+///
+/// Carries the inputs the guard folded together so the caller can log them and
+/// publish them as metrics without recomputing anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedoResetDecision {
+    /// Whether the checkpoint may reclaim the redo prefix through
+    /// `floor_sequence`.
+    pub allow: bool,
+    /// The effective inclusive watermark: the highest sequence every redo
+    /// consumer has released. `u64::MAX` means nothing constrains the reclaim.
+    pub watermark: u64,
+    /// How many in-flight migration delta readers were holding a position.
+    pub delta_reader_holders: usize,
+    /// The lowest redo sequence those readers still need, when any.
+    pub delta_reader_floor: Option<u64>,
+    /// Whether the migration hold was dropped because the redo log is at (or
+    /// past) the point where appenders stall — see [`RedoPressure`].
+    pub hold_overridden: bool,
+    /// The replication ACK floor that went into `watermark`, carried through so
+    /// the caller can log it without recomputing.
+    pub min_acked: u64,
+    /// Whether the BOUNDED migration-mutex read of the delta-reader floor timed
+    /// out, so the decision was taken with no migration hold at all (the
+    /// pre-W16 behaviour). Observable, never silent.
+    pub floor_read_timed_out: bool,
+}
+
+/// W16 review P0-1 — the redo usage fraction at which
+/// [`redo_backpressure_gate`] starts PARKING appenders, derived from the gate's
+/// own reserve so the two cannot drift.
+///
+/// The gate waits for `available_space() >= capacity / REDO_BACKPRESSURE_RESERVE_DIVISOR`,
+/// and `available_space()` is `entries_region_size - (write_pos + reserved)`, so
+/// it blocks once `write_pos` passes `capacity * (1 - 1/DIVISOR)` — i.e. usage
+/// `0.875` at the shipped divisor of 8. Every mutation (and every inbound
+/// replica batch, via `handle_replica_batch_with_tracker`) parks there for up to
+/// `REDO_BACKPRESSURE_MAX_WAIT`.
+pub const REDO_BACKPRESSURE_PRESSURE_MARK: f64 =
+    1.0 - 1.0 / REDO_BACKPRESSURE_RESERVE_DIVISOR as f64;
+
+/// W16 review P0-1 — the redo-log pressure inputs that decide whether a SOFT
+/// hold on the reclaim floor must yield.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RedoPressure {
+    /// Current redo usage fraction — the busiest per-store log, read exactly as
+    /// `run_checkpoint_loop` reads it.
+    pub usage: f64,
+    /// The checkpoint's EFFECTIVE emergency mark. Callers must pass
+    /// [`effective_emergency_water`], not the raw config value.
+    pub emergency_water: f64,
+    /// Whether any appender is currently parked in the backpressure gate
+    /// (`RedoBackpressure::blocked_appenders() > 0`).
+    pub appenders_starved: bool,
+}
+
+impl RedoPressure {
+    /// The usage at which a soft hold must yield: the configured emergency mark,
+    /// CAPPED at [`REDO_BACKPRESSURE_PRESSURE_MARK`].
+    ///
+    /// The cap is the whole point. `checkpoint_emergency_water` defaults to
+    /// 0.90 while the backpressure gate parks writers at 0.875, so a
+    /// pressure-only override armed at 0.90 sits in a DEAD BAND it can never be
+    /// reached in: at 0.875 every mutation and inbound replica batch stalls, so
+    /// appends stop, so usage stops climbing, so the override never fires — and
+    /// meanwhile `reclaim_stalled` pins the checkpoint loop to the fuzzy path
+    /// (`blocking = !ring && !reclaim_stalled && ...`) so it re-snapshots for
+    /// zero gain. The node is write-dead with the hold retained and the override
+    /// counter reading zero. The cap is a CEILING only: an operator emergency
+    /// mark below 0.875 still wins.
+    pub fn soft_hold_release_mark(&self) -> f64 {
+        self.emergency_water.min(REDO_BACKPRESSURE_PRESSURE_MARK)
+    }
+
+    /// Whether a soft hold on the reclaim floor must yield right now.
+    ///
+    /// `appenders_starved` is honoured at ANY usage: it is the same
+    /// lost-wakeup-free correctness signal `run_checkpoint_loop` uses to force
+    /// an emergency drain, and a single oversized batch can park a writer well
+    /// below the usage mark.
+    pub fn releases_soft_holds(&self) -> bool {
+        self.appenders_starved || self.usage >= self.soft_hold_release_mark()
+    }
+}
+
+/// W16 review P2-1 — the checkpoint loop's effective emergency mark.
+///
+/// `run_checkpoint_loop` computes `emergency_high_water.max(high_water).min(0.99)`
+/// (`.max().min()` rather than `clamp` so a `high_water` above 0.99 cannot panic
+/// with `min > max`). Config validation only requires
+/// `high_water < emergency < 1.0`, so an operator value in (0.99, 1.0) makes the
+/// LOOP escalate to a blocking drain while an unclamped guard keeps holding the
+/// floor. Anything comparing against the loop's threshold must mirror it.
+pub fn effective_emergency_water(emergency_water: f64, high_water: f64) -> f64 {
+    emergency_water.max(high_water).min(0.99)
+}
+
+/// W16 direction 1 — decide whether a checkpoint may reclaim the redo prefix
+/// through `floor_sequence`, folding BOTH classes of redo consumer.
+///
+/// `floor_sequence` is the checkpoint's `snapshot_fence_sequence`; a reclaim
+/// erases everything at or below it, so afterwards the earliest surviving
+/// sequence is `floor_sequence + 1`.
+///
+/// # The two consumers
+///
+/// * `min_acked` — the replication ACK floor from
+///   [`min_acked_over_expected`]. It is an INCLUSIVE watermark: the replica set
+///   durably holds everything through it. **HARD**: it is never overridden,
+///   because erasing a prefix an expected replica still needs is data loss.
+/// * `delta_reader_floor` — the lowest sequence an in-flight migration delta
+///   reader still NEEDS (exclusive of nothing — it reads from that sequence
+///   forward; see
+///   [`crate::cluster::migration::MigrationManager::delta_reader_redo_floor`]).
+///   Converted to the same inclusive-watermark space by subtracting one, so
+///   reclaiming strictly below the needed sequence is still permitted and the
+///   guard does not over-block by one. **SOFT**: see below.
+///
+/// # Why the migration hold is soft, and which way each direction errs
+///
+/// Holding the floor too LOW risks filling the 64 MiB redo log, and a full log
+/// bricks the master (every mutation fails with `LogFull` once the backpressure
+/// gate's wait expires). Holding it too HIGH truncates a reader. The ACK floor
+/// errs LOW deliberately — losing a replica's only copy is unrecoverable, a
+/// stalled log is not. The migration hold errs LOW too, but only until
+/// [`RedoPressure::releases_soft_holds`]: truncating a delta reader costs one
+/// failed migration plus a `rollback_shard` (both repairable), so a hold that is
+/// about to wedge the node must yield. When it does, `hold_overridden` is set.
+///
+/// That escape hatch is what bounds an ABANDONED hold: a migration batch whose
+/// workers aborted early leaves entries in `Streaming`/`Fenced` with no driver
+/// (see `MigrationManager::fail_unresolved_tasks`), and without the override
+/// such an entry could pin the log indefinitely. Pressure is a better bound
+/// than a timer here: a pinned log that nothing is writing to costs nothing,
+/// and the hold is released exactly when writers would otherwise start stalling
+/// — see [`RedoPressure::soft_hold_release_mark`] for why "when it starts to
+/// hurt" is 0.875, not the configured 0.90.
+pub fn redo_reset_decision(
+    floor_sequence: u64,
+    min_acked: u64,
+    delta_reader_holders: usize,
+    delta_reader_floor: Option<u64>,
+    pressure: RedoPressure,
+) -> RedoResetDecision {
+    let hold_overridden = delta_reader_floor.is_some() && pressure.releases_soft_holds();
+    let effective_hold = if hold_overridden {
+        None
+    } else {
+        // `needs from N` == `has released through N - 1`.
+        delta_reader_floor.map(|f| f.saturating_sub(1))
+    };
+    let watermark = match effective_hold {
+        Some(h) => min_acked.min(h),
+        None => min_acked,
+    };
+    RedoResetDecision {
+        allow: watermark >= floor_sequence,
+        watermark,
+        delta_reader_holders,
+        delta_reader_floor,
+        hold_overridden,
+        min_acked,
+        floor_read_timed_out: false,
+    }
+}
+
+/// W16 review P2-5 — everything the checkpoint reset guard observes, gathered
+/// once so the decision itself is a pure, testable function.
+///
+/// The guard used to live as an inline closure in `bin/server.rs`, where no test
+/// could reach it — and both of this change's review blockers landed inside it.
+/// The closure is now only I/O: read these fields, call [`evaluate_redo_reset`],
+/// log and publish metrics off the returned [`RedoResetDecision`].
+pub struct RedoResetObservation<'a> {
+    /// The checkpoint's `snapshot_fence_sequence` — a reclaim erases everything
+    /// at or below it.
+    pub floor_sequence: u64,
+    /// Per-replica durable ACK watermarks (`AckTracker::all_acked`).
+    pub acked: &'a HashMap<SocketAddr, u64>,
+    /// The topology's expected replica set (`expected_replica_addrs`).
+    pub expected: &'a [SocketAddr],
+    /// `(holders, lowest_sequence_needed)` from the BOUNDED migration-mutex
+    /// read, or `None` when that read timed out.
+    pub delta_reader_floor: Option<(usize, Option<u64>)>,
+    /// Live redo-log pressure.
+    pub pressure: RedoPressure,
+    /// Configured replication factor (decides how an empty `expected` is read).
+    pub replication_factor: u8,
+}
+
+/// W16 review P2-5 — the whole checkpoint reset-guard decision, as one function.
+///
+/// A `None` `delta_reader_floor` means the bounded migration-mutex acquisition
+/// timed out. That degrades to "no migration hold" — precisely the pre-W16
+/// behaviour — rather than blocking a reclaim behind a wedged mutex, and is
+/// reported via [`RedoResetDecision::floor_read_timed_out`]. Erring that way is
+/// the same trade the soft hold already makes: a truncated delta reader costs a
+/// repairable migration failure, a stalled reclaim costs the node.
+pub fn evaluate_redo_reset(obs: RedoResetObservation<'_>) -> RedoResetDecision {
+    let min_acked = min_acked_over_expected(
+        obs.acked,
+        obs.expected,
+        obs.floor_sequence,
+        obs.replication_factor,
+    );
+    let (holders, floor) = obs.delta_reader_floor.unwrap_or((0, None));
+    let mut decision =
+        redo_reset_decision(obs.floor_sequence, min_acked, holders, floor, obs.pressure);
+    decision.floor_read_timed_out = obs.delta_reader_floor.is_none();
+    decision
+}
+
+/// W16 direction 2 — what the catch-up path must do with a replica whose redo
+/// prefix has been reclaimed ([`crate::replication::durable::CatchupError::RedoReclaimed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReclaimedCatchupAction {
+    /// Drop the ACK-tracker entry: the address is provably not an expected
+    /// replica AND its needed prefix is provably gone, so nothing can ever
+    /// advance it and it can only re-arm resyncs forever.
+    ForgetStaleEntry,
+    /// Post a full-shard resync — the only repair for a reclaimed prefix.
+    PostResync,
+    /// A resync for this address is already the live repair and nothing has
+    /// changed since; re-posting it would only re-arm the same work.
+    SuppressRepost,
+}
+
+/// W16 direction 2 — classify a `RedoReclaimed` catch-up failure.
+///
+/// # Why an entry is ever dropped
+///
+/// [`startup_catchup_targets`] deliberately unions in "any replica the tracker
+/// knows about that is not in the expected set", and the lag monitor iterates
+/// the whole tracker. That is right for a node mid-topology-change whose prefix
+/// is still in the log. It is WRONG for an entry that is simultaneously:
+///
+/// * not in `expected_replica_addrs()` — so [`min_acked_over_expected`] never
+///   counts it and the live fan-out (`record_ack`) never sends to it, and
+/// * below the earliest surviving redo sequence — so catch-up can only ever
+///   return `RedoReclaimed`.
+///
+/// Such an entry is unrecoverable BY CONSTRUCTION: no code path can advance it.
+/// In default scenario 09 (CI 32644353574) node3 held node2 at `last_acked:
+/// 3812` while `master_seq` climbed 36324 -> 38277, and re-armed a 2731-shard
+/// full resync every ~51 s — a sawtooth with no decay.
+///
+/// # Why the predicate is tight
+///
+/// Both conditions must be PROVEN, and each unknown fails safe toward keeping
+/// the entry:
+///
+/// * An EMPTY `expected` set means the topology resolved to nothing — which
+///   `min_acked_over_expected` already treats as "unresolved, fail closed", not
+///   as "no replicas". Never drop on it.
+/// * `earliest_redo_seq == None` (empty log) is no proof the prefix is gone.
+/// * `from_seq >= earliest` means the entry is merely SLOW, not unrecoverable.
+///
+/// # The limit of "provably" (review P2-3)
+///
+/// "Not an expected replica" is only as strong as `expected_replica_addrs()`,
+/// which SILENTLY OMITS a replica whose `NodeId` is missing from the
+/// coordinator's `node_addrs` map. A partial address map can therefore make a
+/// genuine expected replica look unexpected here, and this predicate would drop
+/// its entry. That is a real (if narrow) window, and it is fail-safe rather than
+/// safe: the entry is a re-derivable master-side hint, so the cost is one full
+/// resync when the address map heals and `startup_catchup_targets` re-seeds the
+/// replica from the expected set — never data loss. Dropping is also safe with
+/// respect to the reset guard, in the direction that matters: a MISSING entry
+/// contributes `0` to `min_acked_over_expected` for any address still in
+/// `expected`, so a wrongly-dropped expected replica BLOCKS the reclaim, never
+/// permits one.
+///
+/// Additionally requiring the address to be absent from `node_addrs` would close
+/// that window — and would also DEFEAT the fix. The scenario-09 entry
+/// (CI 32644353574) is node2 as seen by node3: a fully-known, live cluster
+/// member that simply masters shards node3 does not replicate to. It is in
+/// `node_addrs` throughout, so a `node_addrs`-absence requirement would never
+/// fire and the resync sawtooth would remain. The two conditions above are the
+/// tightest pair that still covers the observed defect.
+///
+/// # Why a repost is ever suppressed
+///
+/// A full-shard resync does not advance the ACK tracker — it moves records, not
+/// redo positions — and deliberately so. Writing a synthetic watermark there
+/// would not merely mask lag: [`crate::replication::durable::AckTracker::acked_beyond`]
+/// is the reverse-heal Tier-1 LOST-ACKED-TAIL detector, which fires when this
+/// node's persisted ACKs sit above the sequence range it can still prove it
+/// holds. A watermark the replica never confirmed is a FABRICATED DURABILITY
+/// CLAIM fed straight into the mechanism whose entire job is detecting exactly
+/// that — it would suppress a genuine lost-tail alarm and, through
+/// [`min_acked_over_expected`], authorise reclaiming a prefix the replica does
+/// not have. So `from_seq` is unchanged on the next tick and the
+/// pass re-detects the same lag. Suppression makes the re-post
+/// PROGRESS-driven: re-post when `from_seq` has moved (genuinely new work) or
+/// when `repost_cooldown` has elapsed (so a resync that was silently dropped is
+/// still retried), and otherwise leave the in-flight repair alone. This errs
+/// toward LESS repair work, which is safe because the outstanding resync IS the
+/// repair; the cooldown bounds how long a lost one goes unnoticed.
+///
+/// `last_post` is `(from_seq, age)` of the most recent successfully-queued
+/// resync for this address, or `None` if there is none.
+pub fn reclaimed_catchup_action(
+    addr: &SocketAddr,
+    from_seq: u64,
+    expected: &[SocketAddr],
+    earliest_redo_seq: Option<u64>,
+    last_post: Option<(u64, std::time::Duration)>,
+    repost_cooldown: std::time::Duration,
+) -> ReclaimedCatchupAction {
+    let provably_not_expected = !expected.is_empty() && !expected.contains(addr);
+    let provably_unrecoverable = earliest_redo_seq.is_some_and(|earliest| from_seq < earliest);
+    if provably_not_expected && provably_unrecoverable {
+        return ReclaimedCatchupAction::ForgetStaleEntry;
+    }
+    match last_post {
+        Some((posted_from, age)) if posted_from == from_seq && age < repost_cooldown => {
+            ReclaimedCatchupAction::SuppressRepost
+        }
+        _ => ReclaimedCatchupAction::PostResync,
+    }
+}
+
 /// G12: enumerate the replicas the startup catch-up pass must drive, over
 /// the UNION of the ACK tracker's known replicas and the topology's
 /// EXPECTED-replica set.
@@ -23442,6 +23764,449 @@ mod tests {
             min_acked_over_expected(&acked, &[], floor, 3),
             0,
             "RF>1 with floor=0 still returns 0 (fail-closed value happens to equal floor here — a no-op reclaim)"
+        );
+    }
+
+    /// W16 direction 1 — the reset guard must min the replication ACK floor
+    /// with the redo read position held by in-flight MIGRATION delta readers.
+    ///
+    /// Armed scenario 06 (CI 32644361371): the guard saw
+    /// `expected_replicas: 1, acked_replicas: 2` and allowed the reclaim, and
+    /// 67 ms later 195 shards failed their delta with `earliest available 8143`
+    /// — the checkpoint's own `entries_before`.
+    /// Calm pressure: well below any mark, no starved appender.
+    fn calm() -> RedoPressure {
+        RedoPressure {
+            usage: 0.55,
+            emergency_water: 0.90,
+            appenders_starved: false,
+        }
+    }
+
+    #[test]
+    fn redo_reset_decision_mins_in_the_delta_reader_hold() {
+        let floor: u64 = 8142; // == entries_before - 1
+        let min_acked: u64 = 9000; // every expected replica is well ahead
+
+        // No delta reader: the ACK floor alone decides, exactly as before.
+        let d = redo_reset_decision(floor, min_acked, 0, None, calm());
+        assert!(
+            d.allow,
+            "with no reader holding a position the ACK floor rules"
+        );
+        assert_eq!(d.watermark, min_acked);
+        assert!(!d.hold_overridden);
+
+        // A reader that still needs entries from 6875 pins the log: reclaiming
+        // through 8142 would erase 6875..=8142 out from under it.
+        let d = redo_reset_decision(floor, min_acked, 195, Some(6875), calm());
+        assert!(
+            !d.allow,
+            "a live delta reader needing seq 6875 must block a reclaim through 8142",
+        );
+        assert_eq!(
+            d.watermark, 6874,
+            "the hold converts to an inclusive watermark one below the sequence it needs",
+        );
+        assert_eq!(d.delta_reader_holders, 195);
+
+        // The reader's own boundary is reclaimable: reclaim through 6874 keeps
+        // 6875 available, so the guard must not over-block by one.
+        let d = redo_reset_decision(6874, min_acked, 1, Some(6875), calm());
+        assert!(
+            d.allow,
+            "reclaiming strictly below the needed sequence keeps the reader whole",
+        );
+    }
+
+    /// W16 review P0-1 — the soft hold MUST yield no later than the point
+    /// `redo_backpressure_gate` starts parking appenders, and immediately if one
+    /// is already parked.
+    ///
+    /// The gate blocks at `available < capacity / REDO_BACKPRESSURE_RESERVE_DIVISOR`
+    /// — usage > 0.875 — while `checkpoint_emergency_water` defaults to 0.90. A
+    /// pressure-only override armed at 0.90 therefore sits in a DEAD BAND: at
+    /// 0.875 every mutation and inbound replica batch parks in
+    /// `wait_for_capacity`, so appends stop, so usage stops climbing, so the
+    /// override never fires and the hold is retained forever with the node
+    /// write-dead and `reclaim_stalled` pinning the checkpoint loop to the fuzzy
+    /// path. Crossing the remaining band on the 30 s safety valve alone is
+    /// measured in days.
+    #[test]
+    fn redo_reset_decision_overrides_the_hold_inside_the_backpressure_dead_band() {
+        let floor: u64 = 8142;
+        let min_acked: u64 = 9000;
+
+        // 0.88 — past the backpressure mark, below the configured emergency
+        // mark. This is the band in which the node is already write-stalled.
+        let dead_band = RedoPressure {
+            usage: 0.88,
+            emergency_water: 0.90,
+            appenders_starved: false,
+        };
+        let d = redo_reset_decision(floor, min_acked, 3, Some(10), dead_band);
+        assert!(
+            d.hold_overridden,
+            "the hold must yield at the point writers start stalling (0.875), not at \
+             the configured emergency mark (0.90) they can never reach",
+        );
+        assert!(d.allow);
+
+        // A starved appender is the lost-wakeup-free correctness signal the
+        // checkpoint loop already uses: honour it at ANY usage, since a single
+        // oversized batch can park a writer well below the mark.
+        let starved = RedoPressure {
+            usage: 0.60,
+            emergency_water: 0.90,
+            appenders_starved: true,
+        };
+        let d = redo_reset_decision(floor, min_acked, 3, Some(10), starved);
+        assert!(
+            d.hold_overridden,
+            "a parked appender must release the soft hold regardless of usage",
+        );
+
+        // Below both, with nobody starved, the hold stands.
+        let d = redo_reset_decision(floor, min_acked, 3, Some(10), calm());
+        assert!(
+            !d.hold_overridden,
+            "no override while there is still headroom and no parked appender",
+        );
+        assert!(!d.allow);
+
+        // An operator emergency mark BELOW the backpressure mark still wins —
+        // the clamp is a ceiling, never a floor.
+        let early = RedoPressure {
+            usage: 0.80,
+            emergency_water: 0.78,
+            appenders_starved: false,
+        };
+        assert!(
+            redo_reset_decision(floor, min_acked, 3, Some(10), early).hold_overridden,
+            "a lower configured emergency mark must not be raised to 0.875",
+        );
+    }
+
+    /// The backpressure mark must be DERIVED from the gate's own divisor, not
+    /// a copied literal — the two live in the same module precisely so they
+    /// cannot drift.
+    #[test]
+    fn backpressure_pressure_mark_matches_the_gate_reserve() {
+        assert_eq!(REDO_BACKPRESSURE_RESERVE_DIVISOR, 8);
+        assert!(
+            (REDO_BACKPRESSURE_PRESSURE_MARK - 0.875).abs() < f64::EPSILON,
+            "reserve = capacity/8 means the gate parks appenders above 0.875 usage, \
+             got {REDO_BACKPRESSURE_PRESSURE_MARK}",
+        );
+        // The dead band is real against the SHIPPED default, not a literal: if
+        // `checkpoint_emergency_water`'s default is ever lowered to at-or-below
+        // the backpressure mark, the P0 this cap fixes stops existing and the
+        // cap becomes inert — which is fine, but it must be a deliberate change,
+        // not a silent one.
+        let shipped_emergency = crate::config::ServerConfig::default().checkpoint_emergency_water;
+        assert!(
+            REDO_BACKPRESSURE_PRESSURE_MARK < shipped_emergency,
+            "the gate parks appenders at {REDO_BACKPRESSURE_PRESSURE_MARK} but the default \
+             emergency mark is {shipped_emergency}: the band between them is where the node \
+             is write-stalled and an emergency-only override can never fire",
+        );
+    }
+
+    /// W16 review P2-1 — `run_checkpoint_loop` clamps the configured emergency
+    /// mark (`emergency_high_water.max(high_water).min(0.99)`, checkpoint.rs).
+    /// Config validation only requires `high_water < emergency < 1.0`, so an
+    /// operator value in (0.99, 1.0) makes the LOOP escalate while an unclamped
+    /// guard keeps holding. The guard must use the same effective value.
+    #[test]
+    fn effective_emergency_water_mirrors_the_checkpoint_loop_clamp() {
+        // The shipped default is unchanged by the clamp.
+        assert!((effective_emergency_water(0.90, 0.75) - 0.90).abs() < f64::EPSILON);
+        // Above 0.99 the loop caps; so must the guard.
+        assert!((effective_emergency_water(0.995, 0.75) - 0.99).abs() < f64::EPSILON);
+        // Below high_water the loop raises to high_water; so must the guard.
+        assert!((effective_emergency_water(0.50, 0.75) - 0.75).abs() < f64::EPSILON);
+        // `.max().min()` ordering, not `clamp`: a high_water above 0.99 must not panic.
+        assert!((effective_emergency_water(0.995, 0.999) - 0.99).abs() < f64::EPSILON);
+    }
+
+    /// W16 review P1-2 / P2-5 — the whole guard body is a testable function, so
+    /// the two blockers that lived in the untested `bin/server.rs` closure are
+    /// covered. A `None` delta-reader read means the BOUNDED migration-mutex
+    /// acquisition timed out; that must degrade to the pre-fix behaviour (no
+    /// hold) rather than block a reclaim behind a wedged mutex, and it must be
+    /// reported.
+    #[test]
+    fn evaluate_redo_reset_folds_both_floors_and_degrades_on_a_timed_out_floor_read() {
+        let expected: SocketAddr = "10.0.0.11:7000".parse().unwrap();
+        let mut acked = HashMap::new();
+        acked.insert(expected, 9000u64);
+
+        // Both floors readable: the migration hold blocks.
+        let d = evaluate_redo_reset(RedoResetObservation {
+            floor_sequence: 8142,
+            acked: &acked,
+            expected: &[expected],
+            delta_reader_floor: Some((195, Some(6875))),
+            pressure: calm(),
+            replication_factor: 2,
+        });
+        assert!(!d.allow);
+        assert_eq!(d.watermark, 6874);
+        assert_eq!(d.min_acked, 9000);
+        assert!(!d.floor_read_timed_out);
+
+        // The bounded read timed out: no hold, pre-fix behaviour, flagged.
+        let d = evaluate_redo_reset(RedoResetObservation {
+            floor_sequence: 8142,
+            acked: &acked,
+            expected: &[expected],
+            delta_reader_floor: None,
+            pressure: calm(),
+            replication_factor: 2,
+        });
+        assert!(
+            d.allow,
+            "a wedged migration mutex must not block the reclaim — degrade to the \
+             ACK-only guard, which is exactly the pre-fix behaviour",
+        );
+        assert!(
+            d.floor_read_timed_out,
+            "the degradation must be observable, not silent",
+        );
+        assert_eq!(d.delta_reader_holders, 0);
+
+        // A lagging EXPECTED replica still blocks, timed-out floor read or not.
+        acked.insert(expected, 10);
+        let d = evaluate_redo_reset(RedoResetObservation {
+            floor_sequence: 8142,
+            acked: &acked,
+            expected: &[expected],
+            delta_reader_floor: None,
+            pressure: RedoPressure {
+                usage: 0.99,
+                emergency_water: 0.90,
+                appenders_starved: true,
+            },
+            replication_factor: 2,
+        });
+        assert!(
+            !d.allow,
+            "neither a timed-out floor read nor maximum pressure may override the \
+             expected-replica ACK floor",
+        );
+        assert_eq!(d.watermark, 10);
+    }
+
+    /// The delta-reader hold is a SOFT hold: an abandoned migration entry must
+    /// not be able to pin the redo log until it fills (a full log bricks the
+    /// master — every mutation fails with `LogFull`). At/above the effective
+    /// mark the hold is dropped and the ACK floor alone decides.
+    #[test]
+    fn redo_reset_decision_drops_the_delta_hold_under_emergency_pressure() {
+        let floor: u64 = 8142;
+        let min_acked: u64 = 9000;
+
+        let at_mark = RedoPressure {
+            usage: 0.90,
+            emergency_water: 0.90,
+            appenders_starved: false,
+        };
+        let d = redo_reset_decision(floor, min_acked, 3, Some(10), at_mark);
+        assert!(
+            d.allow,
+            "at the emergency mark the soft migration hold yields so the log can drain",
+        );
+        assert!(
+            d.hold_overridden,
+            "the override must be reported for metrics"
+        );
+
+        // The REPLICATION floor is NOT soft: a lagging expected replica keeps
+        // blocking the reset even at full pressure — that is the thing standing
+        // between a lagging replica and data loss.
+        let full = RedoPressure {
+            usage: 0.99,
+            emergency_water: 0.90,
+            appenders_starved: true,
+        };
+        let d = redo_reset_decision(floor, 10, 3, Some(10), full);
+        assert!(
+            !d.allow,
+            "emergency pressure must never override the expected-replica ACK floor",
+        );
+        assert_eq!(d.watermark, 10);
+    }
+
+    /// W16 direction 2 — a tracker entry for an address the topology no longer
+    /// expects, whose needed redo prefix is gone, is unrecoverable BY
+    /// CONSTRUCTION and must be dropped instead of driving catch-up forever.
+    ///
+    /// Default scenario 09 (CI 32644353574): node3's tracker held node2 at
+    /// `last_acked: 3812` while `master_seq` climbed 36324 -> 38277. node2 is
+    /// not in node3's `expected_replica_addrs()` (strict RF=2 ring), so
+    /// `min_acked_over_expected` never counted it and the live fan-out never
+    /// sends to it — nothing could ever advance that entry. Every lag-monitor
+    /// tick re-posted a 2731-shard full resync.
+    #[test]
+    fn reclaimed_catchup_action_forgets_a_stale_unrecoverable_entry() {
+        let stale: SocketAddr = "10.0.0.12:7000".parse().unwrap();
+        let expected: SocketAddr = "10.0.0.11:7000".parse().unwrap();
+        let cooldown = std::time::Duration::from_secs(300);
+
+        assert_eq!(
+            reclaimed_catchup_action(&stale, 3813, &[expected], Some(15649), None, cooldown),
+            ReclaimedCatchupAction::ForgetStaleEntry,
+            "not expected AND below the redo floor → unrecoverable, drop it",
+        );
+    }
+
+    /// The drop predicate must be TIGHT: a merely-slow replica, an expected
+    /// replica, and an unresolved topology must all keep their entry.
+    #[test]
+    fn reclaimed_catchup_action_keeps_recoverable_expected_and_unresolved_entries() {
+        let a: SocketAddr = "10.0.0.12:7000".parse().unwrap();
+        let expected: SocketAddr = "10.0.0.11:7000".parse().unwrap();
+        let cooldown = std::time::Duration::from_secs(300);
+
+        // Expected replica below the floor: repair it, never drop it.
+        assert_eq!(
+            reclaimed_catchup_action(&expected, 100, &[expected, a], Some(15649), None, cooldown),
+            ReclaimedCatchupAction::PostResync,
+            "an EXPECTED replica must be repaired, never dropped",
+        );
+
+        // Not expected but its prefix is still in the log — merely slow.
+        assert_eq!(
+            reclaimed_catchup_action(&a, 20_000, &[expected], Some(15649), None, cooldown),
+            ReclaimedCatchupAction::PostResync,
+            "an entry whose needed prefix is still available is recoverable — do not drop it",
+        );
+
+        // Topology unresolved (empty expected set): no proof of non-membership.
+        assert_eq!(
+            reclaimed_catchup_action(&a, 3813, &[], Some(15649), None, cooldown),
+            ReclaimedCatchupAction::PostResync,
+            "an empty expected set is 'unresolved', not 'not a replica' — never drop on it",
+        );
+
+        // Redo floor unknown (empty log): no proof of unrecoverability.
+        assert_eq!(
+            reclaimed_catchup_action(&a, 3813, &[expected], None, None, cooldown),
+            ReclaimedCatchupAction::PostResync,
+            "without a known earliest sequence the entry is not PROVABLY unrecoverable",
+        );
+    }
+
+    /// W16 direction 2(b) — `RedoReclaimed` must not be re-entrant. The
+    /// full-shard resync does not advance the ACK tracker, so an unchanged
+    /// `from_seq` means the previous post is still the live repair; re-posting
+    /// it every lag-monitor tick re-arms thousands of tasks forever (observed:
+    /// 2731 tasks every ~51 s, a sawtooth with no decay).
+    #[test]
+    fn reclaimed_catchup_action_suppresses_a_repost_that_would_not_change_anything() {
+        let expected: SocketAddr = "10.0.0.11:7000".parse().unwrap();
+        let cooldown = std::time::Duration::from_secs(300);
+
+        // Same from_seq as the previous post, still inside the cooldown.
+        assert_eq!(
+            reclaimed_catchup_action(
+                &expected,
+                3813,
+                &[expected],
+                Some(15649),
+                Some((3813, std::time::Duration::from_secs(51))),
+                cooldown,
+            ),
+            ReclaimedCatchupAction::SuppressRepost,
+            "an identical re-post while the first repair is fresh adds nothing",
+        );
+
+        // The tracker advanced → this is genuinely new work.
+        assert_eq!(
+            reclaimed_catchup_action(
+                &expected,
+                9000,
+                &[expected],
+                Some(15649),
+                Some((3813, std::time::Duration::from_secs(51))),
+                cooldown,
+            ),
+            ReclaimedCatchupAction::PostResync,
+            "a moved from_seq means the previous post is stale — repair again",
+        );
+
+        // The cooldown expired → retry even without progress, so a resync that
+        // was silently lost is not abandoned forever.
+        assert_eq!(
+            reclaimed_catchup_action(
+                &expected,
+                3813,
+                &[expected],
+                Some(15649),
+                Some((3813, std::time::Duration::from_secs(301))),
+                cooldown,
+            ),
+            ReclaimedCatchupAction::PostResync,
+            "past the cooldown the repair is retried even with no tracker progress",
+        );
+    }
+
+    /// W16 direction 2, the loop must actually TERMINATE. Composing the
+    /// classifier with `AckTracker::forget` and `startup_catchup_targets` shows
+    /// the whole cycle closing: the stale entry drives exactly one pass, is
+    /// dropped, and never appears as a catch-up target again — while the
+    /// genuine expected replica is untouched.
+    #[test]
+    fn dropping_a_stale_entry_removes_it_from_every_catchup_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracker = crate::replication::durable::AckTracker::new(dir.path().join("w16-ack.dat"));
+        let stale: SocketAddr = "10.0.0.12:7000".parse().unwrap();
+        let expected: SocketAddr = "10.0.0.11:7000".parse().unwrap();
+        // node3's view in scenario 09: node2 pinned at 3812 forever while the
+        // master sequence climbed past 38000, node1 the only expected replica.
+        tracker.record_ack(stale, 3812);
+        tracker.record_ack(expected, 38_000);
+        let master_seq = 38_277u64;
+        let earliest = Some(15_649u64);
+
+        // Both are "behind", so both are catch-up targets to begin with.
+        let targets = startup_catchup_targets(&tracker.all_acked(), &[expected], master_seq);
+        assert!(
+            targets.iter().any(|(a, _)| *a == stale),
+            "precondition: the stale entry is a catch-up target before the fix",
+        );
+
+        // Drive the stale one: catch-up fails with RedoReclaimed, and the
+        // classifier proves the entry unrecoverable.
+        assert_eq!(
+            reclaimed_catchup_action(
+                &stale,
+                3813,
+                &[expected],
+                earliest,
+                None,
+                std::time::Duration::from_secs(300),
+            ),
+            ReclaimedCatchupAction::ForgetStaleEntry,
+        );
+        assert!(tracker.forget(&stale));
+
+        // The cycle is closed: no driver can see it again.
+        let after = startup_catchup_targets(&tracker.all_acked(), &[expected], master_seq);
+        assert!(
+            !after.iter().any(|(a, _)| *a == stale),
+            "the dropped entry must not re-enter the catch-up target set",
+        );
+        assert!(
+            after.iter().any(|(a, _)| *a == expected),
+            "the genuine expected replica must still be driven",
+        );
+        // And the reclaim guard is unaffected: the expected replica still gates
+        // the redo reset exactly as before.
+        assert_eq!(
+            min_acked_over_expected(&tracker.all_acked(), &[expected], 38_277, 2),
+            38_000,
+            "dropping a stale entry must not move the expected-replica ACK floor",
         );
     }
 

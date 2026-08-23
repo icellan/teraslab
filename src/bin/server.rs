@@ -178,7 +178,34 @@ struct CatchupContext {
     /// fan-out (`cluster.replication_timeout()`) instead of using a hardcoded
     /// value (REL-112).
     replication_timeout: std::time::Duration,
+    /// W16 direction 2: the live cluster handle, read for
+    /// `expected_replica_addrs()` when a catch-up pass fails with
+    /// `RedoReclaimed`. An entry that is simultaneously outside the expected
+    /// set and below the earliest surviving redo sequence can never be advanced
+    /// by any code path and must be dropped, not re-driven forever.
+    cluster: Arc<teraslab::cluster::coordinator::RunningCluster>,
+    /// W16 direction 2: per-address record of the most recent
+    /// successfully-queued full-shard resync, as `(from_seq, posted_at)`.
+    /// Shared by the startup pass and the lag monitor so a resync that neither
+    /// advanced the ACK tracker nor aged out is not re-posted every tick.
+    resync_posts:
+        Arc<Mutex<std::collections::HashMap<std::net::SocketAddr, (u64, std::time::Instant)>>>,
 }
+
+/// W16 direction 2 — how long a queued full-shard resync suppresses an
+/// identical re-post for the same address.
+///
+/// A resync moves records, not redo positions, so it never advances the ACK
+/// tracker and `from_seq` is unchanged on the next lag-monitor tick. Without a
+/// bound the pass re-synthesizes the same thousands of backfill tasks forever
+/// (default scenario 09, CI 32644353574: 2731 tasks re-armed every ~51 s, a
+/// sawtooth with no decay). Re-posting is therefore progress-driven — a moved
+/// `from_seq` always re-posts immediately — and this cooldown is only the
+/// backstop for a resync that was silently dropped between the queue and the
+/// coordinator. Deliberately much longer than the default lag-check interval
+/// and than a full 4096-shard backfill takes, so it suppresses the loop without
+/// ever abandoning a genuine repair.
+const RESYNC_REPOST_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Run one bounded catch-up pass for a single replica and persist the new ACK
 /// position on success.
@@ -320,44 +347,116 @@ fn run_one_catchup_pass(
             }
             tracker.record_ack(addr, through);
             tracker.flush();
+            // W16 direction 2: the tracker advanced, so any outstanding resync
+            // suppression for this address is stale — drop it so a later
+            // `RedoReclaimed` posts immediately instead of waiting out the
+            // cooldown.
+            ctx.resync_posts.lock().remove(&addr);
             through >= from_seq
         }
         Err(e) => {
             tracing::warn!(%addr, err = %e, "catchup: replica catch-up failed");
             if let teraslab::replication::durable::CatchupError::RedoReclaimed { .. } = e {
-                // The redo prefix the replica still needs has been reclaimed,
-                // so the only safe repair is a full-shard resync. A dropped
-                // resync request must not be silently lost (REL-113): the
-                // common cause of `signal_for_addr` returning false is that the
-                // node-address map has not yet learned `addr` (transient on
-                // join), so retry with bounded backoff. If it still fails, the
-                // receiver is gone (shutdown) or the address is genuinely
-                // unknown; escalate to error-level so the gap is observable.
-                // Either way the ACK tracker has NOT advanced, so the next
-                // lag-monitor tick re-detects the lag and re-runs this pass.
-                const RESYNC_SIGNAL_ATTEMPTS: u32 = 3;
-                let mut queued = false;
-                for attempt in 0..RESYNC_SIGNAL_ATTEMPTS {
-                    if ctx.resync_handle.signal_for_addr(&addr, Vec::new()) {
-                        queued = true;
-                        break;
+                // W16 direction 2: the redo prefix this address needs is gone,
+                // and `RedoReclaimed` is re-entrant by construction — the
+                // full-shard resync below moves records, not redo positions, so
+                // the ACK tracker does NOT advance and the next lag-monitor
+                // tick re-detects the identical lag. Classify before acting:
+                //
+                //   * an entry the topology does not expect AND whose prefix is
+                //     gone can never be advanced by any code path (the live
+                //     fan-out only ACKs addresses it sends to, and
+                //     `min_acked_over_expected` ignores unexpected addresses) —
+                //     it exists only to re-arm resyncs, so drop it;
+                //   * an identical re-post while the previous repair is still
+                //     fresh only re-synthesizes the same backfill tasks.
+                //
+                // See `reclaimed_catchup_action` for why each half of the drop
+                // predicate must be PROVEN and why a slow replica never
+                // qualifies.
+                let expected = ctx.cluster.expected_replica_addrs();
+                let last_post = ctx
+                    .resync_posts
+                    .lock()
+                    .get(&addr)
+                    .map(|(seq, at)| (*seq, at.elapsed()));
+                let action = teraslab::server::dispatch::reclaimed_catchup_action(
+                    &addr,
+                    from_seq,
+                    &expected,
+                    first_avail_seq,
+                    last_post,
+                    RESYNC_REPOST_COOLDOWN,
+                );
+                match action {
+                    teraslab::server::dispatch::ReclaimedCatchupAction::ForgetStaleEntry => {
+                        if tracker.forget(&addr) {
+                            if let Some(m) = teraslab::metrics::replication_metrics() {
+                                m.ack_tracker_stale_entries_dropped.inc();
+                            }
+                            ctx.resync_posts.lock().remove(&addr);
+                            tracing::warn!(
+                                %addr,
+                                from_seq,
+                                earliest_available = ?first_avail_seq,
+                                expected_replicas = expected.len(),
+                                "catchup: dropped an unrecoverable ACK-tracker entry — the \
+                                 address is not an expected replica and its redo prefix has \
+                                 been reclaimed, so nothing could ever advance it",
+                            );
+                        }
                     }
-                    if attempt + 1 < RESYNC_SIGNAL_ATTEMPTS {
-                        std::thread::sleep(std::time::Duration::from_millis(
-                            50 * (attempt as u64 + 1),
-                        ));
+                    teraslab::server::dispatch::ReclaimedCatchupAction::SuppressRepost => {
+                        if let Some(m) = teraslab::metrics::replication_metrics() {
+                            m.replica_resync_reposts_suppressed.inc();
+                        }
+                        tracing::info!(
+                            %addr,
+                            from_seq,
+                            "catchup: full-shard resync already outstanding for this position; \
+                             not re-posting",
+                        );
                     }
-                }
-                if queued {
-                    tracing::info!(%addr, "catchup: posted full-shard resync request");
-                } else {
-                    tracing::error!(
-                        %addr,
-                        attempts = RESYNC_SIGNAL_ATTEMPTS,
-                        "catchup: resync request could not be queued (unknown addr or \
-                         coordinator stopped); replica remains behind and will be \
-                         retried on the next lag-monitor tick",
-                    );
+                    teraslab::server::dispatch::ReclaimedCatchupAction::PostResync => {
+                        // A dropped resync request must not be silently lost
+                        // (REL-113): the common cause of `signal_for_addr`
+                        // returning false is that the node-address map has not
+                        // yet learned `addr` (transient on join), so retry with
+                        // bounded backoff. If it still fails, the receiver is
+                        // gone (shutdown) or the address is genuinely unknown;
+                        // escalate to error-level so the gap is observable.
+                        const RESYNC_SIGNAL_ATTEMPTS: u32 = 3;
+                        let mut queued = false;
+                        for attempt in 0..RESYNC_SIGNAL_ATTEMPTS {
+                            if ctx.resync_handle.signal_for_addr(&addr, Vec::new()) {
+                                queued = true;
+                                break;
+                            }
+                            if attempt + 1 < RESYNC_SIGNAL_ATTEMPTS {
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    50 * (attempt as u64 + 1),
+                                ));
+                            }
+                        }
+                        if queued {
+                            // Only a SUCCESSFULLY queued post arms the
+                            // suppression: a request that never reached the
+                            // coordinator is not a live repair and must be
+                            // retried on the next tick.
+                            ctx.resync_posts
+                                .lock()
+                                .insert(addr, (from_seq, std::time::Instant::now()));
+                            tracing::info!(%addr, from_seq, "catchup: posted full-shard resync request");
+                        } else {
+                            tracing::error!(
+                                %addr,
+                                attempts = RESYNC_SIGNAL_ATTEMPTS,
+                                "catchup: resync request could not be queued (unknown addr or \
+                                 coordinator stopped); replica remains behind and will be \
+                                 retried on the next lag-monitor tick",
+                            );
+                        }
+                    }
                 }
             }
             false
@@ -2307,6 +2406,12 @@ fn main() {
                 replication_timeout: std::time::Duration::from_millis(
                     config.replication_timeout_ms.max(1),
                 ),
+                // W16 direction 2: `expected_replica_addrs()` proves whether a
+                // reclaimed-prefix entry is a genuine replica or a stale one,
+                // and `resync_posts` bounds the `RedoReclaimed` re-post loop
+                // across BOTH catch-up drivers (they share this one context).
+                cluster: running.clone(),
+                resync_posts: Arc::new(Mutex::new(std::collections::HashMap::new())),
             };
             // Stash for the runtime lag monitor (spawned after this block).
             catchup_ctx = Some(ctx.clone());
@@ -2493,8 +2598,42 @@ fn main() {
             // R13: capture the replication factor by value (u8 is Copy) so the
             // reset-guard closure stays 'static without borrowing `config`.
             let replication_factor = config.replication_factor;
+            // W16: the guard folds TWO classes of redo consumer, so it needs the
+            // log's live usage and starved-appender state (to bound the soft
+            // migration hold). The usage expression MIRRORS
+            // `run_checkpoint_loop`'s exactly (busiest per-store log, falling
+            // back to the single handle): the pressure override is the only
+            // bound on an abandoned migration hold, so it must not silently read
+            // 0.0 if a future refactor stops attaching per-store logs.
+            //
+            // W16 review P2-5 — the DECISION itself lives in
+            // `dispatch::evaluate_redo_reset`, not here. This closure is
+            // deliberately nothing but I/O: gather, call, log, publish. Both of
+            // this change's review blockers landed in the logic that used to be
+            // inline here, where no test could reach it.
+            let engine_for_reset = engine.clone();
+            let log_for_reset = log.clone();
+            // W16 review P2-1 — mirror the loop's own clamp
+            // (`emergency_high_water.max(high_water).min(0.99)`); config
+            // validation permits (0.99, 1.0), which would otherwise make the
+            // loop escalate while this guard kept holding.
+            let emergency_water = teraslab::server::dispatch::effective_emergency_water(
+                config.checkpoint_emergency_water,
+                config.checkpoint_high_water,
+            );
+            // W16 review P1-2 — budget for the BOUNDED migration-mutex read. A
+            // blocking checkpoint holds the exclusive visibility barrier across
+            // this guard, so an unbounded wait would fence out all serving for
+            // as long as some other holder keeps the mutex (the empty-shard
+            // recheck holds it across a full index pass). On expiry the guard
+            // degrades to its ACK-only, pre-W16 behaviour.
+            const DELTA_FLOOR_READ_BUDGET: std::time::Duration =
+                std::time::Duration::from_millis(50);
             let reset_guard: std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync + 'static> =
                 std::sync::Arc::new(move |floor_sequence| {
+                    use teraslab::server::dispatch::{
+                        RedoPressure, RedoResetObservation, evaluate_redo_reset,
+                    };
                     let acked = tracker.all_acked();
                     // C3: seed the reclaim denominator from the topology's
                     // EXPECTED replica set, not just the replicas already
@@ -2506,23 +2645,98 @@ fn main() {
                         .as_ref()
                         .map(|c| c.expected_replica_addrs())
                         .unwrap_or_default();
-                    let min_acked = teraslab::server::dispatch::min_acked_over_expected(
-                        &acked,
-                        &expected,
+                    // W16 direction 1: replication ACKs are NOT the only redo
+                    // consumer. A migration worker captures its baseline
+                    // `snapshot_sequence` at Phase 1 and does not read the
+                    // window until Phase 3, so across the whole baseline stream
+                    // it holds a redo read position that the ACK tracker knows
+                    // nothing about. Armed scenario 06 (CI 32644361371)
+                    // reclaimed through this one-sided gate and 195 shards then
+                    // failed their delta with `earliest available 8143` — the
+                    // checkpoint's own `entries_before`, 67 ms earlier — each
+                    // failure calling `rollback_shard` and leaving the node's
+                    // target table diverged from every peer's.
+                    let delta_reader_floor = match cluster_for_reset.as_ref() {
+                        Some(c) => {
+                            c.migration_delta_reader_redo_floor_bounded(DELTA_FLOOR_READ_BUDGET)
+                        }
+                        // Single-node: no migrations, so nothing holds — this is
+                        // a genuine "read succeeded, zero holders", not a timeout.
+                        None => Some((0, None)),
+                    };
+                    let usage = if engine_for_reset.has_per_store_redo() {
+                        engine_for_reset.max_redo_usage_fraction()
+                    } else {
+                        log_for_reset.lock().usage_fraction()
+                    };
+                    let pressure = RedoPressure {
+                        usage,
+                        emergency_water,
+                        // The lost-wakeup-free correctness signal the checkpoint
+                        // loop uses to force an emergency drain.
+                        appenders_starved: engine_for_reset
+                            .redo_backpressure()
+                            .is_some_and(|bp| bp.blocked_appenders() > 0),
+                    };
+                    let decision = evaluate_redo_reset(RedoResetObservation {
                         floor_sequence,
+                        acked: &acked,
+                        expected: &expected,
+                        delta_reader_floor,
+                        pressure,
                         replication_factor,
-                    );
-                    let can_reset = min_acked >= floor_sequence;
-                    if !can_reset {
+                    });
+                    let (holders, floor) = delta_reader_floor.unwrap_or((0, None));
+                    if let Some(m) = teraslab::metrics::redo_metrics() {
+                        m.redo_delta_reader_holders.store(
+                            holders.min(u32::MAX as usize) as u32,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        m.redo_delta_reader_floor
+                            .store(floor.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+                        if decision.hold_overridden {
+                            m.redo_delta_hold_overridden_total.inc();
+                        }
+                        if decision.floor_read_timed_out {
+                            m.redo_delta_floor_read_timeouts_total.inc();
+                        }
+                    }
+                    if decision.floor_read_timed_out {
                         tracing::warn!(
                             floor_sequence,
-                            min_acked,
-                            expected_replicas = expected.len(),
-                            acked_replicas = acked.len(),
-                            "checkpoint reset deferred until replicas catch up",
+                            budget_ms = DELTA_FLOOR_READ_BUDGET.as_millis() as u64,
+                            "migration delta-reader floor unreadable within budget (migration \
+                             mutex contended); this checkpoint falls back to the ACK-only \
+                             guard and may truncate a live delta reader",
                         );
                     }
-                    can_reset
+                    if decision.hold_overridden {
+                        tracing::warn!(
+                            floor_sequence,
+                            delta_reader_holders = holders,
+                            delta_reader_floor = floor,
+                            usage,
+                            starved = pressure.appenders_starved,
+                            release_mark = pressure.soft_hold_release_mark(),
+                            "redo log at the pressure mark: dropping the migration \
+                             delta-reader hold so the log can drain — in-flight deltas will \
+                             fail and roll their shard back (see \
+                             teraslab_redo_delta_hold_overridden_total: alert on any value)",
+                        );
+                    }
+                    if !decision.allow {
+                        tracing::warn!(
+                            floor_sequence,
+                            min_acked = decision.min_acked,
+                            watermark = decision.watermark,
+                            expected_replicas = expected.len(),
+                            acked_replicas = acked.len(),
+                            delta_reader_holders = holders,
+                            delta_reader_floor = floor,
+                            "checkpoint reset deferred until redo consumers release the floor",
+                        );
+                    }
+                    decision.allow
                 });
             teraslab::checkpoint::spawn_checkpoint_task_with_reset_guard(
                 cfg,
