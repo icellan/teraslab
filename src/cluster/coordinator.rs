@@ -23057,6 +23057,21 @@ impl RunningCluster {
         self.migration.lock().active_count()
     }
 
+    /// W16 direction 1 — the redo read floor held by this node's in-flight
+    /// migration delta readers, as `(holder_count, lowest_sequence_needed)`.
+    ///
+    /// Threaded into the checkpoint reset guard alongside
+    /// [`Self::expected_replica_addrs`] so that a migration holding a redo read
+    /// position can hold the reclaim floor, exactly as a lagging replica's ACK
+    /// does. See
+    /// [`crate::cluster::migration::MigrationManager::delta_reader_redo_floor`]
+    /// for what qualifies as a holder and
+    /// [`crate::server::dispatch::redo_reset_decision`] for how the two floors
+    /// are folded (and why only this one is soft).
+    pub fn migration_delta_reader_redo_floor(&self) -> (usize, Option<u64>) {
+        self.migration.lock().delta_reader_redo_floor()
+    }
+
     /// Task #75 — bounded [`RunningCluster::active_migrations`]: waits at
     /// most `timeout` for the migration mutex and returns `None` instead of
     /// blocking indefinitely when a wedged holder keeps it. `/status` uses
@@ -28458,6 +28473,164 @@ mod tests {
             active,
             vec![master_task, replica_task],
             "all data-bearing tasks for an already-serving shard must still stream for repair"
+        );
+    }
+
+    /// W16 direction 1 fixture: an engine with a linear redo log attached and a
+    /// `MigrationManager` holding ONE outbound task that has stamped its
+    /// Phase-1 baseline snapshot sequence — i.e. a live migration delta reader.
+    ///
+    /// Returns `(engine, redo, manager, task, snapshot_seq, tempdir)`.
+    #[allow(clippy::type_complexity)]
+    fn migration_reader_fixture(
+        shard: u16,
+    ) -> (
+        Engine,
+        Arc<ParkingMutex<RedoLog>>,
+        crate::cluster::migration::MigrationManager,
+        MigrationTask,
+        u64,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine();
+        let redo_dev: Arc<dyn crate::device::BlockDevice> =
+            Arc::new(crate::device::MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let redo = Arc::new(ParkingMutex::new(
+            RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap(),
+        ));
+        engine.set_redo_log(redo.clone());
+
+        let mut mgr = crate::cluster::migration::MigrationManager::new();
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        // Phase 1: the worker captures the baseline snapshot sequence and
+        // stamps it on the tracking entry. From here until Phase 3 it needs
+        // every redo entry at/above `snapshot_seq`.
+        let snapshot_seq = redo.lock().current_sequence();
+        mgr.set_snapshot_sequence(&task, snapshot_seq);
+        (engine, redo, mgr, task, snapshot_seq, dir)
+    }
+
+    /// W16 direction 1, the DEFECT — a checkpoint whose reset guard knows only
+    /// about replication ACKs reclaims the redo prefix a live migration delta
+    /// reader still needs, and Phase 3 then fails with the exact production
+    /// error from armed scenario 06 (`ts06-node2.log`, CI 32644361371).
+    #[test]
+    fn checkpoint_reset_erases_a_migration_delta_window_when_no_reader_holds_the_floor() {
+        let shard = 77u16;
+        let (engine, redo, _mgr, _task, snapshot_seq, dir) = migration_reader_fixture(shard);
+        let same_shard = tx_key_for_shard(shard, 1);
+
+        // Baseline streaming is under way; client writes keep landing.
+        for _ in 0..4 {
+            redo.lock()
+                .append_and_flush(crate::redo::RedoOp::SetLocked {
+                    tx_key: same_shard,
+                    value: true,
+                })
+                .unwrap();
+        }
+
+        // The checkpoint fires mid-migration. Every EXPECTED replica is caught
+        // up (scenario 06 logged `expected_replicas: 1, acked_replicas: 2`), so
+        // an ACK-only guard allows the reclaim.
+        let cfg = crate::checkpoint::CheckpointConfig::new(dir.path().join("w16-defect.snap"));
+        let stats =
+            crate::checkpoint::perform_checkpoint_with_reset_guard(&cfg, &engine, &redo, |_| true)
+                .unwrap();
+        assert!(
+            stats.reset_performed,
+            "fixture precondition: the ACK-only guard lets this reclaim through",
+        );
+
+        // A later write keeps the log non-empty, so the truncation is detected
+        // by the earliest-surviving-sequence check rather than by an empty read.
+        redo.lock()
+            .append_and_flush(crate::redo::RedoOp::SetLocked {
+                tx_key: same_shard,
+                value: false,
+            })
+            .unwrap();
+
+        // Phase 3: collect the delta over [snapshot_seq, fence_seq).
+        let fence_seq = redo.lock().current_sequence();
+        let redo_log = Some(redo);
+        let err = collect_migration_delta_ops(&redo_log, snapshot_seq, fence_seq, shard, &engine)
+            .expect_err("the delta window was reclaimed out from under the reader");
+        assert!(
+            err.contains("redo log truncated") && err.contains("full resync required"),
+            "expected the production truncation error, got: {err}",
+        );
+    }
+
+    /// W16 direction 1, the FIX — the same checkpoint, with the migration
+    /// reader's redo position published into the reset guard, defers the
+    /// reclaim and the delta stays readable.
+    #[test]
+    fn checkpoint_reset_is_deferred_while_a_migration_delta_reader_holds_the_floor() {
+        let shard = 77u16;
+        let (engine, redo, mgr, _task, snapshot_seq, dir) = migration_reader_fixture(shard);
+        let same_shard = tx_key_for_shard(shard, 1);
+
+        for _ in 0..4 {
+            redo.lock()
+                .append_and_flush(crate::redo::RedoOp::SetLocked {
+                    tx_key: same_shard,
+                    value: true,
+                })
+                .unwrap();
+        }
+
+        let (holders, floor) = mgr.delta_reader_redo_floor();
+        assert_eq!(
+            (holders, floor),
+            (1, Some(snapshot_seq)),
+            "the in-flight reader must publish exactly its Phase-1 position",
+        );
+
+        let cfg = crate::checkpoint::CheckpointConfig::new(dir.path().join("w16-fix.snap"));
+        let stats = crate::checkpoint::perform_checkpoint_with_reset_guard(
+            &cfg,
+            &engine,
+            &redo,
+            |floor_sequence| {
+                // `u64::MAX` = every expected replica is caught up, so the
+                // migration hold is the only thing that can block the reclaim.
+                crate::server::dispatch::redo_reset_decision(
+                    floor_sequence,
+                    u64::MAX,
+                    holders,
+                    floor,
+                    0.5,
+                    0.9,
+                )
+                .allow
+            },
+        )
+        .unwrap();
+        assert!(
+            !stats.reset_performed,
+            "the reclaim must be deferred while a migration delta reader holds the floor",
+        );
+
+        let fence_seq = redo.lock().current_sequence();
+        let redo_log = Some(redo);
+        let ops = collect_migration_delta_ops(&redo_log, snapshot_seq, fence_seq, shard, &engine)
+            .expect("the delta window must survive a checkpoint taken mid-migration");
+        assert_eq!(
+            ops.len(),
+            4,
+            "every windowed same-shard mutation must still be recoverable, got {ops:?}",
         );
     }
 

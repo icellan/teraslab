@@ -2632,6 +2632,50 @@ impl MigrationManager {
         &self.active
     }
 
+    /// W16 direction 1 — the REDO READ FLOOR held by this node's in-flight
+    /// migration delta readers: `(holder_count, lowest_sequence_still_needed)`.
+    ///
+    /// A migration worker captures `snapshot_sequence` at Phase 1 and does not
+    /// read the redo window `[snapshot_sequence, fence_sequence)` until Phase 3
+    /// (`collect_migration_delta_ops`), with the whole baseline stream in
+    /// between. Across that gap it is a redo CONSUMER holding a read position,
+    /// exactly like a lagging replica's ACK watermark — but nothing published
+    /// it, so the checkpoint reset guard (which consults only
+    /// `min_acked_over_expected`, the replication ACK tracker) could reclaim
+    /// the prefix out from under it. In armed scenario 06 (CI 32644361371) a
+    /// checkpoint whose `entries_before` was 8143 reclaimed 67 ms before 195
+    /// shards failed their delta with `need seq 6875, earliest available 8143`
+    /// — and each failure calls `rollback_shard`, a node-local mutation of the
+    /// target table whose repair is gated behind `active_count() == 0` plus a
+    /// 30 s cooldown.
+    ///
+    /// Only `Streaming` and `Fenced` entries hold: `Preparing` has not captured
+    /// a position yet (`snapshot_sequence == 0`), and `Complete` / `Failed`
+    /// entries keep a STALE `snapshot_sequence` that no live reader needs — a
+    /// parked entry in the durable retry queue would otherwise pin the log at a
+    /// position its re-drive will replace with a fresh Phase-1 stamp.
+    ///
+    /// The returned sequence is the lowest one still NEEDED (inclusive), not an
+    /// ACK watermark; see
+    /// [`crate::server::dispatch::redo_reset_decision`] for the conversion and
+    /// for the pressure escape hatch that keeps this soft hold from filling
+    /// the log.
+    pub fn delta_reader_redo_floor(&self) -> (usize, Option<u64>) {
+        let mut holders = 0usize;
+        let mut floor: Option<u64> = None;
+        for p in &self.active {
+            if p.snapshot_sequence == 0 {
+                continue;
+            }
+            if p.state != MigrationState::Streaming && p.state != MigrationState::Fenced {
+                continue;
+            }
+            holders += 1;
+            floor = Some(floor.map_or(p.snapshot_sequence, |f: u64| f.min(p.snapshot_sequence)));
+        }
+        (holders, floor)
+    }
+
     /// Number of shards pending inbound data.
     pub fn inbound_count(&self) -> usize {
         self.inbound_migrations
@@ -3702,6 +3746,99 @@ impl Default for MigrationManager {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// W16 direction 1 — a migration that has stamped its baseline snapshot
+    /// sequence is holding a REDO READ POSITION, and the checkpoint reset guard
+    /// must be able to see it.
+    ///
+    /// Armed scenario 06 (CI 32644361371) reclaimed the redo prefix 67 ms after
+    /// a checkpoint that the reset guard let through, and 195 shards then failed
+    /// their delta with `redo log truncated: need seq 6875, earliest available
+    /// 8143` — where 8143 was that same checkpoint's `entries_before`. The guard
+    /// consulted only the replication ACK tracker; nothing published the
+    /// migration readers' positions.
+    #[test]
+    fn delta_reader_redo_floor_reports_streaming_and_fenced_holders() {
+        let mut mgr = MigrationManager::new();
+        let self_id = NodeId(1);
+        let streaming = MigrationTask {
+            shard: 10,
+            from_node: self_id,
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let fenced = MigrationTask {
+            shard: 11,
+            from_node: self_id,
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let preparing = MigrationTask {
+            shard: 12,
+            from_node: self_id,
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let tasks = [streaming.clone(), fenced.clone(), preparing.clone()];
+        mgr.start_outbound(&tasks, self_id, &std::collections::HashSet::new());
+
+        // Nothing has stamped a snapshot sequence yet: no reader holds a
+        // position, so nothing pins the redo log.
+        assert_eq!(
+            mgr.delta_reader_redo_floor(),
+            (0, None),
+            "a Preparing task has captured no redo position and must not pin the log",
+        );
+
+        mgr.set_snapshot_sequence(&streaming, 6875);
+        mgr.set_snapshot_sequence(&fenced, 7000);
+        mgr.mark_fenced(&fenced, 8000);
+
+        assert_eq!(
+            mgr.delta_reader_redo_floor(),
+            (2, Some(6875)),
+            "both the Streaming and the Fenced reader hold a position; the floor \
+             is the minimum of them",
+        );
+
+        // Completing the lowest holder releases the floor up to the next one.
+        mgr.mark_complete(&streaming);
+        assert_eq!(
+            mgr.delta_reader_redo_floor(),
+            (1, Some(7000)),
+            "a completed reader must release its hold",
+        );
+    }
+
+    /// The floor must be released by FAILURE too — a parked entry in the
+    /// durable retry queue keeps its stale `snapshot_sequence`, and honouring
+    /// it would pin the redo log at a position no live reader needs (the
+    /// re-drive stamps a fresh one at its own Phase 1).
+    #[test]
+    fn delta_reader_redo_floor_ignores_failed_and_completed_entries() {
+        let mut mgr = MigrationManager::new();
+        let self_id = NodeId(1);
+        let task = MigrationTask {
+            shard: 5,
+            from_node: self_id,
+            to_node: NodeId(3),
+            is_master: false,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&task),
+            self_id,
+            &std::collections::HashSet::new(),
+        );
+        mgr.set_snapshot_sequence(&task, 4242);
+        assert_eq!(mgr.delta_reader_redo_floor(), (1, Some(4242)));
+
+        mgr.mark_failed(&task);
+        assert_eq!(
+            mgr.delta_reader_redo_floor(),
+            (0, None),
+            "a failed/parked entry must not pin the redo log",
+        );
+    }
 
     /// W15 — the #28 evidence is per-`(shard, target)`, and a TERMINAL ABORT of
     /// any one target vetoes the shard's shed at that epoch even when a sibling

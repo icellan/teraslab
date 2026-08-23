@@ -1290,6 +1290,21 @@ pub(crate) fn render_metrics_text(
             "teraslab_ack_tracker_load_failures_total",
             r.ack_tracker_load_failures.get(),
         );
+        // W16 direction 2 — stale ACK entries dropped as unrecoverable, and
+        // full-shard resync re-posts suppressed as already-in-flight. Both
+        // bound the `RedoReclaimed` re-entrant loop; alert on a sustained
+        // `stale_entries_dropped` rate (addresses keep entering the tracker
+        // that the topology never expects).
+        prom_counter(
+            &mut out,
+            "teraslab_ack_tracker_stale_entries_dropped_total",
+            r.ack_tracker_stale_entries_dropped.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_replica_resync_reposts_suppressed_total",
+            r.replica_resync_reposts_suppressed.get(),
+        );
         prom_counter(
             &mut out,
             "teraslab_intent_log_poisoned_total",
@@ -1372,6 +1387,26 @@ pub(crate) fn render_metrics_text(
             &mut out,
             "teraslab_redo_flush_errors_total",
             r.redo_flush_errors_total.get(),
+        );
+        // W16 direction 1 — who is pinning the redo log, and from where. The
+        // holders gauge counts in-flight migration delta readers at the last
+        // checkpoint reset-guard evaluation; the floor is the lowest sequence
+        // they still need (0 = nothing held). `hold_overridden_total` counts
+        // the evaluations that dropped the soft hold under emergency pressure.
+        prom_gauge(
+            &mut out,
+            "teraslab_redo_delta_reader_holders",
+            r.redo_delta_reader_holders.load(Ordering::Relaxed) as u64,
+        );
+        prom_gauge(
+            &mut out,
+            "teraslab_redo_delta_reader_floor",
+            r.redo_delta_reader_floor.load(Ordering::Relaxed),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_redo_delta_hold_overridden_total",
+            r.redo_delta_hold_overridden_total.get(),
         );
         // BC-01: background-checkpoint observability. `triggered_total`
         // increments at the START of each checkpoint, `failed_total`
@@ -5625,6 +5660,8 @@ mod tests {
             "teraslab_replica_missing_record_repair_failed_total",
             "teraslab_ack_tracker_flush_failures_total",
             "teraslab_ack_tracker_load_failures_total",
+            "teraslab_ack_tracker_stale_entries_dropped_total",
+            "teraslab_replica_resync_reposts_suppressed_total",
             "teraslab_intent_log_poisoned_total",
             "teraslab_replica_worker_panics_total",
             "teraslab_replica_unauthenticated_accept_total",
@@ -5637,6 +5674,9 @@ mod tests {
             "teraslab_redo_entries_per_flush",
             "teraslab_redo_append_total",
             "teraslab_redo_flush_errors_total",
+            "teraslab_redo_delta_reader_holders",
+            "teraslab_redo_delta_reader_floor",
+            "teraslab_redo_delta_hold_overridden_total",
             "teraslab_migration_bytes_transferred_total",
             "teraslab_migration_entries_applied_total",
             "teraslab_migration_active",

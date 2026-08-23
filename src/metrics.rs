@@ -1072,6 +1072,21 @@ pub struct ReplicationMetrics {
     /// A non-zero counter means the on-disk ACK watermarks were lost
     /// and replicas are being re-verified from scratch.
     pub ack_tracker_load_failures: PaddedCounter,
+    /// W16 direction 2 — master-side counter, incremented once per ACK-tracker
+    /// entry DROPPED by the catch-up path because the address is provably
+    /// outside `expected_replica_addrs()` AND provably below the earliest
+    /// surviving redo sequence (unrecoverable by construction; see
+    /// [`crate::server::dispatch::reclaimed_catchup_action`]). Such an entry
+    /// re-armed a full-shard resync on every lag-monitor tick forever. A small
+    /// number after a topology change is expected; sustained growth means
+    /// addresses keep entering the tracker that the topology never expects.
+    pub ack_tracker_stale_entries_dropped: PaddedCounter,
+    /// W16 direction 2 — master-side counter, incremented when a full-shard
+    /// resync re-post was SUPPRESSED because an identical one is already the
+    /// live repair (same `from_seq`, still inside the re-post cooldown). A
+    /// resync does not advance the ACK tracker, so without this the same
+    /// thousands of tasks are re-synthesized every lag-monitor tick.
+    pub replica_resync_reposts_suppressed: PaddedCounter,
     /// Observability follow-up: incremented exactly once at the
     /// `ReplicationIntentTracker`'s Active->Poisoned transition (see
     /// [`crate::replication::durable`]'s `compact_locked`), i.e. when a
@@ -1200,6 +1215,8 @@ impl ReplicationMetrics {
             replica_missing_record_repair_failed: PaddedCounter::new(),
             ack_tracker_flush_failures: PaddedCounter::new(),
             ack_tracker_load_failures: PaddedCounter::new(),
+            ack_tracker_stale_entries_dropped: PaddedCounter::new(),
+            replica_resync_reposts_suppressed: PaddedCounter::new(),
             intent_log_poisoned: PaddedCounter::new(),
             replica_worker_panics_total: PaddedCounter::new(),
             replica_unauthenticated_accept_total: PaddedCounter::new(),
@@ -1310,6 +1327,23 @@ pub struct RedoMetrics {
     /// log mutex (excludes the in-lock append). High values under concurrency
     /// indicate the single redo mutex is the write-concurrency bottleneck.
     pub redo_commit_lock_wait_ns: LatencyHistogram,
+    /// W16 direction 1 — how many in-flight migration delta readers were
+    /// holding a redo read position at the last checkpoint reset-guard
+    /// evaluation (gauge). Pairs with `redo_delta_reader_floor`: together they
+    /// answer "who is pinning the redo log and from where".
+    pub redo_delta_reader_holders: AtomicU32,
+    /// W16 direction 1 — the lowest redo sequence those readers still need
+    /// (gauge), or `0` when nothing holds the floor. Compare against the
+    /// checkpoint's `snapshot_fence_sequence`: a floor far below it means a
+    /// long-running migration is preventing reclamation.
+    pub redo_delta_reader_floor: AtomicU64,
+    /// W16 direction 1 — count of checkpoint reset-guard evaluations that
+    /// DROPPED the (soft) migration delta-reader hold because the redo log had
+    /// reached the emergency water mark. Each increment means a migration is
+    /// about to fail with `redo log truncated` so that the log can drain — a
+    /// deliberate trade, but sustained growth means migrations and checkpoints
+    /// are fighting and the log is undersized for the write rate.
+    pub redo_delta_hold_overridden_total: PaddedCounter,
 }
 
 impl Default for RedoMetrics {
@@ -1331,6 +1365,9 @@ impl RedoMetrics {
             redo_checkpoint_failed_total: PaddedCounter::new(),
             redo_checkpoint_duration_ns: LatencyHistogram::new(),
             redo_commit_lock_wait_ns: LatencyHistogram::new(),
+            redo_delta_reader_holders: AtomicU32::new(0),
+            redo_delta_reader_floor: AtomicU64::new(0),
+            redo_delta_hold_overridden_total: PaddedCounter::new(),
         }
     }
 }

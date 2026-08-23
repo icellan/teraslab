@@ -207,6 +207,35 @@ impl AckTracker {
         inner.last_acked.clone()
     }
 
+    /// W16 direction 2 — drop the entry for `addr` and persist the removal
+    /// immediately. Returns `true` if an entry was present.
+    ///
+    /// The ONLY caller is the catch-up path's `RedoReclaimed` handler, and only
+    /// for an address that
+    /// [`crate::server::dispatch::reclaimed_catchup_action`] has proven is both
+    /// outside `expected_replica_addrs()` and below the earliest surviving redo
+    /// sequence — i.e. an entry no code path can ever advance, which would
+    /// otherwise drive a full-shard resync on every lag-monitor tick forever.
+    /// See that function for why each half of the predicate must be proven and
+    /// why a merely-slow replica must never be dropped.
+    ///
+    /// The flush is unconditional (not amortized like [`Self::record_ack`]):
+    /// the removal must survive a restart, or reloading the file resurrects the
+    /// resync loop. Dropping an entry is safe with respect to the reclaim
+    /// guard — [`crate::server::dispatch::min_acked_over_expected`] scores a
+    /// missing expected replica as `0`, which BLOCKS a reclaim rather than
+    /// permitting one.
+    pub fn forget(&self, addr: &SocketAddr) -> bool {
+        let mut inner = self.inner.lock();
+        if inner.last_acked.remove(addr).is_none() {
+            return false;
+        }
+        inner.dirty = true;
+        inner.dirty_count = inner.dirty_count.saturating_add(1);
+        self.flush_locked(&mut inner);
+        true
+    }
+
     /// Reverse-heal Tier-1 fast-path (finding C1): the replicas whose durably
     /// persisted last-ACK sequence is at-or-beyond `floor`.
     ///
@@ -1672,6 +1701,47 @@ mod tests {
         let tracker = AckTracker::new(path);
         assert_eq!(tracker.last_acked(&test_addr(5000)), 42);
         assert_eq!(tracker.last_acked(&test_addr(5001)), 99);
+    }
+
+    /// W16 direction 2 — an entry that is provably not an expected replica AND
+    /// provably below the redo floor is unrecoverable by construction; the
+    /// catch-up path drops it so it stops re-arming full-shard resyncs. The
+    /// drop must be DURABLE, or a restart resurrects the loop from disk.
+    #[test]
+    fn forget_removes_the_entry_and_persists_the_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ack.dat");
+        let stale = test_addr(5100);
+        let live = test_addr(5101);
+
+        let tracker = AckTracker::new(path.clone());
+        tracker.record_ack(stale, 3812);
+        tracker.record_ack(live, 38_277);
+        tracker.flush();
+
+        assert!(tracker.forget(&stale), "a present entry is removed");
+        assert_eq!(tracker.last_acked(&stale), 0);
+        assert_eq!(
+            tracker.last_acked(&live),
+            38_277,
+            "forgetting one address must not disturb any other",
+        );
+        assert!(
+            !tracker.forget(&stale),
+            "forgetting an absent entry reports no change",
+        );
+        assert!(
+            !tracker.all_acked().contains_key(&stale),
+            "the forgotten address must disappear from the catch-up target set",
+        );
+
+        drop(tracker);
+        let reopened = AckTracker::new(path);
+        assert!(
+            !reopened.all_acked().contains_key(&stale),
+            "the removal must survive a restart, or the resync loop comes back",
+        );
+        assert_eq!(reopened.last_acked(&live), 38_277);
     }
 
     /// Reverse-heal Phase 1 Tier-1 (finding C1): a downstream replica's
