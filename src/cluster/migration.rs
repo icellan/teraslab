@@ -7170,6 +7170,60 @@ mod tests {
         );
     }
 
+    /// W17 review P2-7 — the two class accessors must PARTITION the union, by
+    /// construction and not by coincidence.
+    ///
+    /// The report derives the orphan class as `union \ holder_terminal`, so the
+    /// two counts always sum to the total no matter what state an entry is in.
+    /// The orphan-cleanup EXEMPTION uses the stricter local predicate
+    /// (`is_refused_orphan_fence`, which also demands `!heal_pending`) because
+    /// it is about to authorise a judgement, not a report. The two agree
+    /// wherever the module invariant holds, and where they could not, they fail
+    /// in opposite and correct directions: the report over-counts the class
+    /// with the LONGER convergence grace, the exemption refuses.
+    #[test]
+    fn the_two_refusal_classes_partition_the_union_by_construction() {
+        let source = NodeId(2);
+        let mut mgr = MigrationManager::new();
+        for shard in [80u16, 81, 82] {
+            assert!(mgr.register_inbound_source(shard, source));
+        }
+        // 80 → holder-terminal, 81 and 82 → orphan.
+        for _ in 0..TEST_TERMINAL_ROUNDS {
+            mgr.drop_refused_inbound(&[80, 81, 82], source, TEST_TERMINAL_ROUNDS, |s| match s {
+                80 => InboundRetention::KeepHolder,
+                _ => InboundRetention::KeepOrphan,
+            });
+        }
+        let union = mgr.refused_retained_inbound_entries();
+        let holder = mgr.refused_retained_holder_terminal_entries();
+        let orphan = mgr.refused_retained_orphan_entries();
+        assert_eq!(
+            holder.len() + orphan.len(),
+            union.len(),
+            "the classes must sum to the union — a gate that reports \
+             `total`, `holder` and `orphan` separately can otherwise be handed \
+             a set of three numbers describing no possible state",
+        );
+        assert_eq!(holder, vec![(80, source)]);
+        assert_eq!(orphan, vec![(81, source), (82, source)]);
+
+        // A heal-fence promotion removes the entry from the union entirely
+        // (`clear_refusal`), so the partition still holds — the case where the
+        // report and the exemption could disagree is unreachable.
+        assert!(!mgr.mark_heal_fence_active(81));
+        let union = mgr.refused_retained_inbound_entries();
+        assert_eq!(
+            mgr.refused_retained_holder_terminal_entries().len()
+                + mgr.refused_retained_orphan_entries().len(),
+            union.len(),
+        );
+        assert!(
+            !mgr.inbound_is_refused_orphan_fence(81),
+            "and the exemption refuses the promoted entry either way",
+        );
+    }
+
     /// W17 — the exemption must be REVOKED the moment the premise fails, and
     /// it must be all-or-nothing across a shard's entries.
     ///

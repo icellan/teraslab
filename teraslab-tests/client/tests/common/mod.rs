@@ -4420,6 +4420,64 @@ mod migration_gate_tests {
         );
     }
 
+    /// W17 review P2-5 (RED→GREEN) — the parse must be FAIL-CLOSED on schema
+    /// drift, which its own doc claims and the first cut did not deliver.
+    ///
+    /// The classes were read independently of the total, so a server reporting
+    /// `total=5, holder=0, orphan=0` — any partial rollout, any future rename,
+    /// any bug in the split — yielded a residue whose `.total()` is ZERO. That
+    /// satisfies the gates' `total_refused_retained.total() == 0` condition: a
+    /// stuck cluster becomes a GREEN verdict, which is the one outcome the
+    /// residue machinery exists to prevent.
+    ///
+    /// `inbound_refused_retained` is the authority. The orphan half is DERIVED
+    /// from it, so the two classes always sum to the total, and any
+    /// inconsistency lands entirely in the class with the longer grace.
+    #[test]
+    fn an_inconsistent_split_is_never_read_as_an_absent_residue() {
+        // The exact drift: total present, both halves zero.
+        let drifted = serde_json::json!({
+            "inbound_pending": 5,
+            "inbound_refused_retained": 5,
+            "inbound_refused_retained_holder_terminal": 0,
+            "inbound_refused_retained_orphan": 0,
+        });
+        let counts = refused_residue_counts(&drifted);
+        assert_eq!(
+            counts.total(),
+            5,
+            "the residue must survive a split that does not add up — reading \
+             it as zero is a green verdict over a wedged cluster",
+        );
+        assert_eq!(counts.orphan, 5, "the remainder takes the longer grace");
+
+        // Halves that OVERSTATE the total are clamped the same way: the total
+        // is the authority, and the holder half can never exceed it.
+        let overstated = serde_json::json!({
+            "inbound_refused_retained": 2,
+            "inbound_refused_retained_holder_terminal": 9,
+            "inbound_refused_retained_orphan": 0,
+        });
+        let counts = refused_residue_counts(&overstated);
+        assert_eq!(counts.total(), 2, "the total is the authority");
+        assert_eq!(counts.holder_terminal, 2);
+        assert_eq!(counts.orphan, 0);
+
+        // And the honest case is unchanged.
+        let consistent = serde_json::json!({
+            "inbound_refused_retained": 5,
+            "inbound_refused_retained_holder_terminal": 2,
+            "inbound_refused_retained_orphan": 3,
+        });
+        assert_eq!(
+            refused_residue_counts(&consistent),
+            RefusedResidue {
+                holder_terminal: 2,
+                orphan: 3,
+            },
+        );
+    }
+
     /// W16/W17 — the failure has to EXPLAIN itself, and it must not claim a
     /// guarantee it did not enforce.
     ///
