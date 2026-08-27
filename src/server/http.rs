@@ -1497,6 +1497,16 @@ pub(crate) fn render_metrics_text(
         );
         prom_counter(
             &mut out,
+            "teraslab_migration_stranded_reaped_total",
+            mm.migration_stranded_reaped_total.get(),
+        );
+        prom_gauge(
+            &mut out,
+            "teraslab_migration_stranded_held_off",
+            mm.migration_stranded_held_off.load(Ordering::Relaxed) as u64,
+        );
+        prom_counter(
+            &mut out,
             "teraslab_topology_epoch_mismatch_total",
             mm.topology_epoch_mismatch.get(),
         );

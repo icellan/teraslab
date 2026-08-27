@@ -1434,6 +1434,32 @@ pub struct MigrationMetrics {
     /// operator-visible signal that a node booted with a gap versus its
     /// replicas.
     pub stale_suspect_shards: AtomicU32,
+    /// W17 — total migration tasks retired by the coordinator's stranded-task
+    /// reaper.
+    ///
+    /// # ALERT ON A BURST — a spike is destroyed in-flight work, not cleanup
+    ///
+    /// The reaper exists for leftovers a settled cluster can never otherwise
+    /// clear (one `Fenced` task after a rolling restart; eight `Preparing`
+    /// tasks that were the whole migration set), so healthy values are 0 or a
+    /// handful. CI run 32668957355 incremented this 4877 times across two nodes
+    /// inside one second, aborting a converging rebalance and forcing a full
+    /// re-plan — and NOTHING metered it, so the only evidence was a log line
+    /// that hardcoded the wrong state. Pair a burst with the reap log's `state`
+    /// field to tell which candidate path fired.
+    pub migration_stranded_reaped_total: PaddedCounter,
+    /// W17 — stranded-task candidates whose ABSOLUTE dwell has passed
+    /// `STRANDED_TASK_REAP_AFTER` but which are still held off because the
+    /// migration pipeline keeps advancing (gauge).
+    ///
+    /// The reap deadline measures pipeline-IDLE time, which has no wall-clock
+    /// ceiling by design: a workerless task coexisting with live migrations
+    /// waits for them to drain. That is the correct trade — the alternative
+    /// destroys converging rebalances — but it means a shard can stay
+    /// write-fenced for as long as something else is moving. A persistently
+    /// non-zero value is the operator-visible signal for that, and the
+    /// measurement needed to choose a ceiling if one is ever warranted.
+    pub migration_stranded_held_off: AtomicU32,
     /// Number of times a migration completion or failure was rejected because
     /// the bookkeeping task's `topology_epoch` did not match the live
     /// epoch on the coordinator.
@@ -1829,6 +1855,8 @@ impl MigrationMetrics {
             migration_phase_serving_new: AtomicU32::new(0),
             migration_lost: AtomicU32::new(0),
             stale_suspect_shards: AtomicU32::new(0),
+            migration_stranded_reaped_total: PaddedCounter::new(),
+            migration_stranded_held_off: AtomicU32::new(0),
             topology_epoch_mismatch: PaddedCounter::new(),
             phantom_master_relinquished: PaddedCounter::new(),
             heal_deadline_alerts: PaddedCounter::new(),
