@@ -459,6 +459,23 @@ struct InboundMigration {
     /// — the entry counts as in-flight again for another
     /// `terminal_after_rounds` rounds.
     refusal_rounds: u32,
+    /// W17 — WHICH retention class earned `refused_by_source`: `true` for the
+    /// [`InboundRetention::KeepHolder`] terminal streak, `false` for
+    /// [`InboundRetention::KeepOrphan`].
+    ///
+    /// `refused_by_source` alone cannot answer this and two callers need it to.
+    /// The convergence gate's fatal message names the HOLDER-terminal class by
+    /// its round count, but the gauge it reads
+    /// ([`MigrationManager::refused_retained_inbound_entries`]) returns both
+    /// classes, so it asserted a six-round streak over entries marked on their
+    /// FIRST refusal. And W17's orphan-cleanup exemption is sound only for the
+    /// orphan class: a holder's copy is unproven, not redundant.
+    ///
+    /// Meaningless while `refused_by_source` is clear, and reset with it
+    /// ([`InboundMigration::clear_refusal`]) so a re-classified entry cannot
+    /// carry the old class. Process-local, not serialized, exactly like the
+    /// mark and the streak it qualifies.
+    refused_as_holder: bool,
     /// P0 (reverse-heal Phase 2c) — the no-serve-before-heal FENCE marker.
     ///
     /// Set when this inbound entry represents a boot reverse-heal PULL
@@ -574,6 +591,7 @@ impl InboundMigration {
             lost: false,
             refused_by_source: false,
             refusal_rounds: 0,
+            refused_as_holder: false,
             heal_pending: false,
             heal_started_at: None,
         }
@@ -589,6 +607,23 @@ impl InboundMigration {
     fn clear_refusal(&mut self) {
         self.refused_by_source = false;
         self.refusal_rounds = 0;
+        self.refused_as_holder = false;
+    }
+
+    /// W17 — this entry is a TERMINALLY-REFUSED ORPHAN FENCE: its own source
+    /// has said nothing is coming, this node is not a holder of the shard, and
+    /// it is not a reverse-heal fence.
+    ///
+    /// The `!heal_pending` term is checked HERE rather than inferred from
+    /// `drop_refused_inbound`'s heal early-return, because that inference is a
+    /// non-local invariant and it was already false:
+    /// [`MigrationManager::mark_heal_fence_active`] promotes an existing entry
+    /// in place, so a `KeepOrphan` mark could survive into a #74 park. That is
+    /// fixed at the promotion site as well — this is the local half of the same
+    /// argument, and the one an orphan-cleanup reader can verify without
+    /// leaving the predicate.
+    fn is_refused_orphan_fence(&self) -> bool {
+        !self.completed && self.refused_by_source && !self.refused_as_holder && !self.heal_pending
     }
 }
 
@@ -1646,6 +1681,16 @@ impl MigrationManager {
             .filter(|m| m.shard == shard)
         {
             m.heal_pending = true;
+            // W17 — the promotion is a NEW fail-closed expectation with its own
+            // resolution path (an operator, or the Phase-3b re-heal), so a
+            // prior terminal refusal no longer describes the entry.
+            // `register_heal_source` already does this (W12 review P2-4) and
+            // its comment asserts the invariant module-wide — but it was only
+            // true of ACQUIRING the mark, never of KEEPING it through this
+            // in-place promotion. A #74 park carrying `refused_by_source` is
+            // reported as a settled fixpoint by the status JSON, the gauge and
+            // the convergence gate.
+            m.clear_refusal();
             // Phase 3c — (re)start the fenced-heal deadline clock on (re)raise.
             m.heal_started_at = Some(std::time::Instant::now());
             existed = true;
@@ -2999,6 +3044,103 @@ impl MigrationManager {
             .collect()
     }
 
+    /// W17 — the [`InboundRetention::KeepHolder`] half of
+    /// [`Self::refused_retained_inbound_entries`]: entries this node IS the
+    /// holder for, whose source has refused them for
+    /// `terminal_after_rounds` CONSECUTIVE rounds.
+    ///
+    /// This is the class the convergence gate's fatal diagnostic names ("…for
+    /// `REFUSED_HOLDER_TERMINAL_ROUNDS` consecutive rounds"). It could not
+    /// demand it before: the combined accessor above returns both classes, so
+    /// the gate asserted a six-round streak over `KeepOrphan` entries that
+    /// `drop_refused_inbound` marks on their FIRST refusal.
+    ///
+    /// An entry here holds an UNPROVEN local copy of a shard it owns. Nothing
+    /// may reclaim it — not orphan cleanup (the ownership test excludes it) and
+    /// not W17's exemption (see [`Self::inbound_is_refused_orphan_fence`]). It
+    /// is genuinely terminal until a re-planned handoff clears the mark.
+    pub fn refused_retained_holder_terminal_entries(&self) -> Vec<(u16, NodeId)> {
+        self.inbound_migrations
+            .iter()
+            .filter(|m| !m.completed && m.refused_by_source && m.refused_as_holder)
+            .map(|m| (m.shard, m.from_node))
+            .collect()
+    }
+
+    /// W17 — the [`InboundRetention::KeepOrphan`] half of
+    /// [`Self::refused_retained_inbound_entries`]: entries for shards this node
+    /// does NOT hold, retained only because local orphan records would
+    /// otherwise become readable on a non-holder.
+    ///
+    /// Marked on the FIRST refusal, and resolvable — orphan cleanup reclaiming
+    /// the records turns the entry into a zero-record non-holder, which the
+    /// ordinary prune retires. The two classes are reported apart because they
+    /// carry different promises about how long they may legitimately persist.
+    pub fn refused_retained_orphan_entries(&self) -> Vec<(u16, NodeId)> {
+        self.inbound_migrations
+            .iter()
+            .filter(|m| m.is_refused_orphan_fence())
+            .map(|m| (m.shard, m.from_node))
+            .collect()
+    }
+
+    /// W17 — is EVERY uncompleted inbound entry for `shard` a terminally
+    /// refused ORPHAN fence ([`InboundMigration::is_refused_orphan_fence`])?
+    ///
+    /// False when the shard has no uncompleted entry at all, so callers must
+    /// compose it with [`Self::has_pending_inbound`] rather than read it as
+    /// "nothing is inbound".
+    ///
+    /// # Why this is the sound cut for orphan cleanup
+    ///
+    /// Both orphan-cleanup paths skip any shard with a pending inbound entry,
+    /// and that skip runs BEFORE the #28 evidence check. Combined with
+    /// `inbound_entry_retention` — which retires an entry only at zero local
+    /// records — it closes a cycle with no exit: the entry waits for the
+    /// records, the records wait for the entry. Armed scenario 09 (CI
+    /// 32668963874) held twelve shards and 21 records in it permanently, at
+    /// rest, with every pass logging `pending_inbound=12`.
+    ///
+    /// The gate's stated purpose is that nothing this node is still RECEIVING
+    /// as part of its topology plan may be misjudged around a pass. An entry
+    /// admitted here is not that, on three independent grounds:
+    ///
+    /// * its own `from_node` answered `ERR_MIGRATION_NO_TASKS` — the source
+    ///   has stated it will never send, so no transfer can be in flight;
+    /// * this node is not a target holder of the shard at the committed epoch
+    ///   (that is what made the retention `KeepOrphan` rather than
+    ///   `KeepHolder`), so the entry is not plan work;
+    /// * it is not a reverse-heal fence, which is the one inbound class a
+    ///   peer's opinion of its own outbound tasks says nothing about.
+    ///
+    /// And the exemption is not itself permission to delete. It only lets the
+    /// shard be JUDGED: the #28 committed-handoff guard and the
+    /// proof-of-elsewhere unanimity bar are both downstream and untouched. Its
+    /// effect is that a shard whose evidence is unearnable — the TARGET-side
+    /// orphan, where `handoff_outcomes` was never written because this node was
+    /// never the source — can finally reach the proof phase that exists for
+    /// exactly that case.
+    ///
+    /// Revocable the instant the premise fails: a batch arriving
+    /// ([`Self::mark_inbound_active`]), a task or source registration, a heal
+    /// promotion, or the source matching the request in a later round all clear
+    /// the mark. Callers re-evaluate it under the lock immediately before
+    /// deleting, so a transfer that becomes live mid-pass closes the gate again.
+    pub fn inbound_is_refused_orphan_fence(&self, shard: u16) -> bool {
+        let mut any = false;
+        for m in self
+            .inbound_migrations
+            .iter()
+            .filter(|m| m.shard == shard && !m.completed)
+        {
+            if !m.is_refused_orphan_fence() {
+                return false;
+            }
+            any = true;
+        }
+        any
+    }
+
     /// W1.1 residual fix — stamp the listed pending inbound shards with the
     /// current instant, recording that this node has just sent an
     /// `OP_MIGRATION_TRANSFER_REQUEST` (pull-based repair) for them.
@@ -3589,6 +3731,9 @@ impl MigrationManager {
                     m.refusal_rounds = m.refusal_rounds.saturating_add(1);
                     if m.refusal_rounds >= terminal_after_rounds {
                         m.refused_by_source = true;
+                        // W17 — record the CLASS with the mark; see
+                        // `InboundMigration::refused_as_holder`.
+                        m.refused_as_holder = true;
                         kept_holder_terminal.push(m.shard);
                     } else {
                         kept_holder.push(m.shard);
@@ -3598,6 +3743,10 @@ impl MigrationManager {
                 InboundRetention::KeepOrphan => {
                     m.refusal_rounds = m.refusal_rounds.saturating_add(1);
                     m.refused_by_source = true;
+                    // W17 — an entry can be re-classified between rounds (the
+                    // shard's records or this node's holder-ness can change),
+                    // so the class is ASSIGNED every round, never only set.
+                    m.refused_as_holder = false;
                     kept_orphan.push(m.shard);
                     true
                 }
@@ -6956,6 +7105,107 @@ mod tests {
             "the entry keeps its concrete source, so it is a heal PULL, not a \
              no-source park",
         );
+    }
+
+    /// W17 — the two retention classes must be reportable APART, and the
+    /// orphan-fence predicate must admit exactly one of them.
+    ///
+    /// `refused_by_source` is set by both arms of `drop_refused_inbound`, so
+    /// every caller that needs one class specifically — the convergence gate's
+    /// fatal diagnostic, and the orphan-cleanup exemption — was reading the
+    /// union. The classes are opposite states: a HOLDER's copy is unproven and
+    /// nothing may reclaim it; a non-holder's is redundant and only orphan
+    /// cleanup can.
+    #[test]
+    fn a_refusal_records_which_retention_class_earned_the_mark() {
+        let source = NodeId(2);
+        let mut mgr = MigrationManager::new();
+        assert!(mgr.register_inbound_source(50, source));
+        assert!(mgr.register_inbound_source(51, source));
+
+        // 50 is an orphan fence (marked on the FIRST refusal); 51 is a holder
+        // entry, which needs the full consecutive streak.
+        for round in 1..=TEST_TERMINAL_ROUNDS {
+            let outcome =
+                mgr.drop_refused_inbound(&[50, 51], source, TEST_TERMINAL_ROUNDS, |s| match s {
+                    50 => InboundRetention::KeepOrphan,
+                    _ => InboundRetention::KeepHolder,
+                });
+            assert_eq!(outcome.dropped, 0, "round {round} must drop nothing");
+            assert_eq!(outcome.kept_orphan, vec![50], "round {round}");
+        }
+
+        assert_eq!(
+            mgr.refused_retained_orphan_entries(),
+            vec![(50, source)],
+            "the non-holder entry is the orphan class",
+        );
+        assert_eq!(
+            mgr.refused_retained_holder_terminal_entries(),
+            vec![(51, source)],
+            "the holder entry is the terminal-streak class",
+        );
+        assert_eq!(
+            mgr.refused_retained_inbound_entries(),
+            vec![(50, source), (51, source)],
+            "and the combined accessor keeps meaning the union — it is what \
+             `in_flight_inbound_pending` subtracts, and neither class can \
+             progress",
+        );
+
+        assert!(
+            mgr.inbound_is_refused_orphan_fence(50),
+            "only the orphan class may be exempted from the orphan-cleanup \
+             pending-inbound skip",
+        );
+        assert!(
+            !mgr.inbound_is_refused_orphan_fence(51),
+            "a HOLDER's unproven copy is not redundant — exempting it would \
+             offer a shard this node owns to the reclaim",
+        );
+        assert!(
+            !mgr.inbound_is_refused_orphan_fence(52),
+            "a shard with no inbound entry at all is not an orphan fence — \
+             callers must compose with `has_pending_inbound`",
+        );
+    }
+
+    /// W17 — the exemption must be REVOKED the moment the premise fails, and
+    /// it must be all-or-nothing across a shard's entries.
+    ///
+    /// A shard can carry entries from several sources (a forward transfer and
+    /// a re-push, say). One refusing source says nothing about the other, so a
+    /// single un-refused entry has to keep the whole shard out of the pass.
+    #[test]
+    fn one_unrefused_entry_keeps_the_whole_shard_out_of_the_exemption() {
+        let refuser = NodeId(2);
+        let other = NodeId(3);
+        let mut mgr = MigrationManager::new();
+        assert!(mgr.register_inbound_source(60, refuser));
+        assert!(mgr.register_inbound_source(60, other));
+        mgr.drop_refused_inbound(&[60], refuser, TEST_TERMINAL_ROUNDS, |_| {
+            InboundRetention::KeepOrphan
+        });
+        assert_eq!(mgr.refused_retained_orphan_entries(), vec![(60, refuser)]);
+        assert!(
+            !mgr.inbound_is_refused_orphan_fence(60),
+            "node3 has refused nothing — its transfer can still arrive",
+        );
+
+        // node3 refuses too: now nothing is coming for the shard from anyone.
+        mgr.drop_refused_inbound(&[60], other, TEST_TERMINAL_ROUNDS, |_| {
+            InboundRetention::KeepOrphan
+        });
+        assert!(mgr.inbound_is_refused_orphan_fence(60));
+
+        // …and one batch arriving revokes it again.
+        assert!(!mgr.mark_inbound_active(60));
+        assert!(
+            !mgr.inbound_is_refused_orphan_fence(60),
+            "records arriving mean the shard is receiving — the exemption's \
+             premise is gone",
+        );
+        assert!(mgr.has_pending_inbound(60), "and the fence never came down");
     }
 
     /// W16 (RED→GREEN) — a HOLDER's inbound entry its source refuses ROUND
