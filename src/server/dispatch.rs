@@ -1842,11 +1842,29 @@ pub(crate) fn handle_request(
             // and away from DESTROYING possibly-live data, and that is the safe
             // direction for a UTXO store:
             //
-            //   * Retention is not resurrection. Nothing comes back — the local
-            //     copy never left. A retained stale copy cannot propagate onto
-            //     a node that knows about the deletion: RULE-DS vetoes a heal
-            //     from an at-or-behind image. The exposure is a local stale
-            //     read, and only on a node that already held the record.
+            //   * Retention is not resurrection, FOR AS LONG AS THE DELETION
+            //     IS STILL REMEMBERED. Nothing comes back — the local copy
+            //     never left — and a retained stale copy cannot propagate onto
+            //     a node that knows about the deletion, because RULE-DS vetoes
+            //     a heal from an at-or-behind image. That veto is TIME-BOUNDED:
+            //     the tombstone carrying it is GC'd at
+            //     `tombstone_retention_blocks` (`config.rs`), after which a
+            //     resync from the retaining node CAN apply the key
+            //     cluster-wide. This is the pre-existing E5 residual, and this
+            //     change ENLARGES the population riding it — every retained
+            //     record is now a candidate where a pruned one was not. So the
+            //     claim is: within the tombstone-retention window the exposure
+            //     is a local stale read on a node that already held the record;
+            //     past that window it is E5, unchanged in mechanism and larger
+            //     in population. E5's own mitigation (sizing retention above
+            //     the finality horizon) widens the window rather than closing
+            //     it.
+            //
+            //     Blast radius past the veto is still bounded on RF>1: a spend
+            //     of a retained key fans out and NAKs at
+            //     `missing_record_apply_outcome` (replication::receiver), so it
+            //     degrades to an unconvergeable key rather than a committed
+            //     double-spend.
             //   * Loss is terminal. All holders received the same short
             //     manifest, so there was no copy left to heal from, and the
             //     `PruneReplace` tombstone the prune planted then vetoed every
@@ -1859,18 +1877,45 @@ pub(crate) fn handle_request(
             //     every non-authoritative source). Making that unconditional
             //     removes a rare catastrophic branch; it does not change the
             //     posture the cluster actually runs in.
-            //   * Anti-resurrection duty stays where it is EVIDENCE-BASED: an
-            //     authoritative delete/spend replicates a real tombstone, and
-            //     the committed-handoff-gated orphan cleanup (#28) reclaims
-            //     residue against committed evidence.
+            //   * Anti-resurrection duty for a delete that ACTUALLY HAPPENED
+            //     stays evidence-based: the authoritative delete/spend
+            //     replicates a real tombstone. That is a different population
+            //     from the residue below, and it is unaffected by this change.
             //
-            // ACCEPTED RESIDUAL. A migration target can now carry stale records
-            // the authority no longer has, until a replicated delete or #28
-            // reclaims them. `teraslab_migration_prune_retained_omitted_total`
-            // is that volume. The right guard against a
-            // stale replica being promoted and then SERVING that residue is
-            // convergence-gating the promotion — not deleting data on a
-            // completion frame.
+            // ACCEPTED RESIDUAL — AND NOTHING RECLAIMS IT. Be precise here,
+            // because the first version of this comment was wrong and the wrong
+            // version is the comfortable one.
+            //
+            // A migration target now keeps every local key an authoritative
+            // manifest omitted, PERMANENTLY. Neither named reconciler applies:
+            //
+            //   * the committed-handoff-gated orphan cleanup (#28) CANNOT touch
+            //     it. `run_orphan_cleanup` skips any shard this node owns
+            //     (`cluster::coordinator`, the `if owned || shard_record_count
+            //     == 0 { continue }` guard), and this residue is BY
+            //     CONSTRUCTION in a shard this node is a migration target for —
+            //     so it is owned the moment the completion commits. Before the
+            //     commit the `has_pending_inbound` gate one branch above skips
+            //     it anyway. #28 reclaims NON-owned shards; this is the owned
+            //     case, and there is no owned-shard reclaimer.
+            //   * a replicated delete cannot reach it either: it would require
+            //     the authority to issue a delete for a key it does not hold,
+            //     which it never will.
+            //
+            // So the residue is PERMANENT and FORWARD-PROPAGATING: on the next
+            // migration where this node is the SOURCE, the retained key is in
+            // `fenced_keys`, so `collect_manifest_entries` folds it into the
+            // manifest and streams it onward as authoritative content.
+            //
+            // That is the accepted cost, and it is accepted only because the
+            // alternative destroyed acked records three times. The open owner
+            // is convergence-gating PROMOTION — refusing to make a node that
+            // has not converged the serving master of a shard — which addresses
+            // both the residue's origin and its exposure without deleting data
+            // on a completion frame. Filed as follow-up; NOT solved here.
+            // `teraslab_migration_prune_retained_omitted_total` is the volume,
+            // and it is a one-way count: nothing decrements it and no cleanup
+            // counter will ever correlate with it.
             //
             // ------------------------- historical -------------------------
             // DATA-LOSS GATE (task #29). The exact-entry manifest reconciliation
@@ -2073,13 +2118,27 @@ pub(crate) fn handle_request(
             // line below without an `unwrap`.
             //
             // W17 — the `shard_record_count` leg is an O(1) PRECONDITION on the
-            // scan, not a safety gate. `keys_for_shard` is a full index pass
-            // plus a device footer read per hit, and this block no longer
-            // deletes, so running it when there is provably nothing to report
-            // is pure cost. The atomic per-shard counter answers "could this
-            // node hold anything the manifest does not name?" for free. It
-            // strictly improves on the pre-W17 cost, which paid for the scan
-            // whenever the cutoff gate passed even with the counts equal.
+            // scan, not a safety gate. `keys_for_shard` (`ops::engine`) is a
+            // full INDEX pass plus a device footer read per hit — O(index) per
+            // call, which at 2B records is not a detail — and this block no
+            // longer deletes, so running it when there is provably nothing to
+            // report is pure cost. The atomic per-shard counter answers "could
+            // this node hold anything the manifest does not name?" for free.
+            //
+            // Do NOT read this as strictly cheaper than pre-W17: the two
+            // conditions are not nested. Pre-W17 scanned when the cutoff gate
+            // PASSED, including with the counts equal; post-W17 scans when
+            // `count > expected`, including when the gate REFUSED. On the shape
+            // ts17 actually produced (1812 refusals, none with extras to argue
+            // about) this is cheaper; a workload with persistent extras and an
+            // agreeing gate would pay more.
+            //
+            // And the cost is RECURRING by construction: because the residue is
+            // never removed, `count > expected` stays true for that shard, so
+            // every completion retry and every future migration into it re-runs
+            // the scan and re-emits the identical line. If that becomes hot, the
+            // fix is to bound the work (per-shard suppression), not to restore
+            // the delete.
             //
             // It can under-count the report in one corner: a shard holding
             // FEWER records than the manifest names can still hold an omitted
@@ -2376,9 +2435,29 @@ pub(crate) fn handle_request(
             //     let those possibly-stale extras be served. Such a completion is
             //     NOT epoch-current, so it falls through to the STRICT count
             //     check and is rejected (shard stays fenced) — exactly the #29
-            //     anti-stale-serving guarantee. The #29 prune gate above already
-            //     retains the extras; this keeps them unservable until the
-            //     authoritative current-epoch migration reconciles them.
+            //     anti-stale-serving guarantee. The block above retains the
+            //     extras; the epoch gate is what keeps them unservable.
+            //
+            //   * W17 — EPOCH-CURRENT AUTHORITATIVE SHORT MANIFEST, the third
+            //     case, which this enumeration used to omit because the #29
+            //     prune deleted it out of existence before the count decision
+            //     ran. It no longer does, so say what now happens: an
+            //     epoch-current authoritative source whose manifest is short
+            //     lands HERE, on the superset arm, and COMMITS with the extras
+            //     retained and servable.
+            //
+            //     That is deliberate and it is the weakest point of the W17
+            //     trade, so do not paper over it. The alternative was deleting
+            //     them, which destroyed acked records three times, and refusing
+            //     the completion instead was tried as W11 FIX 2 and REVERTED as
+            //     non-convergent. Nothing here can tell a stale extra from a
+            //     live one — that is the whole finding — so the epoch gate is
+            //     the only discriminator left, and it does not fire for a
+            //     current-epoch source. The real guard is refusing to promote an
+            //     unconverged node in the first place (see the W17 banner);
+            //     until that lands, this arm commits possibly-stale extras and
+            //     `teraslab_migration_prune_retained_omitted_total` is the only
+            //     signal that it did.
             //
             // A legacy no-epoch completion (epoch == 0) cannot be proven current
             // and is treated as not-current → strict.
@@ -6429,11 +6508,24 @@ impl PruneOmissionAudit {
         // W15's rule was "a path that DELETES must never be silent", after this
         // prune destroyed live RF-acked copies in CI run 32637576348 and
         // emitted nothing. W17 keeps the line for the inverse reason: the
-        // retention is a deliberate, load-bearing refusal to clean up, and an
-        // operator must be able to see how much residue it is carrying and
-        // which source's manifest was short. ONE INFO line per shard, never per
-        // record — same shape as the orphan reclaim's line in
-        // `cluster::coordinator`'s `run_orphan_cleanup`.
+        // retention is a deliberate, load-bearing refusal to clean up that
+        // NOTHING later undoes, and an operator must be able to see how much
+        // residue it is carrying and which source's manifest was short. ONE
+        // INFO line per shard, never per record — same shape as the orphan
+        // reclaim's line in `cluster::coordinator`'s `run_orphan_cleanup`.
+        //
+        // Expect REPETITION, and do not read it as new residue: because the
+        // records are never removed, the same shard re-emits the identical line
+        // on every completion retry and every future migration into it.
+        //
+        // W15 carried this emission in `Drop` so no exit could skip it, and
+        // that was load-bearing while the loop had a fallible `delete` with an
+        // early `return`. The loop is now infallible with a single exit, so the
+        // direct call is what the code actually needs and the test that pinned
+        // the `Drop` property had to go with the exit it simulated. IF A
+        // FALLIBLE CALL IS EVER ADDED BACK TO THE LOOP, restore the `Drop`
+        // emission and its test in the same change — a half-completed pass that
+        // names none of its records is exactly the shape W15 was fixing.
         tracing::info!(
             shard = self.shard,
             records_retained = self.retained,
@@ -6444,17 +6536,26 @@ impl PruneOmissionAudit {
             "cluster: migration completion RETAINED local keys the \
              authoritative source's manifest omitted — omission is not \
              deletion evidence, so these records are KEPT (no tombstone, \
-             still healable); genuinely-stale residue is reconciled by \
-             replicated deletes and the committed-handoff-gated orphan \
-             cleanup",
+             still healable). NOTHING RECLAIMS THIS RESIDUE: the shard is \
+             owned once the completion commits, and orphan cleanup skips \
+             owned shards, so the count is permanent and re-emits on every \
+             later completion for the shard",
         );
     }
 }
 
-/// W10 FIX 1 — may the #29 completion prune run, given the source's
-/// enumeration cutoff?
+/// Does the source's enumeration cutoff agree with this node's own view of its
+/// stream?
 ///
-/// Three independent proofs, ALL of which must hold:
+/// W10 built this as the #29 prune's authorization gate. W17 removed the
+/// prune's deletion — no cutoff can establish that a manifest is a superset of
+/// a shard, which is the property the prune actually needed — so this now feeds
+/// a REPLICATION-HEALTH signal (`migration_prune_skipped_cutoff_gate`) and
+/// authorizes nothing. It is kept because it is the only place that
+/// cross-checks a source's `last_acked` view of us against our own durable
+/// watermark, and it caught a real regression shape (leg 3).
+///
+/// Four independent checks, ALL of which must hold:
 ///
 ///  1. `applied_after_in_memory == false` — this process recorded no tracked
 ///     apply from that source to the shard past the cutoff
@@ -6487,14 +6588,20 @@ impl PruneOmissionAudit {
 ///
 /// Leg 3 is strictly stronger than sender-side bookkeeping hygiene: it catches
 /// EVERY regression source, including ones no sender can observe (an operator
-/// restoring the target from a backup, a wiped state directory). A refused
-/// prune is only ever a deferral — the retained extras fail the retryable
-/// count check and the source re-folds against a fresh, non-stale cutoff.
+/// restoring the target from a backup, a wiped state directory).
 ///
-/// `our_watermark == None` (no durable tracker configured — the test-harness /
-/// untracked path) leaves legs 2 and 3 unprovable; the historical behavior is
-/// preserved by falling back to leg 1 alone, which is exactly the pre-W10
-/// posture for such deployments.
+///  4. **W17 — a ZERO cutoff never agrees.** See the leg's comment in the body.
+///
+/// `our_watermark == None` (no durable tracker configured) leaves legs 2, 3 and
+/// 4 unprovable. This used to fall back to leg 1 alone and return `true`,
+/// preserving the pre-W10 posture for untracked deployments. W17 returns
+/// `false` instead: it is the same defect leg 4 exists to fix, one arm over —
+/// reading the absence of evidence as agreement — and since nothing is
+/// authorized by the answer any more, honesty costs nothing and a signal that
+/// claims agreement it cannot verify is worse than one that says "unknown".
+/// In practice this arm is unreachable on a clustered node, which is the only
+/// kind that migrates: `init_replica_applied_tracker` runs at clustered
+/// startup and fails closed.
 fn prune_safe_at_enumeration_cutoff(
     applied_after_in_memory: bool,
     our_watermark: Option<u64>,
@@ -6512,16 +6619,26 @@ fn prune_safe_at_enumeration_cutoff(
         // source has not completed a single full-batch ACK to this target, so
         // it has no view of our stream position at all; matching it against our
         // own zero watermark made "we have no relationship whatsoever" read as
-        // "we are provably in sync". That vacuous `0 == 0` is what authorized
-        // node3's 65 deletions in CI run 32668963874 while node1 — which DID
-        // have prior history with the same source's stream, hence a non-zero
-        // watermark — refused the identical completions 118 times. It is also
-        // the exact shape the per-source keying premise on
-        // `ops::engine::ReplicaShardSeqTracker` cannot cover: a node that has
-        // just been handed mastership of a shard whose content reached us
-        // through a DIFFERENT node's stream.
+        // "we are provably in sync". It is the exact shape the per-source
+        // keying premise on `ops::engine::ReplicaShardSeqTracker` cannot cover:
+        // a node just handed mastership of a shard whose content reached us
+        // through a DIFFERENT node's stream. The leg is justified on that
+        // alone — absence of evidence is not agreement — independently of any
+        // particular incident.
+        //
+        // ATTRIBUTION, HEDGED ON PURPOSE. The `0 == 0` pass is the LEADING
+        // HYPOTHESIS for CI run 32668963874's refusal asymmetry (node1 refused
+        // 118 times, node3 zero while pruning 65 records), not a proven one. It
+        // fits all three numbers, but `last_acked` is per-TARGET-ADDRESS, so
+        // node1 and node3 received DIFFERENT cutoffs from the same source —
+        // node1 refusing on `C1 != W1` with both values non-zero fits the counts
+        // equally well, and the logs needed to separate the two were not
+        // re-read. Do not cite this comment as proof of the mechanism; cite it
+        // as the reason the leg is correct regardless of which one it was.
         Some(watermark) => cutoff != 0 && watermark == cutoff,
-        None => true,
+        // W17 — no durable watermark means legs 2-4 are unprovable, so we
+        // cannot claim agreement. Same reasoning as leg 4; see the doc.
+        None => false,
     }
 }
 
@@ -6539,17 +6656,36 @@ fn prune_safe_at_enumeration_cutoff(
 /// renegotiation relabels fresh content DOWN to at-or-below a cutoff read
 /// from the stale value. What makes the cutoff safe is therefore not a
 /// sender-side bound but the target-side EQUALITY gate
-/// (`prune_safe_at_enumeration_cutoff`): the prune runs only when the
+/// (`prune_safe_at_enumeration_cutoff`): the comparison holds only when the
 /// target's own watermark equals the cutoff, so a source view that is either
 /// ahead of (regressed target) or behind (missed applies) the target's truth
 /// refuses. Reading this value BEFORE the manifest fold only under-
-/// approximates, which defers the prune — never authorizes a deletion.
+/// approximates, which can only make the check stricter.
 ///
 /// Returns `0` when no replication slot exists for `addr` (nothing acked from
-/// this process yet). A `0` cutoff is still sound: the target then prunes
-/// only if it has NEVER applied a tracked op from this node's stream (its
-/// in-memory high-water and durable watermark are both empty) — in which
-/// case nothing it holds can postdate this node's fold via that stream.
+/// this process yet).
+///
+/// # W17 — a `0` cutoff is NOT sound, and the argument that said it was is
+/// exactly how this gets re-armed
+///
+/// This doc used to read: "a `0` cutoff is still sound: the target then prunes
+/// only if it has NEVER applied a tracked op from this node's stream — in which
+/// case nothing it holds can postdate this node's fold via that stream." Every
+/// clause is true and the conclusion does not follow. The qualifier *via that
+/// stream* is doing all the work: it bounds only what arrived from THIS source,
+/// and says nothing about content the target took from any other node. A source
+/// that has just been handed mastership of a shard is precisely the node with
+/// no stream history with its new peers, so `cutoff == 0` selects for the
+/// dangerous case rather than excluding it.
+///
+/// CI run 32668963874 settled it empirically: node3's watermark for the new
+/// master's stream was also `0`, the gate read `0 == 0` as proven agreement,
+/// and 65 records were deleted; node1, which HAD prior history and so a
+/// non-zero watermark, refused the same completions 118 times. The gate now
+/// refuses a zero cutoff outright (`prune_safe_at_enumeration_cutoff` leg 4),
+/// and — because no cutoff can establish that a manifest is a superset of a
+/// shard — the completion path no longer deletes on omission at all. This value
+/// feeds a replication-health signal, not an authorization.
 pub fn replication_stream_cutoff_for(addr: SocketAddr) -> u64 {
     let slot = {
         let pool = REPL_POOL.lock();
@@ -29603,15 +29739,18 @@ mod tests {
         // The case `PruneReplace`'s generation gate could never save: a
         // created-once record is gen-0 forever, so an at-or-behind image is
         // the ONLY image it will ever present. It must be admitted.
+        //
+        // This follows from the cause check above, and is asserted anyway
+        // because it goes through the DIFFERENT API the heal path actually
+        // calls: `tombstone_cause` reads the recorded cause, while
+        // `tombstone_blocks_heal_apply` is the veto itself. A future veto leg
+        // that does not derive from the cause map would slip past the check
+        // above and be caught here. The strictly-newer case is NOT asserted —
+        // it adds nothing once the at-or-behind case passes.
         assert!(
             !h.engine.tombstone_blocks_heal_apply(&key_b, gen_b),
             "a heal at the record's own generation — the only one a \
              created-once record can ever present — must not be vetoed",
-        );
-        assert!(
-            !h.engine
-                .tombstone_blocks_heal_apply(&key_b, gen_b.wrapping_add(1)),
-            "and a strictly-newer copy must be admitted too",
         );
     }
 
@@ -29801,11 +29940,16 @@ mod tests {
     /// (the armed-05 re-baselining leg: the tombstoned holder acted as
     /// authoritative-complete source, its manifest omitted the pruned key,
     /// and every peer deleted its live copy). The completion frame therefore
-    /// carries the source's weak-tombstone keys for the shard; the target
-    /// EXCLUDES them from the #29 prune (retaining its live copy) while the
-    /// epoch-current superset accept still lets the completion verify.
+    /// carries the source's weak-tombstone keys for the shard.
+    ///
+    /// W17 — the target no longer deletes on ANY omission, so the declaration
+    /// is no longer an exclusion from a prune; it is an ATTRIBUTION (see
+    /// `migration_prune_weak_declared_retained`). What this test still pins is
+    /// that a declared key is retained AND that the epoch-current superset
+    /// accept lets the completion verify — the survival half is now
+    /// unconditional, the accept half is not.
     #[test]
-    fn migration_complete_prune_excludes_source_weak_tombstone_keys() {
+    fn migration_complete_retains_source_weak_tombstone_keys() {
         let h = DispatchTestHarness::new();
         let shard = 43u16;
         let txid_a = txid_for_shard(shard, 7);
@@ -31834,9 +31978,14 @@ mod tests {
         // Leg 1 dominates: an in-memory apply past the cutoff always refuses.
         assert!(!prune_safe_at_enumeration_cutoff(true, Some(10), 10));
         assert!(!prune_safe_at_enumeration_cutoff(true, None, 10));
-        // No durable tracker: leg 1 alone (historical posture).
-        assert!(prune_safe_at_enumeration_cutoff(false, None, 10));
-        assert!(prune_safe_at_enumeration_cutoff(false, None, 0));
+        // W17 — no durable tracker: legs 2-4 are unprovable, so the answer is
+        // "unknown", and unknown is not agreement. This reverses the pre-W17
+        // fallback (leg 1 alone, returning true), which was the same
+        // absence-of-evidence-as-agreement defect leg 4 fixes one arm over.
+        // Nothing is authorized by the verdict any more, so the honest answer
+        // is free.
+        assert!(!prune_safe_at_enumeration_cutoff(false, None, 10));
+        assert!(!prune_safe_at_enumeration_cutoff(false, None, 0));
     }
 
     /// W17 (secondary) — the refusal ASYMMETRY observed in CI run 32668963874:

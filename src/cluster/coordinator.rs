@@ -18468,13 +18468,21 @@ pub(crate) fn encode_migration_complete_payload_with_weak_keys(
 ///
 /// `enumeration_cutoff` (W10 FIX 1) is this node's `last_acked` view of the
 /// TARGET's per-stream applied watermark, read at MANIFEST-FOLD time via
-/// [`crate::server::dispatch::replication_stream_cutoff_for`]. The target's
-/// #29 prune runs only when it applied nothing from our stream past this
-/// cutoff — the proof that the manifest's omissions are not merely
-/// enumeration staleness. It MUST be captured BEFORE the manifest fold (a
-/// pre-fold read under-approximates, which can only defer the prune, never
-/// authorize deleting a post-fold apply) and MUST be reused unchanged for
-/// every retry that re-sends the SAME (possibly reduced) manifest.
+/// [`crate::server::dispatch::replication_stream_cutoff_for`].
+///
+/// W17 — this no longer authorizes anything on the target, and the claim it
+/// used to carry ("the proof that the manifest's omissions are not merely
+/// enumeration staleness") was FALSE. It bounds only what the target took from
+/// OUR stream; the manifest's omissions can just as easily be content the
+/// target took from another node, or content our own fold never saw because
+/// `fenced_keys` is a pre-migration snapshot this function's caller explicitly
+/// tolerates being short. The target consumes the cutoff as a replication-health
+/// comparison only — it retains an omitted key regardless. See
+/// `server::dispatch`'s W17 banner for why no cutoff can carry that proof.
+///
+/// It MUST still be captured BEFORE the manifest fold and reused unchanged for
+/// every retry that re-sends the SAME (possibly reduced) manifest, so the
+/// health signal compares like with like.
 ///
 /// If `stream` is Some, reuses it (avoids a new TCP connection).
 /// Otherwise opens a fresh connection.

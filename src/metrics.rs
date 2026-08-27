@@ -1608,13 +1608,27 @@ pub struct MigrationMetrics {
     /// the shard will stay dual-mastered until the ownership disagreement is
     /// resolved elsewhere.
     pub migration_weak_veto_arbitration_refused: PaddedCounter,
-    /// W10 review P2-2 — local keys the #29 completion prune RETAINED because
-    /// the source declared them as its own WEAK-tombstone omissions (FIX 3).
-    /// Each exclusion is a deliberate refusal to delete on the source's
-    /// omission; it also means the prune's incidental cleanup of a genuinely
-    /// stale local copy of that key no longer happens here (see the residual
-    /// documented at the exclusion site), so the count is the operator's
-    /// visibility into how much residue is being deferred to repair.
+    /// W10 review P2-2 — local keys the #29 completion RETAINED because the
+    /// source declared them as its own WEAK-tombstone omissions (FIX 3).
+    ///
+    /// W17 changed both its meaning and its magnitude, so expect a STEP CHANGE
+    /// ON UPGRADE and do not read it as a regression:
+    ///
+    ///   * MEANING. It used to count refusals-to-delete — the keys spared from
+    ///     a prune that deleted everything else it enumerated. Nothing on this
+    ///     path deletes now, so it no longer records a spared record. What it
+    ///     still records is ATTRIBUTION: this omission is one the source
+    ///     EXPLAINED (its own weak reconcile marker), as against
+    ///     `migration_prune_retained_omitted`, which is residue the source did
+    ///     not explain. "The source knows it is short" versus "the source has
+    ///     no idea it is short" — the second being the stale-master shape.
+    ///   * MAGNITUDE. The enumeration it sits inside is no longer gated on the
+    ///     enumeration-cutoff check, so it now bumps on every
+    ///     authoritative-complete completion whose shard holds more records
+    ///     than the manifest names, where it previously bumped only on the
+    ///     subset of those where the cutoff check also agreed.
+    ///
+    /// Like its sibling it is one-way: nothing reclaims the retained key.
     pub migration_prune_weak_declared_retained: PaddedCounter,
     /// Completions whose enumeration cutoff did not match this node's own
     /// stream watermark (`prune_safe_at_enumeration_cutoff` refused).
@@ -1649,12 +1663,30 @@ pub struct MigrationMetrics {
     /// a manifest folded before the records arrived, or content that reached
     /// this node through a different source's stream entirely).
     ///
-    /// Operationally this is a RESIDUE gauge, not an error: it counts how much
-    /// possibly-stale local content the completion declined to clean up. The
-    /// reconciliation duty sits with the tombstone/RULE-DS veto and the
-    /// committed-handoff-gated orphan cleanup (#28). A steadily rising value
-    /// with no matching orphan-cleanup activity means residue is accumulating
-    /// and should be investigated — it never means data was lost.
+    /// Operationally this is a RESIDUE counter, not an error: it counts how
+    /// much possibly-stale local content the completion declined to clean up.
+    /// It never means data was lost — it exists BECAUSE data is no longer being
+    /// lost here.
+    ///
+    /// # Nothing reclaims what this counts — do not wait for a correlation
+    ///
+    /// An earlier version of this doc said to watch for "a steadily rising
+    /// value with no matching orphan-cleanup activity". That is bad guidance:
+    /// the orphan-cleanup activity for THIS residue is structurally zero, so
+    /// the correlation can never appear. `run_orphan_cleanup`
+    /// (`cluster::coordinator`) skips any shard this node OWNS, and this
+    /// residue is by construction in a shard this node just became a migration
+    /// target for — owned the moment the completion commits. A replicated
+    /// delete cannot reach it either; that would require the authority to
+    /// delete a key it does not hold.
+    ///
+    /// So read this as a ONE-WAY, MONOTONIC count of PERMANENT residue that
+    /// also PROPAGATES: on the next migration where this node is the SOURCE,
+    /// the retained keys sit in `fenced_keys` and are folded into the manifest
+    /// it streams onward as authoritative content. Expect it to rise and never
+    /// fall, and expect the same shard to be recounted on every later
+    /// completion for it. The open owner is convergence-gated promotion, not a
+    /// cleanup path.
     pub migration_prune_retained_omitted: PaddedCounter,
     /// W11 FIX 4(a) — `OP_MIGRATION_TRANSFER_REQUEST` frames this source
     /// refused shards for: either a WHOLE-frame refusal (the requester is
