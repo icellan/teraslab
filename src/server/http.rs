@@ -2598,11 +2598,12 @@ async fn handle_admin_migration_status(State(state): State<Arc<HttpState>>) -> i
             // W12 review NIT — ONE snapshot under a single migration lock, so
             // the four numbers below cannot straddle a concurrent refusal and
             // render an impossible state (refused > pending).
+            //
+            // W17 — the inbound half is rendered by the snapshot itself
+            // (`InboundStatusSnapshot::to_json`), which is where the per-entry
+            // retention CLASS is attributed and unit-tested. The four inbound
+            // fields below are merged from it verbatim.
             let inbound_snapshot = cluster.inbound_status_snapshot();
-            let inbound = inbound_snapshot.pending_count;
-            let inbound_entries = &inbound_snapshot.entries;
-            let refused_retained = &inbound_snapshot.refused_retained;
-            let fenced = inbound_snapshot.fenced_count;
             let active_count = migrations
                 .iter()
                 .filter(|m| {
@@ -2614,19 +2615,9 @@ async fn handle_admin_migration_status(State(state): State<Arc<HttpState>>) -> i
                 .iter()
                 .filter(|m| m.state == crate::cluster::migration::MigrationState::Failed)
                 .count();
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "active_count": active_count,
                 "failed_count": failed_count,
-                "inbound_pending": inbound,
-                "inbound_entries": inbound_entries.iter().map(|(shard, from_node)| {
-                    serde_json::json!({
-                        "shard": shard,
-                        "from_node": from_node.0,
-                        "refused_by_source": refused_retained.contains(&(*shard, *from_node)),
-                    })
-                }).collect::<Vec<_>>(),
-                "inbound_refused_retained": refused_retained.len(),
-                "fenced_shards": fenced,
                 "migrations": migrations.iter().map(|m| {
                     serde_json::json!({
                         "shard": m.shard,
@@ -2639,6 +2630,13 @@ async fn handle_admin_migration_status(State(state): State<Arc<HttpState>>) -> i
                     })
                 }).collect::<Vec<_>>(),
             });
+            if let (Some(body), Some(inbound)) =
+                (body.as_object_mut(), inbound_snapshot.to_json().as_object())
+            {
+                for (k, v) in inbound {
+                    body.insert(k.clone(), v.clone());
+                }
+            }
             (StatusCode::OK, body.to_string())
         }
         None => (

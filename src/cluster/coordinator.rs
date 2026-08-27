@@ -1938,10 +1938,61 @@ pub struct InboundStatusSnapshot {
     /// Every uncompleted `(shard, from_node)` entry.
     pub entries: Vec<(u16, NodeId)>,
     /// The subset of `entries` whose source terminally refused them and which
-    /// the fail-closed record guard retained (`InboundRetention::KeepOrphan`).
+    /// the fail-closed record guard retained, on EITHER ground.
     pub refused_retained: std::collections::HashSet<(u16, NodeId)>,
+    /// W17 — the subset of `refused_retained` retained on the
+    /// [`InboundRetention::KeepHolder`] ground, after the full consecutive
+    /// refusal streak. Its complement within `refused_retained` is the
+    /// [`InboundRetention::KeepOrphan`] class.
+    ///
+    /// Split out because the two make different promises about how long they
+    /// may legitimately stand, and the E2E convergence gate's fatal diagnostic
+    /// names the holder class specifically — it could not demand it while the
+    /// endpoint published only the union.
+    pub refused_holder_terminal: std::collections::HashSet<(u16, NodeId)>,
     /// Shards with a write fence active.
     pub fenced_count: usize,
+}
+
+impl InboundStatusSnapshot {
+    /// Render the inbound half of `/admin/migration_status`.
+    ///
+    /// Lives next to the type rather than in the handler so the CLASS
+    /// attribution is unit-testable without an HTTP server and a live cluster:
+    /// the handler merges the returned object into its body verbatim.
+    ///
+    /// Every entry carries `refused_class` — `"holder_terminal"`, `"orphan"`,
+    /// or `null` for an entry no source has refused. The pre-W17
+    /// `refused_by_source` bool and the combined
+    /// `inbound_refused_retained` count are both preserved: the count is what
+    /// the harness's `in_flight_inbound_pending` subtracts, and neither class
+    /// can progress, so the union remains the right answer to "is a migration
+    /// still running?".
+    pub fn to_json(&self) -> serde_json::Value {
+        let holder_terminal = self.refused_holder_terminal.len();
+        serde_json::json!({
+            "inbound_pending": self.pending_count,
+            "inbound_entries": self.entries.iter().map(|(shard, from_node)| {
+                let key = (*shard, *from_node);
+                let refused = self.refused_retained.contains(&key);
+                serde_json::json!({
+                    "shard": shard,
+                    "from_node": from_node.0,
+                    "refused_by_source": refused,
+                    "refused_class": match (refused, self.refused_holder_terminal.contains(&key)) {
+                        (false, _) => serde_json::Value::Null,
+                        (true, true) => serde_json::Value::from("holder_terminal"),
+                        (true, false) => serde_json::Value::from("orphan"),
+                    },
+                })
+            }).collect::<Vec<_>>(),
+            "inbound_refused_retained": self.refused_retained.len(),
+            "inbound_refused_retained_holder_terminal": holder_terminal,
+            "inbound_refused_retained_orphan":
+                self.refused_retained.len().saturating_sub(holder_terminal),
+            "fenced_shards": self.fenced_count,
+        })
+    }
 }
 
 /// W12 review P1-1 — the fail-closed retention judgement for a pending inbound
@@ -24055,6 +24106,14 @@ impl RunningCluster {
             entries: mgr.pending_inbound_entries(),
             refused_retained: mgr
                 .refused_retained_inbound_entries()
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
+            // W17 — taken under the SAME lock as its superset, for the reason
+            // this whole snapshot exists: read through separate accessors, a
+            // concurrent re-classification could render a holder-terminal
+            // count larger than the union it is a subset of.
+            refused_holder_terminal: mgr
+                .refused_retained_holder_terminal_entries()
                 .into_iter()
                 .collect::<std::collections::HashSet<_>>(),
             fenced_count: mgr.fenced_count(),

@@ -591,6 +591,43 @@ pub fn refused_retained_inbound(json: &serde_json::Value) -> u64 {
     json["inbound_refused_retained"].as_u64().unwrap_or(0)
 }
 
+/// W17 — the same census, SPLIT BY RETENTION CLASS.
+///
+/// The two classes are opposite states that happen to share a disposition, and
+/// they promise different things about how long they may legitimately stand —
+/// see [`RefusedResidueClass`]. The combined count above stays the answer to
+/// "is a migration still running?"; this is the answer to "is anything stuck,
+/// and stuck how?".
+///
+/// A server that reports the total but not the split (any build before W17) has
+/// its whole residue attributed to the ORPHAN class. That is the fail-closed
+/// direction for TIMING: the orphan grace is the longer of the two, so an
+/// unclassifiable residue is never failed on the shorter clock — which is
+/// exactly the wave-16 defect this split exists to remove. The residue itself
+/// is never dropped, so the VERDICT stays fail-closed too.
+pub fn refused_residue_counts(json: &serde_json::Value) -> RefusedResidue {
+    let total = refused_retained_inbound(json);
+    if total == 0 {
+        return RefusedResidue::default();
+    }
+    match (
+        json["inbound_refused_retained_holder_terminal"].as_u64(),
+        json["inbound_refused_retained_orphan"].as_u64(),
+    ) {
+        (Some(holder_terminal), Some(orphan)) => RefusedResidue {
+            holder_terminal,
+            orphan,
+        },
+        // Only one half named, or neither: the answer cannot be trusted to
+        // attribute anything to the SHORT clock, so all of it takes the long
+        // one.
+        _ => RefusedResidue {
+            holder_terminal: 0,
+            orphan: total,
+        },
+    }
+}
+
 /// W12 TAIL 2 — the inbound entries that can still make progress.
 ///
 /// `inbound_pending` counts two opposite things. A plain pending entry is
@@ -619,7 +656,57 @@ pub fn in_flight_inbound_pending(json: &serde_json::Value) -> u64 {
     pending.saturating_sub(refused_retained_inbound(json))
 }
 
-/// W16 — how long a terminally-refused residue may persist before a convergence
+/// W17 — the per-class census of terminally-refused retained inbound entries a
+/// node reports.
+///
+/// `refused_by_source` is set on two OPPOSITE states that happen to share a
+/// disposition, and the gate below has to tell them apart. See
+/// [`RefusedResidueClass`] for what each one costs to earn and how it clears.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RefusedResidue {
+    /// Entries this node HOLDS whose source has refused them for
+    /// `REFUSED_HOLDER_TERMINAL_ROUNDS` consecutive rounds.
+    pub holder_terminal: u64,
+    /// Entries for shards this node does NOT hold, retained only over local
+    /// orphan records. Marked on the FIRST refusal.
+    pub orphan: u64,
+}
+
+impl RefusedResidue {
+    /// Every retained entry, of either class — what `inbound_refused_retained`
+    /// reports and what [`in_flight_inbound_pending`] subtracts.
+    pub fn total(self) -> u64 {
+        self.holder_terminal.saturating_add(self.orphan)
+    }
+}
+
+/// W17 — which retention class a residue belongs to, and therefore which grace
+/// it is judged by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedResidueClass {
+    /// This node is the shard's HOLDER and its copy is unproven. Nothing may
+    /// reclaim it — not orphan cleanup (the ownership test excludes it), not
+    /// the W17 exemption. Only a re-planned handoff clears it, so the only
+    /// question the grace asks is whether one arrives.
+    HolderTerminal,
+    /// This node is a NON-holder sitting on orphan records. Resolvable, on the
+    /// orphan-cleanup path: the pass reclaims the records and the ordinary
+    /// prune then retires the entry and drops the fence.
+    Orphan,
+}
+
+impl RefusedResidueClass {
+    /// How long a residue of this class may stand before the gate calls it
+    /// terminal.
+    fn grace(self) -> Duration {
+        match self {
+            Self::HolderTerminal => REFUSED_HOLDER_TERMINAL_GRACE,
+            Self::Orphan => REFUSED_ORPHAN_GRACE,
+        }
+    }
+}
+
+/// W16 — how long a HOLDER-TERMINAL residue may persist before a convergence
 /// gate calls it FATAL.
 ///
 /// Mirrors `SAME_TERM_REACTIVATION_COOLDOWN` (`src/cluster/coordinator.rs`,
@@ -630,75 +717,168 @@ pub fn in_flight_inbound_pending(json: &serde_json::Value) -> u64 {
 /// between "the source refused six times in a row" (what the mark proves) and
 /// "and nothing re-planned it afterwards either" (what makes it terminal).
 ///
-/// The server-side mark already costs six consecutive refusals — 60 s at the
-/// 10 s `TRANSFER_REQUEST_INTERVAL` — so a gate can only fail on this after
-/// ~90 s of a shard being fenced with nothing coming for it. It cannot fire on a
+/// This class's server-side mark costs six consecutive refusals — 60 s at the
+/// 10 s `TRANSFER_REQUEST_INTERVAL` — so a gate can only fail on it after ~90 s
+/// of a shard being fenced with nothing coming for it. It cannot fire on a
 /// transient source-table divergence.
-const REFUSED_RESIDUE_GRACE: Duration = Duration::from_secs(30);
-
-/// W16 — track how long a terminally-refused residue has been continuously
-/// observed: `Some(first_seen)` while it stands, `None` the moment it clears.
 ///
-/// Clearing on zero is what keeps the grace window honest. The mark is
-/// revocable by design (a batch arriving, a task or re-registration, a re-park,
-/// or the source matching the request in a later round all clear it), so a
-/// residue that comes back later starts a NEW window rather than resuming a
-/// half-spent one.
+/// W17 — that guarantee is TRUE only of this class, and until W17 the gate
+/// could not demand it: it read the combined count, which also carries
+/// `KeepOrphan` entries marked on their FIRST refusal. CI 32668963874 failed
+/// twelve of those after three refusal rounds while the message claimed six.
+/// The orphan class has its own, longer window — see [`REFUSED_ORPHAN_GRACE`].
+const REFUSED_HOLDER_TERMINAL_GRACE: Duration = Duration::from_secs(30);
+
+/// W17 — how long an ORPHAN-class residue may persist before a convergence gate
+/// calls it FATAL.
+///
+/// Longer than [`REFUSED_HOLDER_TERMINAL_GRACE`], for two reasons that both
+/// point the same way:
+///
+/// * the mark is EARNED CHEAPLY. `drop_refused_inbound` sets it on the FIRST
+///   refusal for a non-holder, ~10 s after the entry is registered — there is
+///   no streak behind it to spend part of the budget;
+/// * it CLEARS SLOWLY. The path that resolves it is orphan cleanup reclaiming
+///   the records, and the steady-state pass is rate-limited to one per
+///   `EVENT_ORPHAN_CLEANUP_MIN_INTERVAL` (60 s, `src/cluster/coordinator.rs`).
+///   A 30 s verdict can therefore fail a residue that was about to clear on its
+///   own before the first pass even fires.
+///
+/// Two cleanup intervals plus a pass. Still decisive — a genuinely stranded
+/// residue (the W17 circular wait: no committed-handoff evidence, disarmed
+/// proof-of-elsewhere) never clears at all, and fails here.
+const REFUSED_ORPHAN_GRACE: Duration = Duration::from_secs(120);
+
+/// W17 — the per-class window state a polling gate carries: `Some(first_seen)`
+/// while that class's residue stands, `None` the moment it clears.
+///
+/// Per class, not per node and not combined. A holder-terminal residue that
+/// appears while an orphan residue is already standing must get its own full
+/// window, and an orphan residue that clears must not leave a half-spent window
+/// behind for a later one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RefusedResidueWindows {
+    holder_terminal: Option<std::time::Instant>,
+    orphan: Option<std::time::Instant>,
+}
+
+/// W16/W17 — advance the per-class windows with this poll's observation.
+///
+/// Clearing on zero is what keeps the grace honest. The mark is revocable by
+/// design (a batch arriving, a task or re-registration, a re-park, the source
+/// matching the request in a later round, or — for the orphan class — orphan
+/// cleanup reclaiming the records), so a residue that comes back later starts a
+/// NEW window rather than resuming a half-spent one.
 fn note_refused_residue(
-    seen_since: Option<std::time::Instant>,
-    total_refused_retained: u64,
+    windows: RefusedResidueWindows,
+    seen: RefusedResidue,
     now: std::time::Instant,
-) -> Option<std::time::Instant> {
-    if total_refused_retained == 0 {
-        return None;
+) -> RefusedResidueWindows {
+    let advance = |window: Option<std::time::Instant>, count: u64| {
+        if count == 0 {
+            None
+        } else {
+            Some(window.unwrap_or(now))
+        }
+    };
+    RefusedResidueWindows {
+        holder_terminal: advance(windows.holder_terminal, seen.holder_terminal),
+        orphan: advance(windows.orphan, seen.orphan),
     }
-    Some(seen_since.unwrap_or(now))
 }
 
-/// W16 — has an observed residue outlasted [`REFUSED_RESIDUE_GRACE`]?
-fn refused_residue_is_fatal(
-    seen_since: Option<std::time::Instant>,
+/// W17 — the class whose residue has outlasted ITS OWN grace, if any.
+///
+/// Checked holder-first only for determinism when both have expired; the two
+/// windows are otherwise independent.
+fn refused_residue_fatal_class(
+    windows: RefusedResidueWindows,
     now: std::time::Instant,
-) -> bool {
-    seen_since.is_some_and(|since| now.saturating_duration_since(since) >= REFUSED_RESIDUE_GRACE)
+) -> Option<RefusedResidueClass> {
+    let expired = |window: Option<std::time::Instant>, class: RefusedResidueClass| {
+        window
+            .is_some_and(|since| now.saturating_duration_since(since) >= class.grace())
+            .then_some(class)
+    };
+    expired(windows.holder_terminal, RefusedResidueClass::HolderTerminal)
+        .or_else(|| expired(windows.orphan, RefusedResidueClass::Orphan))
 }
 
-/// W16 — the diagnostic a fatal residue fails with.
+/// W16/W17 — the diagnostic a fatal residue fails with, stating the guarantee
+/// the gate ACTUALLY enforced for the class that expired.
 ///
 /// This is NOT convergence. Every entry it counts is a shard left FENCED and
-/// client-invisible on its own node, that no transfer will ever un-fence — and
-/// in the armed-09 shape it is not even slow-but-completable: the source's
-/// completion handshake failed the strict `actual == expected_records` check
-/// against a target holding a SUPERSET, which retrying cannot satisfy. A gate
-/// that went green there would be reporting something false about the cluster.
+/// client-invisible on its own node. The holder variant is the armed-09 shape:
+/// not slow-but-completable, but uncompletable — the source's completion
+/// handshake failed the strict `actual == expected_records` check against a
+/// target holding a SUPERSET, which retrying cannot satisfy. The orphan variant
+/// is the W17 circular wait: the shard's records could only ever be reclaimed by
+/// orphan cleanup, and they were not.
 ///
 /// The count is discounted from `in_flight_inbound_pending` because the question
 /// THAT asks — "is a migration still running?" — genuinely answers no. This is
 /// the separate question, asked separately.
-fn refused_residue_error(total_refused_retained: u64, node_details: &[String]) -> String {
+fn refused_residue_error(
+    class: RefusedResidueClass,
+    seen: RefusedResidue,
+    node_details: &[String],
+) -> String {
     let refused_details: Vec<&str> = node_details
         .iter()
         .filter(|d| d.contains("inbound-refused-retained"))
         .map(|d| d.as_str())
         .collect();
+    let (count, condition) = match class {
+        RefusedResidueClass::HolderTerminal => (
+            seen.holder_terminal,
+            format!(
+                "refused by {{POSS}} own source for `REFUSED_HOLDER_TERMINAL_ROUNDS` consecutive \
+                 rounds and still FENCED after a further {REFUSED_HOLDER_TERMINAL_GRACE:?}"
+            ),
+        ),
+        RefusedResidueClass::Orphan => (
+            seen.orphan,
+            format!(
+                "refused by {{POSS}} own source and still FENCED over local orphan records that \
+                 orphan cleanup did not reclaim in {REFUSED_ORPHAN_GRACE:?}"
+            ),
+        ),
+    };
+    let condition = condition.replace("{POSS}", if count == 1 { "its" } else { "their" });
     format!(
-        "TERMINALLY REFUSED INBOUND RESIDUE — {total_refused_retained} inbound entr{} \
-         refused by {} own source for `REFUSED_HOLDER_TERMINAL_ROUNDS` consecutive rounds and \
-         still FENCED after a further {REFUSED_RESIDUE_GRACE:?}: the shard(s) stay \
-         client-invisible on that node and no transfer will ever un-fence them. This is not \
+        "TERMINALLY REFUSED INBOUND RESIDUE — {count} inbound entr{} {condition}: the shard(s) \
+         stay client-invisible on that node and no transfer will ever un-fence them. This is not \
          convergence [{}]",
-        if total_refused_retained == 1 {
-            "y"
-        } else {
-            "ies"
-        },
-        if total_refused_retained == 1 {
-            "its"
-        } else {
-            "their"
-        },
+        if count == 1 { "y" } else { "ies" },
         refused_details.join(", "),
     )
+}
+
+/// W17 — accumulate ONE node's per-class residue into the run-wide census, and
+/// name it in the per-node detail the fatal diagnostic quotes.
+///
+/// Both convergence gates poll the same endpoint and must reach the same
+/// verdict, so the accumulation and the detail formatting live in one place.
+/// The detail carries the split, not just the total: a residue that fails the
+/// run has to say which class expired, on which node.
+fn accumulate_refused_residue(
+    total: &mut RefusedResidue,
+    details: &mut Vec<String>,
+    node_num: u32,
+    json: &serde_json::Value,
+) {
+    let seen = refused_residue_counts(json);
+    if seen.total() == 0 {
+        return;
+    }
+    total.holder_terminal = total.holder_terminal.saturating_add(seen.holder_terminal);
+    total.orphan = total.orphan.saturating_add(seen.orphan);
+    details.push(format!(
+        "node{node_num}:inbound-refused-retained={}(holder-terminal={},orphan={})",
+        seen.total(),
+        seen.holder_terminal,
+        seen.orphan,
+    ));
 }
 
 /// Wait until migrations complete on specific nodes (by node number).
@@ -719,12 +899,12 @@ pub async fn wait_specific_migrations_complete(
 ) -> Result<(), ClientError> {
     let start = std::time::Instant::now();
     let mut ready_polls = 0u32;
-    let mut refused_since: Option<std::time::Instant> = None;
+    let mut refused_windows = RefusedResidueWindows::default();
     loop {
         let mut all_idle = true;
         let mut total_masters: u64 = 0;
         let mut total_inbound_pending: u64 = 0;
-        let mut total_refused_retained: u64 = 0;
+        let mut total_refused_retained = RefusedResidue::default();
         let mut total_pending_handoffs: u64 = 0;
         let mut status_details = Vec::new();
         for &n in node_nums {
@@ -736,12 +916,13 @@ pub async fn wait_specific_migrations_complete(
                 // W12 TAIL 2 — only entries that can still progress hold the
                 // gate; terminally-refused ones are reported below.
                 inbound_pending = in_flight_inbound_pending(&json);
-                let refused = refused_retained_inbound(&json);
                 total_inbound_pending += inbound_pending;
-                total_refused_retained += refused;
-                if refused > 0 {
-                    status_details.push(format!("node{n}:inbound-refused-retained={refused}"));
-                }
+                accumulate_refused_residue(
+                    &mut total_refused_retained,
+                    &mut status_details,
+                    n,
+                    &json,
+                );
                 if let Some(count) = json["active_count"].as_u64() {
                     active_count = Some(count);
                     if count > 0 {
@@ -779,19 +960,19 @@ pub async fn wait_specific_migrations_complete(
         // ends the wait outright: nothing will clear it, and burning the rest of
         // the budget only delays a failure that is already decided.
         let now = std::time::Instant::now();
-        refused_since = note_refused_residue(refused_since, total_refused_retained, now);
-        if refused_residue_is_fatal(refused_since, now) {
+        refused_windows = note_refused_residue(refused_windows, total_refused_retained, now);
+        if let Some(class) = refused_residue_fatal_class(refused_windows, now) {
             return Err(ClientError::Connection(format!(
                 "{} [masters={total_masters}/4096, handoffs={total_pending_handoffs}, \
                  inbound={total_inbound_pending}] [{}]",
-                refused_residue_error(total_refused_retained, &status_details),
+                refused_residue_error(class, total_refused_retained, &status_details),
                 status_details.join(", "),
             )));
         }
         if total_masters == 4096
             && total_pending_handoffs == 0
             && total_inbound_pending == 0
-            && total_refused_retained == 0
+            && total_refused_retained.total() == 0
             && all_idle
         {
             ready_polls += 1;
@@ -826,10 +1007,21 @@ pub async fn wait_specific_migrations_complete(
             } else {
                 String::new()
             };
-            let residue = if total_refused_retained > 0 {
+            let residue = if total_refused_retained.total() > 0 {
                 format!(
                     " [{}]",
-                    refused_residue_error(total_refused_retained, &status_details)
+                    refused_residue_error(
+                        // The wait ran out of budget rather than expiring a
+                        // window, so no class is decided; report the one that
+                        // dominates the residue.
+                        if total_refused_retained.holder_terminal >= total_refused_retained.orphan {
+                            RefusedResidueClass::HolderTerminal
+                        } else {
+                            RefusedResidueClass::Orphan
+                        },
+                        total_refused_retained,
+                        &status_details,
+                    )
                 )
             } else {
                 String::new()
@@ -1241,16 +1433,17 @@ pub async fn wait_migrations_complete(
     // Retained divergence verdict for the timeout dump (diagnostic only —
     // see the demotion note at the check site).
     let mut divergence_note: Option<String> = None;
-    // W16 — when a terminally-refused residue was FIRST seen, cleared whenever
-    // a poll sees none (the mark is revocable, so a residue that returns starts
-    // a fresh window). See `note_refused_residue`.
-    let mut refused_since: Option<std::time::Instant> = None;
+    // W16/W17 — when a terminally-refused residue of each CLASS was FIRST
+    // seen, cleared whenever a poll sees none of that class (the mark is
+    // revocable, so a residue that returns starts a fresh window). See
+    // `note_refused_residue`.
+    let mut refused_windows = RefusedResidueWindows::default();
     loop {
         let mut all_idle = true;
         let mut total_masters: u64 = 0;
         let mut total_pending_handoffs: u64 = 0;
         let mut total_inbound_pending: u64 = 0;
-        let mut total_refused_retained: u64 = 0;
+        let mut total_refused_retained = RefusedResidue::default();
         let mut node_details = Vec::new();
         let mut shard_views: Vec<NodeShardView> = Vec::new();
         let mut complete_status_answers: u32 = 0;
@@ -1264,9 +1457,7 @@ pub async fn wait_migrations_complete(
                 // gate and reported separately (see
                 // `in_flight_inbound_pending`).
                 let inbound_pending = in_flight_inbound_pending(&json);
-                let refused = refused_retained_inbound(&json);
                 total_inbound_pending += inbound_pending;
-                total_refused_retained += refused;
                 if let Some(count) = json["active_count"].as_u64()
                     && count > 0
                 {
@@ -1276,9 +1467,12 @@ pub async fn wait_migrations_complete(
                 if inbound_pending > 0 {
                     node_details.push(format!("node{i}:inbound={inbound_pending}"));
                 }
-                if refused > 0 {
-                    node_details.push(format!("node{i}:inbound-refused-retained={refused}"));
-                }
+                accumulate_refused_residue(
+                    &mut total_refused_retained,
+                    &mut node_details,
+                    i,
+                    &json,
+                );
             } else {
                 node_details.push(format!("node{i}:migration-status-unavailable"));
             }
@@ -1383,12 +1577,12 @@ pub async fn wait_migrations_complete(
         // the wait outright: nothing will clear it, and burning the rest of the
         // budget only delays a failure that is already decided.
         let now = std::time::Instant::now();
-        refused_since = note_refused_residue(refused_since, total_refused_retained, now);
-        if refused_residue_is_fatal(refused_since, now) {
+        refused_windows = note_refused_residue(refused_windows, total_refused_retained, now);
+        if let Some(class) = refused_residue_fatal_class(refused_windows, now) {
             return Err(ClientError::Connection(format!(
                 "{} [masters={total_masters}/4096, handoffs={total_pending_handoffs}, \
                  inbound={total_inbound_pending}, activation={}] [{}]",
-                refused_residue_error(total_refused_retained, &node_details),
+                refused_residue_error(class, total_refused_retained, &node_details),
                 activation_reason.as_deref().unwrap_or("ok"),
                 node_details.join(", "),
             )));
@@ -1396,7 +1590,7 @@ pub async fn wait_migrations_complete(
         if masters_ok
             && total_pending_handoffs == 0
             && total_inbound_pending == 0
-            && total_refused_retained == 0
+            && total_refused_retained.total() == 0
             && all_idle
         {
             ready_polls += 1;
@@ -1440,10 +1634,21 @@ pub async fn wait_migrations_complete(
             // The activation reason carries the per-node serving/target dump,
             // so a gate held ONLY by an unactivated table names the nodes
             // holding it instead of leaving `masters=4096` looking settled.
-            let residue = if total_refused_retained > 0 {
+            let residue = if total_refused_retained.total() > 0 {
                 format!(
                     " [{}]",
-                    refused_residue_error(total_refused_retained, &node_details)
+                    refused_residue_error(
+                        // The wait ran out of budget rather than expiring a
+                        // window, so no class is decided; report the one that
+                        // dominates the residue.
+                        if total_refused_retained.holder_terminal >= total_refused_retained.orphan {
+                            RefusedResidueClass::HolderTerminal
+                        } else {
+                            RefusedResidueClass::Orphan
+                        },
+                        total_refused_retained,
+                        &node_details,
+                    )
                 )
             } else {
                 String::new()
