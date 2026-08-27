@@ -29938,6 +29938,73 @@ mod tests {
         );
     }
 
+    /// W17 (RED→GREEN) — `/admin/migration_status` must name WHICH refusal
+    /// class each retained entry belongs to.
+    ///
+    /// The wave-16 convergence gate fails with *"refused by their own source
+    /// for `REFUSED_HOLDER_TERMINAL_ROUNDS` consecutive rounds"*, but the only
+    /// thing the endpoint published was a single `refused_by_source` bool and
+    /// a combined count, so the gate could not demand the class its own message
+    /// names. In CI 32668963874 it fired on twelve `KeepOrphan` entries — a
+    /// class marked on the FIRST refusal — after three refusal rounds, not six.
+    ///
+    /// Fail-before: the rendered JSON has no way to tell the classes apart.
+    #[test]
+    fn migration_status_json_names_each_refusal_class() {
+        let holder = (7u16, NodeId(2));
+        let orphan = (9u16, NodeId(3));
+        let live = (11u16, NodeId(4));
+        let snapshot = InboundStatusSnapshot {
+            pending_count: 3,
+            entries: vec![holder, orphan, live],
+            refused_retained: [holder, orphan].into_iter().collect(),
+            refused_holder_terminal: [holder].into_iter().collect(),
+            fenced_count: 3,
+        };
+
+        let json = snapshot.to_json();
+
+        assert_eq!(
+            json["inbound_pending"], 3,
+            "the pending count is unchanged — both classes are still fenced",
+        );
+        assert_eq!(
+            json["inbound_refused_retained"], 2,
+            "the combined count keeps its meaning: it is what \
+             `in_flight_inbound_pending` subtracts, and neither class can \
+             progress",
+        );
+        assert_eq!(json["inbound_refused_retained_holder_terminal"], 1);
+        assert_eq!(json["inbound_refused_retained_orphan"], 1);
+
+        let entries = json["inbound_entries"]
+            .as_array()
+            .expect("inbound_entries must be an array");
+        let class_of = |shard: u16| -> String {
+            entries
+                .iter()
+                .find(|e| e["shard"] == shard)
+                .map(|e| e["refused_class"].to_string())
+                .unwrap_or_else(|| panic!("shard {shard} missing from the render"))
+        };
+        assert_eq!(class_of(7), "\"holder_terminal\"");
+        assert_eq!(class_of(9), "\"orphan\"");
+        assert_eq!(
+            class_of(11),
+            "null",
+            "an entry no source has refused has no class — it is a transfer \
+             that can still arrive",
+        );
+        // The pre-W17 field stays, so an older reader keeps working.
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e["refused_by_source"] == true)
+                .count(),
+            2,
+        );
+    }
+
     // -----------------------------------------------------------------
     // W12 — proof-of-elsewhere for the #28 fail-closed retain
     // -----------------------------------------------------------------

@@ -3965,113 +3965,279 @@ mod migration_gate_tests {
         assert_eq!(in_flight_inbound_pending(&inconsistent), 0);
     }
 
-    /// W16 (RED→GREEN) — a terminally-refused residue that survives one full
-    /// re-heal window FAILS the convergence gate. It is not convergence.
+    /// W16/W17 (RED→GREEN) — a terminally-refused residue that outlasts the
+    /// grace its OWN CLASS earns FAILS the convergence gate. It is not
+    /// convergence.
     ///
     /// Discounting it from `in_flight_inbound_pending` is right — no migration
     /// is running — and it is what stops armed 09's nine entries from wedging
     /// every scenario for the whole budget. But letting the gate then return
-    /// `Ok` would be reporting something false: those nine shards are FENCED
-    /// and client-invisible on their own master, and the transfer is not slow,
-    /// it is UNCOMPLETABLE — the source's handshake failed the strict
-    /// `actual == expected_records` check against a target holding a SUPERSET
-    /// (`expected N, got N+1`), which no retry can satisfy.
+    /// `Ok` would be reporting something false: those shards are FENCED, and
+    /// the transfer is not slow, it is UNCOMPLETABLE.
     ///
-    /// The grace window is what makes the verdict safe rather than merely
-    /// strict: the server-side mark already costs six consecutive refusals
-    /// (60 s), and the mark is revocable by any evidence of real work, so a
-    /// late re-plan clears it. Failing only after a further
-    /// `REFUSED_RESIDUE_GRACE` means the gate fails on "refused six times AND
-    /// nothing re-planned it for a whole re-heal window after that".
+    /// W17 — the grace is per class, because the two classes cost different
+    /// amounts to earn and resolve on different paths. A HOLDER-terminal mark
+    /// already costs six consecutive refusals (60 s at the 10 s transfer-request
+    /// interval), so a further [`REFUSED_HOLDER_TERMINAL_GRACE`] means the gate
+    /// fails on "refused six times AND nothing re-planned it for a whole
+    /// re-heal window after that".
     #[test]
-    fn a_refused_residue_fails_the_gate_after_one_reheal_window() {
+    fn a_holder_terminal_residue_fails_the_gate_after_one_reheal_window() {
         let t0 = std::time::Instant::now();
+        let none = RefusedResidueWindows::default();
+        let seen = RefusedResidue {
+            holder_terminal: 9,
+            orphan: 0,
+        };
 
         // Nothing observed: no window, never fatal.
-        assert_eq!(note_refused_residue(None, 0, t0), None);
-        assert!(!refused_residue_is_fatal(
+        assert_eq!(
+            note_refused_residue(none, RefusedResidue::default(), t0),
+            none,
+        );
+        assert_eq!(
+            refused_residue_fatal_class(none, t0 + REFUSED_ORPHAN_GRACE * 10),
             None,
-            t0 + REFUSED_RESIDUE_GRACE * 10
-        ));
+        );
 
         // First observation opens the window and does NOT fail immediately —
         // the mark is revocable, so an instant verdict would fail a run whose
         // re-heal was about to re-plan the handoff.
-        let opened = note_refused_residue(None, 9, t0).expect("a residue opens a window");
+        let opened = note_refused_residue(none, seen, t0);
         assert_eq!(
-            opened, t0,
-            "the window starts when the residue is FIRST seen"
+            opened.holder_terminal,
+            Some(t0),
+            "the window starts when the residue is FIRST seen",
         );
-        assert!(
-            !refused_residue_is_fatal(Some(opened), t0),
+        assert_eq!(
+            opened.orphan, None,
+            "a class that was never seen must not open a window",
+        );
+        assert_eq!(
+            refused_residue_fatal_class(opened, t0),
+            None,
             "an instant verdict would leave no room for a late re-plan",
         );
-        assert!(
-            !refused_residue_is_fatal(Some(opened), t0 + REFUSED_RESIDUE_GRACE / 2),
+        assert_eq!(
+            refused_residue_fatal_class(opened, t0 + REFUSED_HOLDER_TERMINAL_GRACE / 2),
+            None,
             "half a re-heal window is not a full one",
         );
 
         // A later poll that still sees the residue must NOT restart the clock,
         // or the gate could never reach a verdict at a 50 ms poll cadence.
-        let still = note_refused_residue(Some(opened), 9, t0 + REFUSED_RESIDUE_GRACE / 2);
-        assert_eq!(still, Some(opened), "a continuing residue keeps its window");
+        let still = note_refused_residue(opened, seen, t0 + REFUSED_HOLDER_TERMINAL_GRACE / 2);
+        assert_eq!(
+            still, opened,
+            "a continuing residue keeps its window, per class",
+        );
 
-        assert!(
-            refused_residue_is_fatal(still, t0 + REFUSED_RESIDUE_GRACE),
+        assert_eq!(
+            refused_residue_fatal_class(still, t0 + REFUSED_HOLDER_TERMINAL_GRACE),
+            Some(RefusedResidueClass::HolderTerminal),
             "refused six consecutive rounds AND unchanged for a further \
-             {REFUSED_RESIDUE_GRACE:?} is terminal",
+             {REFUSED_HOLDER_TERMINAL_GRACE:?} is terminal",
         );
     }
 
-    /// W16 (RED→GREEN) — a residue that CLEARS closes its window, so a later
-    /// one starts a fresh full grace period.
+    /// W17 (RED→GREEN) — the ORPHAN class must not be judged by the holder
+    /// class's clock, and the gate's stated guarantee must be true of it.
+    ///
+    /// `drop_refused_inbound` marks a `KeepOrphan` entry on its FIRST refusal —
+    /// W12 behaviour that predates the six-round streak entirely — so the
+    /// wave-16 doc's *"the server-side mark already costs six consecutive
+    /// refusals … so a gate can only fail on this after ~90 s"* was simply
+    /// false for half of what the gauge counted. CI 32668963874 failed on
+    /// twelve such entries after three refusal rounds and 30 s.
+    ///
+    /// An orphan residue is also RESOLVABLE, on a slower path: orphan cleanup
+    /// reclaims the records and the ordinary prune then retires the entry. That
+    /// pass is rate-limited to one per `EVENT_ORPHAN_CLEANUP_MIN_INTERVAL`
+    /// (60 s), so a 30 s verdict could fail a residue that was about to clear
+    /// on its own. The grace has to cover the cleanup cadence, not the refusal
+    /// cadence.
+    #[test]
+    fn an_orphan_residue_gets_the_orphan_cleanup_cadence_not_the_reheal_window() {
+        assert!(
+            REFUSED_ORPHAN_GRACE > REFUSED_HOLDER_TERMINAL_GRACE,
+            "an orphan entry is marked on its FIRST refusal and clears on a \
+             60 s cleanup cadence — judging it on the holder clock is the \
+             wave-16 false positive",
+        );
+        let t0 = std::time::Instant::now();
+        let seen = RefusedResidue {
+            holder_terminal: 0,
+            orphan: 12,
+        };
+        let opened = note_refused_residue(RefusedResidueWindows::default(), seen, t0);
+        assert_eq!(opened.orphan, Some(t0));
+        assert_eq!(opened.holder_terminal, None);
+
+        assert_eq!(
+            refused_residue_fatal_class(opened, t0 + REFUSED_HOLDER_TERMINAL_GRACE),
+            None,
+            "the holder grace says nothing about an orphan residue — this is \
+             exactly the run the wave-16 gate failed at 30 s",
+        );
+        assert_eq!(
+            refused_residue_fatal_class(opened, t0 + REFUSED_ORPHAN_GRACE),
+            Some(RefusedResidueClass::Orphan),
+            "…but a genuinely terminal orphan residue must still fail — the \
+             gate is narrowed to the honest window, not until nothing fails",
+        );
+    }
+
+    /// W17 — each class runs its own clock, and the first to expire decides.
+    #[test]
+    fn the_two_classes_track_independent_windows() {
+        let t0 = std::time::Instant::now();
+        // The orphan residue is seen first, the holder residue much later.
+        let w = note_refused_residue(
+            RefusedResidueWindows::default(),
+            RefusedResidue {
+                holder_terminal: 0,
+                orphan: 4,
+            },
+            t0,
+        );
+        let holder_seen_at = t0 + REFUSED_HOLDER_TERMINAL_GRACE;
+        let w = note_refused_residue(
+            w,
+            RefusedResidue {
+                holder_terminal: 1,
+                orphan: 4,
+            },
+            holder_seen_at,
+        );
+        assert_eq!(w.orphan, Some(t0), "the orphan window is not restarted");
+        assert_eq!(w.holder_terminal, Some(holder_seen_at));
+
+        // The holder window expires first even though it opened later.
+        assert_eq!(
+            refused_residue_fatal_class(w, holder_seen_at + REFUSED_HOLDER_TERMINAL_GRACE),
+            Some(RefusedResidueClass::HolderTerminal),
+        );
+    }
+
+    /// W16/W17 (RED→GREEN) — a residue that CLEARS closes its window, per
+    /// class, so a later one starts a fresh full grace period.
     ///
     /// The mark is revoked by any evidence of real work (a batch arriving, a
     /// task or re-registration, a re-park, or the source matching the request
-    /// in a later round). Carrying a half-spent window across that revocation
-    /// would let a cluster that demonstrably recovered be failed by the ghost
-    /// of an earlier residue.
+    /// in a later round), and an ORPHAN mark also clears when orphan cleanup
+    /// reclaims the records holding its fence up. Carrying a half-spent window
+    /// across that revocation would let a cluster that demonstrably recovered
+    /// be failed by the ghost of an earlier residue.
     #[test]
     fn a_residue_that_clears_starts_a_fresh_window() {
         let t0 = std::time::Instant::now();
-        let opened = note_refused_residue(None, 2, t0);
-        assert_eq!(opened, Some(t0));
+        let seen = RefusedResidue {
+            holder_terminal: 0,
+            orphan: 2,
+        };
+        let opened = note_refused_residue(RefusedResidueWindows::default(), seen, t0);
+        assert_eq!(opened.orphan, Some(t0));
 
-        // The re-heal re-planned it and a batch arrived: the server cleared the
-        // mark, so the gate must forget the window.
-        let cleared = note_refused_residue(opened, 0, t0 + REFUSED_RESIDUE_GRACE / 2);
-        assert_eq!(cleared, None, "zero residue closes the window");
-        assert!(!refused_residue_is_fatal(
+        // Orphan cleanup reclaimed the records and the prune retired the
+        // entry: the gate must forget the window.
+        let cleared = note_refused_residue(
+            opened,
+            RefusedResidue::default(),
+            t0 + REFUSED_ORPHAN_GRACE / 2,
+        );
+        assert_eq!(
             cleared,
-            t0 + REFUSED_RESIDUE_GRACE * 5
-        ));
+            RefusedResidueWindows::default(),
+            "zero residue closes the window",
+        );
+        assert_eq!(
+            refused_residue_fatal_class(cleared, t0 + REFUSED_ORPHAN_GRACE * 5),
+            None,
+        );
 
         // A residue appearing again later is judged on its OWN window.
-        let reopened_at = t0 + REFUSED_RESIDUE_GRACE;
-        let reopened = note_refused_residue(cleared, 2, reopened_at);
-        assert_eq!(reopened, Some(reopened_at));
-        assert!(
-            !refused_residue_is_fatal(reopened, reopened_at + REFUSED_RESIDUE_GRACE / 2),
+        let reopened_at = t0 + REFUSED_ORPHAN_GRACE;
+        let reopened = note_refused_residue(cleared, seen, reopened_at);
+        assert_eq!(reopened.orphan, Some(reopened_at));
+        assert_eq!(
+            refused_residue_fatal_class(reopened, reopened_at + REFUSED_ORPHAN_GRACE / 2),
+            None,
             "the new residue must get a full window, not the remainder of the old one",
         );
-        assert!(refused_residue_is_fatal(
-            reopened,
-            reopened_at + REFUSED_RESIDUE_GRACE
-        ));
+        assert_eq!(
+            refused_residue_fatal_class(reopened, reopened_at + REFUSED_ORPHAN_GRACE),
+            Some(RefusedResidueClass::Orphan),
+        );
     }
 
-    /// W16 — the failure has to EXPLAIN itself. The `CONVERGED WITH RESIDUE`
-    /// wording moved from a note on a passing run (which nobody reads) into the
-    /// error that fails the run, and it must still name which nodes hold the
-    /// residue and why it can never clear.
+    /// W17 — a server that cannot NAME the class must be judged by the LONGER
+    /// grace, never the shorter one.
+    ///
+    /// `inbound_refused_retained` predates the split. Attributing an
+    /// unclassifiable residue to the holder class would resurrect the wave-16
+    /// false positive against exactly the servers that cannot defend
+    /// themselves; attributing it to the orphan class keeps the residue
+    /// visible and gives it the window the slower resolution path needs.
     #[test]
-    fn the_residue_diagnostic_names_the_nodes_and_the_condition() {
+    fn an_unclassifiable_residue_is_judged_by_the_longer_grace() {
+        let legacy = serde_json::json!({
+            "inbound_pending": 5,
+            "inbound_refused_retained": 5,
+        });
+        let counts = refused_residue_counts(&legacy);
+        assert_eq!(counts.total(), 5, "the residue must not be lost");
+        assert_eq!(
+            counts,
+            RefusedResidue {
+                holder_terminal: 0,
+                orphan: 5,
+            },
+            "an unnamed class gets the longer grace",
+        );
+        // …and the classified form is read as sent.
+        let classified = serde_json::json!({
+            "inbound_pending": 5,
+            "inbound_refused_retained": 5,
+            "inbound_refused_retained_holder_terminal": 2,
+            "inbound_refused_retained_orphan": 3,
+        });
+        assert_eq!(
+            refused_residue_counts(&classified),
+            RefusedResidue {
+                holder_terminal: 2,
+                orphan: 3,
+            },
+        );
+        // A server with no residue at all reports nothing in either class.
+        assert_eq!(
+            refused_residue_counts(&serde_json::json!({"inbound_pending": 0})),
+            RefusedResidue::default(),
+        );
+    }
+
+    /// W16/W17 — the failure has to EXPLAIN itself, and it must not claim a
+    /// guarantee it did not enforce.
+    ///
+    /// The wave-16 message asserted a six-round streak over every entry it
+    /// counted; the gate now demands the class it names, and the ORPHAN
+    /// variant states what is actually true of that class — marked on the
+    /// first refusal, and held open by records orphan cleanup has not
+    /// reclaimed.
+    #[test]
+    fn the_residue_diagnostic_names_the_class_it_actually_enforced() {
         let details = vec![
             "node1:size=3,ver=7,masters=1365".to_string(),
-            "node1:inbound-refused-retained=9".to_string(),
-            "node2:inbound-refused-retained=1".to_string(),
+            "node1:inbound-refused-retained=9(holder-terminal=9,orphan=0)".to_string(),
+            "node2:inbound-refused-retained=1(holder-terminal=1,orphan=0)".to_string(),
         ];
-        let msg = refused_residue_error(10, &details);
+        let msg = refused_residue_error(
+            RefusedResidueClass::HolderTerminal,
+            RefusedResidue {
+                holder_terminal: 10,
+                orphan: 0,
+            },
+            &details,
+        );
         assert!(msg.contains("node1:inbound-refused-retained=9"), "{msg}");
         assert!(msg.contains("node2:inbound-refused-retained=1"), "{msg}");
         assert!(
@@ -4087,10 +4253,44 @@ mod migration_gate_tests {
             msg.contains("This is not convergence"),
             "the verdict must be explicit, not inferable: {msg}",
         );
+        assert!(
+            msg.contains("REFUSED_HOLDER_TERMINAL_ROUNDS"),
+            "the holder variant names the streak it enforced: {msg}",
+        );
+
+        // The orphan variant must NOT claim the streak — that claim is what
+        // wave 16 got wrong.
+        let orphan = refused_residue_error(
+            RefusedResidueClass::Orphan,
+            RefusedResidue {
+                holder_terminal: 0,
+                orphan: 12,
+            },
+            &["node3:inbound-refused-retained=12(holder-terminal=0,orphan=12)".to_string()],
+        );
+        assert!(
+            !orphan.contains("REFUSED_HOLDER_TERMINAL_ROUNDS"),
+            "a KeepOrphan entry is marked on its FIRST refusal — claiming a \
+             six-round streak over it is the wave-16 defect: {orphan}",
+        );
+        assert!(
+            orphan.contains("orphan cleanup"),
+            "the orphan variant must name the path that would have resolved \
+             it: {orphan}",
+        );
+        assert!(orphan.contains("12 inbound entries"), "{orphan}");
+
         // Singular/plural, because a one-entry residue is the common case and
         // "1 inbound entries ... their own source" reads like a formatting bug
         // in a failure message someone has to trust.
-        let one = refused_residue_error(1, &["node3:inbound-refused-retained=1".to_string()]);
+        let one = refused_residue_error(
+            RefusedResidueClass::Orphan,
+            RefusedResidue {
+                holder_terminal: 0,
+                orphan: 1,
+            },
+            &["node3:inbound-refused-retained=1(holder-terminal=0,orphan=1)".to_string()],
+        );
         assert!(one.contains("1 inbound entry"), "{one}");
         assert!(one.contains("its own source"), "{one}");
     }
