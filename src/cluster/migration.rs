@@ -830,6 +830,9 @@ pub struct MigrationManager {
     /// unique generation; starts at 1 so a stamp of 0 (the `from_task`
     /// default, never handed to a batch capture) matches nothing.
     next_attempt: u64,
+    /// W17 — monotonic count of FORWARD advances of this node's outbound
+    /// migration pipeline. See [`Self::pipeline_advances`].
+    pipeline_advances: u64,
     /// W8 — pending self-retry arm set by a migration-batch disposition that
     /// ended with failures at a still-current epoch
     /// (`run_migration_batch`'s `f > 0` disposition, which runs on a worker
@@ -920,6 +923,7 @@ impl MigrationManager {
             resync_dual_write: std::collections::HashMap::new(),
             handoff_outcomes: std::collections::HashMap::new(),
             next_attempt: 1,
+            pipeline_advances: 0,
             failed_batch_retry_arm: false,
             replica_abort_resync_arm: false,
             replica_abort_forced_resync_enabled: true,
@@ -1076,6 +1080,7 @@ impl MigrationManager {
                 resync_dual_write: _,
                 handoff_outcomes: _,
                 next_attempt: _,
+                pipeline_advances: _,
                 failed_batch_retry_arm: _,
                 replica_abort_resync_arm: _,
                 failed_retry_hold: _,
@@ -2099,8 +2104,21 @@ impl MigrationManager {
 
     /// Fence a shard on the source node — writes for this shard will be
     /// rejected with ERR_MIGRATION_IN_PROGRESS. Reads continue locally.
+    ///
+    /// W17 — counts as a pipeline advance ([`Self::pipeline_advances`]). This
+    /// is the ONLY manager call the empty-shard batch path makes between
+    /// registering its tasks and completing them: it fences with this rather
+    /// than [`Self::mark_fenced`], so its tasks stay in `Preparing` and no
+    /// state transition is emitted, while `drain_in_flight_mutations`, a full
+    /// `keys_by_shard_filtered` index pass and a batched completion handshake
+    /// run. Without this bump an empty-dominated rebalance emits nothing at all
+    /// and the stranded-task reaper fires on a working pipeline.
+    ///
+    /// [`Self::unfence_shard`] deliberately does NOT count: `mark_failed` lifts
+    /// the fence through it, and a failure must never reset the reaper's clock.
     pub fn fence_shard(&mut self, shard: u16) {
         self.fenced_shards.set(shard);
+        self.note_pipeline_advance();
     }
 
     /// Remove the write fence for a shard (migration completed or failed).
@@ -2154,6 +2172,9 @@ impl MigrationManager {
             p.state = MigrationState::Fenced;
             p.fence_sequence = fence_sequence;
         }
+        if prev_state.is_some() {
+            self.note_pipeline_advance();
+        }
         if raise_write_fence {
             self.fence_shard(task.shard);
         }
@@ -2191,6 +2212,9 @@ impl MigrationManager {
             p.snapshot_hold_attempt = Some(p.attempt);
             p.state = MigrationState::Streaming;
         }
+        if prev_state.is_some() {
+            self.note_pipeline_advance();
+        }
         if let Some(m) = migration_metrics() {
             if let Some(prev) = prev_state {
                 dec_phase_gauge(m, &prev);
@@ -2205,9 +2229,14 @@ impl MigrationManager {
             .find_task_mut(task)
             .map(|p| p.is_master)
             .unwrap_or(true);
+        let mut found = false;
         if let Some(p) = self.find_task_mut(task) {
             p.migrated_records += records;
             p.bytes_sent += bytes;
+            found = true;
+        }
+        if found && (records != 0 || bytes != 0) {
+            self.note_pipeline_advance();
         }
         if let Some(m) = migration_metrics() {
             m.migration_entries_applied_total.inc_by(records);
@@ -2234,6 +2263,7 @@ impl MigrationManager {
         } else {
             return;
         }
+        self.note_pipeline_advance();
         if !self.has_other_fenced_task(task.shard, task) {
             self.unfence_shard(task.shard);
         }
@@ -2735,6 +2765,74 @@ impl MigrationManager {
     /// Get all active migrations.
     pub fn active_migrations(&self) -> &[MigrationProgress] {
         &self.active
+    }
+
+    /// W17 — monotonic count of FORWARD advances of this node's OUTBOUND
+    /// migration pipeline: a write fence raised ([`Self::fence_shard`]), a task
+    /// entering `Streaming` ([`Self::set_snapshot_sequence`]), entering
+    /// `Fenced` ([`Self::mark_fenced_with_origin`]), or completing
+    /// ([`Self::mark_complete`]).
+    ///
+    /// [`Self::record_progress`] bumps it too, but is DEAD CODE today: the repo
+    /// has no production caller (Phase 1 discards the count
+    /// `stream_shard_baseline` returns), so no live migration ever carries
+    /// `bytes_sent`/`migrated_records` above zero. That is a pre-existing gap
+    /// with consequences beyond this counter — see
+    /// `task_is_stranded_candidate`, whose "progress-carrying tasks are
+    /// excluded" guard has therefore never excluded anything, and `/status`,
+    /// which reports `records_transferred: 0` forever. Do not read this line as
+    /// a live source until that is wired.
+    ///
+    /// Never resets and never decreases, so a sampler that misses ticks —
+    /// the coordinator event loop routinely stalls ten seconds under I/O
+    /// pressure — still sees every advance that happened while it was away.
+    /// That is the whole point: an INSTANTANEOUS "is anything streaming right
+    /// now" sample cannot distinguish a dead pipeline from a live one
+    /// observed between phases.
+    ///
+    /// # The bug this exists for (CI run 32668957355, scenario 07)
+    ///
+    /// The stranded-task reaper retires a `Fenced` task that has made no
+    /// progress for `STRANDED_TASK_REAP_AFTER` (45 s), on the premise that
+    /// `Fenced` is a brief per-task cutover state no live task dwells in.
+    /// The batch pipeline breaks that premise in bulk: a worker fences an
+    /// ENTIRE sub-batch in one lock (`run_migration_batch_with_origin`
+    /// Phase 2) and then works the completion handshakes serially, so every
+    /// shard in the sub-batch — an EMPTY one moves no bytes and no records
+    /// by definition — sits in `Fenced` at zero progress for as long as the
+    /// whole sub-batch takes.
+    ///
+    /// On a host running ~3x slower than every comparison run (a 246-shard
+    /// batch took 9.2/31.5 s against 1.3-7.2 s; a ~490-730-shard batch
+    /// 54.7-74.0 s against 15.3-30.5 s) that exceeded 45 s, and the reaper
+    /// destroyed 4877 in-flight tasks across two nodes at exactly T+45 s —
+    /// node3 reaped 2261, re-planned from scratch (`outbound=2006`), and the
+    /// scenario missed its 120 s gate. The run was CONVERGING, not wedged:
+    /// successful handoffs per 10 s bucket ran 24, 6, 165, 222, 270, 481,
+    /// 356, 487, 558 right through the reap. The deadline, not the cluster,
+    /// was the failure.
+    ///
+    /// Gating the reap on this counter makes it mean "45 s with the pipeline
+    /// IDLE" instead of "45 s of wall clock". The two recorded strandings it
+    /// exists for are both fully quiesced — one leftover `Fenced` task with
+    /// masters/handoffs/inbound all converged, and eight `Preparing` tasks
+    /// that were the entire migration set — so nothing advances this counter
+    /// and the reap still fires.
+    ///
+    /// # What is deliberately NOT counted
+    ///
+    /// `mark_failed*` (a resolution, not an advance — and the reaper's own
+    /// call, which would otherwise feed itself) and `start_outbound*` (task
+    /// REGISTRATION: a re-planning loop that keeps enqueuing tasks nothing
+    /// ever drives must not look like progress).
+    pub fn pipeline_advances(&self) -> u64 {
+        self.pipeline_advances
+    }
+
+    /// Record one forward advance of the outbound migration pipeline.
+    /// See [`Self::pipeline_advances`] for what qualifies and what does not.
+    fn note_pipeline_advance(&mut self) {
+        self.pipeline_advances = self.pipeline_advances.saturating_add(1);
     }
 
     /// W16 direction 1 — the REDO READ FLOOR held by this node's in-flight
@@ -3980,6 +4078,163 @@ mod tests {
     /// behaviour is exercised at the real threshold; the `Drop` and
     /// `KeepOrphan` arms decide on the FIRST refusal and are insensitive to it.
     const TEST_TERMINAL_ROUNDS: u32 = 6;
+
+    /// W17 — the pipeline-liveness counter the stranded-task reaper gates its
+    /// dwell clock on. It must count exactly the FORWARD advances of a batch
+    /// (a write fence raised, `Streaming`, `Fenced`, bytes/records moved,
+    /// completion) and nothing else: task registration and task failure are not
+    /// evidence that anything is being driven, and `mark_failed` is the
+    /// reaper's own call, so counting it would let the reaper reset its own
+    /// clock.
+    ///
+    /// Asserted as DELTAS rather than absolute totals: a fenced handoff
+    /// legitimately advances twice (the write fence, then the state
+    /// transition), and the reap gate only ever tests the counter for
+    /// INEQUALITY between passes, so the exact magnitude of an advance carries
+    /// no meaning and must not be pinned.
+    #[test]
+    fn pipeline_advances_counts_forward_batch_progress_only() {
+        let self_id = NodeId(1);
+        let no_keys = std::collections::HashSet::new();
+        let mut mgr = MigrationManager::new();
+        let task = MigrationTask {
+            shard: 7,
+            from_node: self_id,
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        assert_eq!(
+            mgr.pipeline_advances(),
+            0,
+            "a fresh manager has advanced nothing"
+        );
+
+        /// Advance delta produced by `step`.
+        macro_rules! delta {
+            ($mgr:expr, $step:expr) => {{
+                let before = $mgr.pipeline_advances();
+                $step;
+                $mgr.pipeline_advances() - before
+            }};
+        }
+
+        assert_eq!(
+            delta!(
+                mgr,
+                mgr.start_outbound(std::slice::from_ref(&task), self_id, &no_keys)
+            ),
+            0,
+            "registering a task is not driving it",
+        );
+        assert_eq!(
+            delta!(mgr, mgr.set_snapshot_sequence(&task, 42)),
+            1,
+            "entering Streaming is an advance",
+        );
+        assert_eq!(
+            delta!(mgr, mgr.record_progress(&task, 3, 128)),
+            1,
+            "moved records/bytes are an advance",
+        );
+        assert_eq!(
+            delta!(mgr, mgr.record_progress(&task, 0, 0)),
+            0,
+            "a zero-work progress report moved nothing",
+        );
+        assert_eq!(
+            delta!(mgr, mgr.mark_fenced(&task, 99)),
+            2,
+            "a fenced handoff advances twice: the write fence, then the state \
+             transition (the RESYNC variant raises no fence and advances once)",
+        );
+        assert_eq!(
+            delta!(mgr, mgr.mark_complete(&task)),
+            1,
+            "a completed handoff is an advance",
+        );
+
+        // A call naming a task this manager does not hold changes no task
+        // state, so it must not read as progress. `mark_fenced` is the
+        // exception and correctly so: it raises a real write fence on the
+        // shard whether or not a task matches.
+        let unknown = MigrationTask {
+            shard: 4000,
+            from_node: self_id,
+            to_node: NodeId(3),
+            is_master: true,
+        };
+        assert_eq!(
+            delta!(mgr, mgr.set_snapshot_sequence(&unknown, 1)),
+            0,
+            "an unknown task must not advance the pipeline counter",
+        );
+        assert_eq!(delta!(mgr, mgr.record_progress(&unknown, 5, 5)), 0);
+        assert_eq!(delta!(mgr, mgr.mark_complete(&unknown)), 0);
+        assert_eq!(
+            delta!(mgr, mgr.mark_fenced(&unknown, 1)),
+            1,
+            "the write fence it raises is real even with no matching task",
+        );
+
+        // Failure is a resolution, not an advance — and `unfence_shard`, which
+        // both failure paths call, must not sneak one in either.
+        let doomed = MigrationTask {
+            shard: 8,
+            from_node: self_id,
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        mgr.start_outbound(std::slice::from_ref(&doomed), self_id, &no_keys);
+        assert_eq!(
+            delta!(mgr, mgr.mark_failed(&doomed)),
+            0,
+            "failing a task must never reset the reaper's own clock",
+        );
+        assert_eq!(delta!(mgr, mgr.mark_failed_exact(&doomed)), 0);
+        assert_eq!(
+            delta!(mgr, mgr.unfence_shard(8)),
+            0,
+            "lifting a fence is not forward progress",
+        );
+
+        // W17 P2 — `retry_failed` re-drives a parked entry straight into
+        // `Streaming` without going through `set_snapshot_sequence`. It is
+        // deliberately UNCOUNTED, for the same reason `start_outbound` is: a
+        // re-drive loop that keeps re-arming tasks nothing finishes must not
+        // read as a live pipeline. (It does flip `queue_is_being_served`,
+        // which shelters `Preparing` candidates — a pre-existing effect of the
+        // `Streaming` state itself, not of this counter.)
+        assert_eq!(
+            delta!(mgr, mgr.retry_failed(&doomed)),
+            0,
+            "a re-drive is registration, not progress",
+        );
+    }
+
+    /// W17 P1-1 — raising a BARE write fence is a pipeline advance.
+    ///
+    /// The empty-shard path in `run_migration_batch_with_origin` fences its
+    /// shards with [`MigrationManager::fence_shard`] alone: the tasks stay in
+    /// `Preparing`, nothing ever enters `Streaming`, and the next manager call
+    /// that changes anything is the `mark_complete` AFTER the batched
+    /// completion handshake — with `drain_in_flight_mutations` and a full
+    /// `keys_by_shard_filtered` index pass in between. On an empty-dominated
+    /// rebalance every per-target worker sits inside that window at once, so
+    /// without this the node emits ZERO advances for the whole batch and the
+    /// stranded-task reaper fires on a pipeline that is plainly working.
+    #[test]
+    fn raising_a_bare_write_fence_is_a_pipeline_advance() {
+        let mut mgr = MigrationManager::new();
+        assert_eq!(mgr.pipeline_advances(), 0);
+        mgr.fence_shard(9);
+        assert_eq!(
+            mgr.pipeline_advances(),
+            1,
+            "the empty-shard path's bare fence is the only evidence it emits",
+        );
+        mgr.fence_shard(10);
+        assert_eq!(mgr.pipeline_advances(), 2);
+    }
 
     /// W16 direction 1 — a migration that has stamped its baseline snapshot
     /// sequence is holding a REDO READ POSITION, and the checkpoint reset guard

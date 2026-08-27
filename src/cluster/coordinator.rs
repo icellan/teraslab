@@ -34,10 +34,19 @@ const TRANSFER_REQUEST_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How long a migration task may sit in a transient setup/cutover state
 /// (`Preparing` or `Fenced`) with zero bytes and zero records migrated before
-/// the event loop reaps it as stranded. Comfortably longer than either real
-/// phase — baseline preparation, or delta streaming plus the completion
-/// handshake — so this only ever fires on a task whose worker is gone.
-/// See [`task_is_stranded_candidate`].
+/// the event loop reaps it as stranded.
+///
+/// W17 — this was documented as "comfortably longer than either real phase …
+/// so this only ever fires on a task whose worker is gone". That premise is
+/// FALSE and CI run 32668957355 disproved it: the batch pipeline fences a whole
+/// sub-batch at once and works the completion handshakes serially, so on a host
+/// running ~3x slow a live sub-batch dwelt past this budget and 4877 healthy
+/// in-flight tasks were destroyed. The budget was deliberately NOT raised —
+/// covering the forced re-plan would need >= 190 s against a 120 s scenario
+/// gate. Instead the deadline now measures pipeline-IDLE time, so the "worker
+/// is gone" premise is enforced by evidence rather than assumed from a
+/// duration; see [`stranded_tasks_due_for_reap`] and
+/// [`task_is_stranded_candidate`].
 const STRANDED_TASK_REAP_AFTER: Duration = Duration::from_secs(45);
 
 /// W5-followup — minimum spacing between consecutive reactivations while a node
@@ -2659,6 +2668,16 @@ fn phantom_master_shard_count(
 /// and retiring it would abort live work. Retiring a zero-progress task is
 /// recoverable either way — it is not a data operation, and the next
 /// reactivation re-plans the shard if it is still needed.
+///
+/// W17 — that exclusion is INERT in the shipped build.
+/// [`crate::cluster::migration::MigrationManager::record_progress`] has no
+/// production caller (Phase 1 discards the count `stream_shard_baseline`
+/// returns), so `bytes_sent` and `migrated_records` are zero on every live
+/// task and every candidate reaches the state match. It is precisely why all
+/// 4877 tasks destroyed in CI run 32668957355 qualified. The pipeline-idle
+/// gate in [`stranded_tasks_due_for_reap`] is what actually holds the line
+/// today; wiring `record_progress` would restore this guard as a second,
+/// per-task one. Tracked, not fixed here.
 /// Keys that must be streamed to the target after the write fence, because the
 /// target does not have them yet.
 ///
@@ -2713,6 +2732,185 @@ fn task_is_stranded_candidate(
         MigrationState::Preparing => !queue_is_being_served,
         _ => false,
     }
+}
+
+/// W17 — how long a stranded-task candidate has been sitting, tracked on two
+/// clocks because the reap gate and its escape hatch need different questions
+/// answered.
+#[derive(Clone, Copy, Debug)]
+struct StrandedDwell {
+    /// When this candidate was FIRST seen. Never reset by pipeline activity, so
+    /// it measures the shard's total exposure — for a `Fenced` master handoff
+    /// that is how long client writes have been rejected.
+    first_seen: std::time::Instant,
+    /// When its idle clock last restarted, i.e. the last pass at which the
+    /// migration pipeline had advanced. This is what the reap deadline runs
+    /// against.
+    idle_since: std::time::Instant,
+}
+
+/// W17 — the outcome of one stranded-task dwell pass.
+#[derive(Debug, Default)]
+struct StrandedReapPass {
+    /// Candidates whose IDLE dwell has passed the deadline, each with the state
+    /// it was found in.
+    ///
+    /// The state is carried because the reap log hardcoded `"stranded in
+    /// Fenced"` for both candidate states, which is why the only field
+    /// evidence for CI run 32668957355 — 4877 lines reading "stranded in
+    /// Fenced" — could not actually distinguish a `Fenced` task from a
+    /// `Preparing` one. The empty-shard path leaves its tasks in `Preparing`,
+    /// so that distinction decides which code path the incident came through.
+    due: Vec<(MigrationTask, crate::cluster::migration::MigrationState)>,
+    /// Candidates whose ABSOLUTE dwell has passed the deadline but which are
+    /// alive only because the pipeline keeps advancing. See
+    /// `teraslab_migration_stranded_held_off`.
+    held_off: usize,
+}
+
+/// The stranded-task dwell pass: stamp/advance the per-task clocks against the
+/// quiesced view `active`, and return the tasks that have now sat in a
+/// zero-progress transient state for longer than `reap_after` WITH THE
+/// PIPELINE IDLE.
+///
+/// `fenced_since` (when a candidate was FIRST seen stranded) and
+/// `last_seen_advances` (the pipeline-advance count at the previous pass) are
+/// the caller's event-loop-local state and are updated in place; entries for
+/// tasks that are no longer candidates are dropped.
+///
+/// # Why the deadline is idle time and not wall clock (W17)
+///
+/// The reap premise is that a candidate state is transient, so a task dwelling
+/// in one has no worker behind it. The batch pipeline breaks that premise in
+/// bulk, through BOTH candidate states:
+///
+/// * data shards — `run_migration_batch_with_origin` fences an ENTIRE
+///   sub-batch in one lock (Phase 2) and then works the completion handshakes
+///   serially, so every shard in it sits in `Fenced` for as long as the whole
+///   sub-batch takes;
+/// * empty shards — the empty path raises its write fence with the bare
+///   `MigrationManager::fence_shard` and leaves its tasks in `Preparing` right
+///   through `drain_in_flight_mutations`, a full `keys_by_shard_filtered`
+///   index pass, and a batched completion handshake.
+///
+/// An EMPTY shard's handoff moves no bytes and no records by definition, and
+/// `record_progress` has no production caller at all (see
+/// [`task_is_stranded_candidate`]), so the zero-progress filter excludes
+/// nothing in either case.
+///
+/// In CI run 32668957355 the host ran ~3x slower than every comparison run (a
+/// ~490-730-shard batch took 54.7-74.0 s against 15.3-30.5 s), that duration
+/// crossed the deadline, and the reaper retired 4877 in-flight tasks across two
+/// nodes at exactly T+45 s. node3 then re-planned the whole rebalance from
+/// scratch (`outbound=2363` -> `outbound=2006`) and scenario 07 missed its
+/// 120 s gate — while cluster-wide successful handoffs were running at 165-558
+/// per 10 s bucket straight through the reap. Raising the budget would pay for
+/// that bug rather than fix it: one generation on the slow host is ~95 s, which
+/// fits inside the existing 120 s, but covering the rework needs >= 190 s.
+///
+/// WHICH state those 4877 were in is not established: the reap log hardcoded
+/// `"stranded in Fenced"` for both, so the field evidence cannot distinguish
+/// them (fixed — the log now carries `state`, and
+/// `teraslab_migration_stranded_reaped_total` meters it). The gate below is
+/// state-agnostic on purpose: it resets the dwell clock of every candidate,
+/// so it covers whichever path the incident came through.
+///
+/// So a pipeline advance ([`crate::cluster::migration::MigrationManager::pipeline_advances`])
+/// since the last pass resets EVERY dwell clock. Both strandings this reaper
+/// exists for are fully quiesced — one leftover `Fenced` task, and eight
+/// `Preparing` tasks that were the entire migration set, in both cases with
+/// masters/handoffs/inbound converged — so nothing advances and they are still
+/// reaped on schedule.
+///
+/// # The cost, and why there is no wall-clock ceiling
+///
+/// A genuinely workerless task coexisting with OTHER live migrations now waits
+/// for those to finish before its clock can run out, and for a `Fenced` master
+/// handoff that means its shard stays write-fenced for the duration. That is
+/// the same "quiesced view" principle the reap site already relies on (see the
+/// three abort-path variants that regressed scenario 05), widened from one task
+/// to the pipeline.
+///
+/// A hard ceiling was considered and deliberately NOT added, because no safe
+/// value is derivable: the completion handshake alone budgets
+/// `MAX_RETRIES(40) x IO_TIMEOUT(30 s)` (`send_completion_only_handshakes`), and
+/// `Preparing` is by design an unbounded queue — scenario 09 had 1680 healthy
+/// tasks parked in it — so any ceiling short enough to matter would reap live
+/// work, which is the exact failure being fixed. Picking a number I cannot
+/// justify is the "raise the budget" mistake in a different costume.
+///
+/// Instead the hold-off is made VISIBLE rather than silent: [`StrandedReapPass`]
+/// reports every candidate past the deadline on its ABSOLUTE dwell, published
+/// as `teraslab_migration_stranded_held_off`. Two other mechanisms bound the
+/// hazard in practice — `retire_abandoned_batch_tasks` parks a batch's
+/// unresolved tasks the moment its worker scope joins, and a topology
+/// activation cancels stale ones — so the reaper is the last resort, not the
+/// first. Starving it outright takes an unending stream of migrations, which is
+/// itself an alarm-worthy state.
+///
+/// A counter that went BACKWARDS is treated as an advance too: the only way
+/// that happens is [`crate::cluster::migration::MigrationManager::reset_transient_state`]
+/// on a topology activation, which is itself a pipeline event and re-plans
+/// whatever is still needed.
+fn stranded_tasks_due_for_reap(
+    active: &[crate::cluster::migration::MigrationProgress],
+    pipeline_advances: u64,
+    last_seen_advances: &mut u64,
+    fenced_since: &mut std::collections::HashMap<(u16, NodeId, NodeId, bool), StrandedDwell>,
+    now: std::time::Instant,
+    reap_after: Duration,
+) -> StrandedReapPass {
+    // A pipeline advance restarts every IDLE clock; `first_seen` is deliberately
+    // preserved so the absolute exposure of each candidate stays measurable.
+    if pipeline_advances != *last_seen_advances {
+        *last_seen_advances = pipeline_advances;
+        for dwell in fenced_since.values_mut() {
+            dwell.idle_since = now;
+        }
+    }
+    let mut pass = StrandedReapPass::default();
+    let mut live: std::collections::HashSet<(u16, NodeId, NodeId, bool)> =
+        std::collections::HashSet::new();
+    // Any task actively streaming proves the worker pool is draining the
+    // queue, which makes a `Preparing` dwell normal backlog rather than a
+    // stranded task.
+    let queue_is_being_served = active.iter().any(|p| {
+        matches!(
+            p.state,
+            crate::cluster::migration::MigrationState::Streaming
+        )
+    });
+    for p in active {
+        if !task_is_stranded_candidate(
+            &p.state,
+            p.bytes_sent,
+            p.migrated_records,
+            queue_is_being_served,
+        ) {
+            continue;
+        }
+        let key = (p.shard, p.from_node, p.to_node, p.is_master);
+        live.insert(key);
+        let dwell = *fenced_since.entry(key).or_insert(StrandedDwell {
+            first_seen: now,
+            idle_since: now,
+        });
+        if now.duration_since(dwell.idle_since) >= reap_after {
+            pass.due.push((
+                MigrationTask {
+                    shard: p.shard,
+                    from_node: p.from_node,
+                    to_node: p.to_node,
+                    is_master: p.is_master,
+                },
+                p.state.clone(),
+            ));
+        } else if now.duration_since(dwell.first_seen) >= reap_after {
+            pass.held_off += 1;
+        }
+    }
+    fenced_since.retain(|k, _| live.contains(k));
+    pass
 }
 
 fn missing_master_shard_count(
@@ -4111,8 +4309,12 @@ impl ClusterCoordinator {
             // nothing persisted, and it resets naturally on restart.
             let mut fenced_since: std::collections::HashMap<
                 (u16, NodeId, NodeId, bool),
-                std::time::Instant,
+                StrandedDwell,
             > = std::collections::HashMap::new();
+            // W17 — the migration pipeline's advance count as of the previous
+            // stranded-task pass. Same event-loop-local, restart-reset shape as
+            // `fenced_since`; see `MigrationManager::pipeline_advances`.
+            let mut last_pipeline_advances: u64 = 0;
             // W1.1 FIX B — last time this node requested missing shard
             // transfers from sources. `None` = never, so the first
             // detection of the stalled-inbound condition fires
@@ -5091,50 +5293,41 @@ impl ClusterCoordinator {
                     // a worker unwinds and its peers are still running disturbs
                     // an in-flight rebalance. From the event loop the decision
                     // is made against a quiesced view instead: the task must
-                    // have sat in `Fenced` making no progress for longer than
-                    // any real handoff takes.
+                    // have sat in a transient state making no progress for
+                    // longer than any real handoff takes — and, since W17, with
+                    // the whole migration pipeline idle for that long, not
+                    // merely the one task. See `stranded_tasks_due_for_reap`.
                     {
-                        let now = std::time::Instant::now();
-                        let mut stranded: Vec<MigrationTask> = Vec::new();
-                        let mut live: std::collections::HashSet<(u16, NodeId, NodeId, bool)> =
-                            std::collections::HashSet::new();
-                        // Any task actively streaming proves the worker pool
-                        // is draining the queue, which makes a `Preparing`
-                        // dwell normal backlog rather than a stranded task.
-                        let queue_is_being_served = mgr.active_migrations().iter().any(|p| {
-                            matches!(
-                                p.state,
-                                crate::cluster::migration::MigrationState::Streaming
-                            )
-                        });
-                        for p in mgr.active_migrations() {
-                            if !task_is_stranded_candidate(
-                                &p.state,
-                                p.bytes_sent,
-                                p.migrated_records,
-                                queue_is_being_served,
-                            ) {
-                                continue;
-                            }
-                            let key = (p.shard, p.from_node, p.to_node, p.is_master);
-                            live.insert(key);
-                            let first = *fenced_since.entry(key).or_insert(now);
-                            if now.duration_since(first) >= STRANDED_TASK_REAP_AFTER {
-                                stranded.push(MigrationTask {
-                                    shard: p.shard,
-                                    from_node: p.from_node,
-                                    to_node: p.to_node,
-                                    is_master: p.is_master,
-                                });
+                        let pass = stranded_tasks_due_for_reap(
+                            mgr.active_migrations(),
+                            mgr.pipeline_advances(),
+                            &mut last_pipeline_advances,
+                            &mut fenced_since,
+                            std::time::Instant::now(),
+                            STRANDED_TASK_REAP_AFTER,
+                        );
+                        drop(mgr);
+                        if let Some(m) = crate::metrics::migration_metrics() {
+                            m.migration_stranded_held_off
+                                .store(pass.held_off as u32, Ordering::Relaxed);
+                            if !pass.due.is_empty() {
+                                m.migration_stranded_reaped_total
+                                    .inc_by(pass.due.len() as u64);
                             }
                         }
-                        fenced_since.retain(|k, _| live.contains(k));
-                        drop(mgr);
-                        for task in &stranded {
+                        for (task, state) in &pass.due {
+                            // W17 P1-1b — name the STATE. This log used to
+                            // hardcode "stranded in Fenced" for both candidate
+                            // states, so the only field evidence for run
+                            // 32668957355 (4877 such lines) could not tell a
+                            // `Fenced` task from a `Preparing` one — and the
+                            // empty-shard path, which never leaves `Preparing`,
+                            // is a different code path with a different fix.
                             tracing::warn!(
                                 shard = task.shard,
                                 to = task.to_node.0,
-                                "cluster: reaping migration task stranded in Fenced with no progress",
+                                state = ?state,
+                                "cluster: reaping migration task stranded with no progress",
                             );
                             fail_migration_task_current_epoch(
                                 &migration,
@@ -13895,50 +14088,76 @@ fn run_migration_batch_with_origin(
         // one more round.
         drain_in_flight_mutations(&engine);
         let mut empty_recheck_incomplete = false;
-        {
+        // W17 — enumerate OUTSIDE the migration mutex.
+        //
+        // `keys_by_shard_filtered` is a full index pass plus a device read per
+        // key. Holding the migration mutex across it made this the longest
+        // holder in the file, and at 3x I/O cost it wedged the coordinator: CI
+        // run 32668957355 node1 lost ~46 s to three STALLED reports, all
+        // `shard_table=free migration=HELD`, at `sweep` (10974 ms),
+        // `inbound_prune` (10582 ms) and `transfer_drain` (11651 ms) — three
+        // occurrences, zero in every other archived log. It is also the holder
+        // `RedoMetrics::redo_delta_floor_read_timeouts_total` was added to
+        // catch, and the one named in
+        // `migration_delta_reader_redo_floor_bounded`'s hazard note; W16
+        // bounded the READER's wait on this mutex, not this hold.
+        //
+        // Nothing here needed the mutex. What makes the recheck sound is the
+        // WRITE FENCE, raised in its own (already released) critical section
+        // above and published through `fenced_shards` / `fenced_bm`, plus the
+        // `drain_in_flight_mutations` that follows it — the client write path
+        // consults the lock-free bitmap and dispatch never takes this lock at
+        // all. Decisively, the recheck -> commit gap ALREADY spanned a network
+        // round trip outside the lock in the old code, so the enumeration was
+        // never protected end-to-end anyway.
+        //
+        // What does change: a concurrent `unfence_shard` can now land DURING
+        // the enumeration rather than after it. That widens a pre-existing
+        // window rather than opening one — it is rooted in
+        // `has_other_fenced_task` matching on `state == Fenced`, which this
+        // empty path never sets — and the unfenced RESYNC path
+        // (`raise_write_fence == false`) is racy by design either way, as
+        // documented at the drain above.
+        let (fenced_keys_by_shard, fenced_skipped) = engine.keys_by_shard_filtered(&empty_shards);
+        if fenced_skipped > 0 {
+            // Issue #46 fail-safe: an unreadable footer during the empty
+            // recheck means we CANNOT prove these shards are empty — a
+            // record exists but its full txid could not be resolved.
+            // Completing them as "empty" would silently drop that UTXO from
+            // the handoff. Refuse: leave every rechecked task out of both
+            // the ready-empty and promoted sets and fail it below (rolled
+            // back to self, never relinquished — the shard is NOT proven
+            // empty) so the retry path re-verifies next pass.
+            empty_recheck_incomplete = true;
+            tracing::error!(
+                skipped = fenced_skipped,
+                ?empty_shards,
+                "cluster: empty-shard recheck enumeration skipped {fenced_skipped} \
+                 unreadable-footer record(s); refusing to finalize these shards as empty \
+                 this round — routing to retry (issue #46)",
+            );
+        } else {
             let mut mgr = migration.lock();
-            let (fenced_keys_by_shard, fenced_skipped) =
-                engine.keys_by_shard_filtered(&empty_shards);
-
-            if fenced_skipped > 0 {
-                // Issue #46 fail-safe: an unreadable footer during the empty
-                // recheck means we CANNOT prove these shards are empty — a
-                // record exists but its full txid could not be resolved.
-                // Completing them as "empty" would silently drop that UTXO from
-                // the handoff. Refuse: leave every rechecked task out of both
-                // the ready-empty and promoted sets and fail it below (rolled
-                // back to self, never relinquished — the shard is NOT proven
-                // empty) so the retry path re-verifies next pass.
-                empty_recheck_incomplete = true;
-                tracing::error!(
-                    skipped = fenced_skipped,
-                    ?empty_shards,
-                    "cluster: empty-shard recheck enumeration skipped {fenced_skipped} \
-                     unreadable-footer record(s); refusing to finalize these shards as empty \
-                     this round — routing to retry (issue #46)",
-                );
-            } else {
-                for task in &empty_tasks {
-                    if !fenced_keys_by_shard.contains_key(&task.shard) {
-                        ready_empty_tasks.push(task.clone());
-                    } else {
-                        if engine.shard_record_count(task.shard) == 0 {
-                            let key_count = fenced_keys_by_shard
-                                .get(&task.shard)
-                                .map(|v| v.len())
-                                .unwrap_or(0);
-                            tracing::warn!(
-                                shard = task.shard,
-                                keys = key_count,
-                                "cluster: shard empty recheck found keys despite zero shard count",
-                            );
-                        }
-                        // Records appeared between snapshot and fence.
-                        // Must go through full migration path.
-                        mgr.unfence_shard(task.shard);
-                        fenced_bm.clear(task.shard);
-                        promoted.push(task.clone());
+            for task in &empty_tasks {
+                if !fenced_keys_by_shard.contains_key(&task.shard) {
+                    ready_empty_tasks.push(task.clone());
+                } else {
+                    if engine.shard_record_count(task.shard) == 0 {
+                        let key_count = fenced_keys_by_shard
+                            .get(&task.shard)
+                            .map(|v| v.len())
+                            .unwrap_or(0);
+                        tracing::warn!(
+                            shard = task.shard,
+                            keys = key_count,
+                            "cluster: shard empty recheck found keys despite zero shard count",
+                        );
                     }
+                    // Records appeared between snapshot and fence.
+                    // Must go through full migration path.
+                    mgr.unfence_shard(task.shard);
+                    fenced_bm.clear(task.shard);
+                    promoted.push(task.clone());
                 }
             }
         }
@@ -39938,6 +40157,395 @@ mod tests {
         }
     }
 
+    /// One stranded-task reap pass over `mgr`, with the caller's event-loop
+    /// state threaded through exactly as the coordinator loop threads it.
+    fn reap_pass(
+        mgr: &MigrationManager,
+        last_advances: &mut u64,
+        dwell: &mut std::collections::HashMap<(u16, NodeId, NodeId, bool), StrandedDwell>,
+        now: std::time::Instant,
+    ) -> StrandedReapPass {
+        stranded_tasks_due_for_reap(
+            mgr.active_migrations(),
+            mgr.pipeline_advances(),
+            last_advances,
+            dwell,
+            now,
+            STRANDED_TASK_REAP_AFTER,
+        )
+    }
+
+    /// Shards of the tasks a pass wants reaped, sorted for comparison.
+    fn reaped_shards(pass: &StrandedReapPass) -> Vec<u16> {
+        let mut shards: Vec<u16> = pass.due.iter().map(|(t, _)| t.shard).collect();
+        shards.sort_unstable();
+        shards
+    }
+
+    /// W17 — the reap deadline must mean "45 s with the pipeline IDLE", not
+    /// "45 s of wall clock".
+    ///
+    /// CI run 32668957355 scenario 07: `run_migration_batch_with_origin`
+    /// fences an ENTIRE sub-batch in one lock (Phase 2) and then works the
+    /// completion handshakes serially, so every shard in it dwells at zero
+    /// progress — an EMPTY shard's handoff moves no bytes and no records by
+    /// definition — for as long as the whole sub-batch takes. On a host running
+    /// ~3x slower than every comparison run that exceeded 45 s, and the reaper
+    /// destroyed 4877 in-flight tasks across two nodes at exactly T+45 s (node3
+    /// reaped 2261 and re-planned from scratch, `outbound=2006`), blowing the
+    /// 120 s gate. The run was CONVERGING, not wedged: cluster-wide successful
+    /// handoffs per 10 s bucket ran 24, 6, 165, 222, 270, 481, 356, 487, 558
+    /// straight through the reap.
+    #[test]
+    fn stranded_reap_holds_off_while_the_batch_pipeline_advances() {
+        let self_id = NodeId(1);
+        let no_keys = std::collections::HashSet::new();
+        let mut mgr = MigrationManager::new();
+        let sub_batch: Vec<MigrationTask> = (0..4u16)
+            .map(|shard| MigrationTask {
+                shard,
+                from_node: self_id,
+                to_node: NodeId(2),
+                is_master: true,
+            })
+            .collect();
+        mgr.start_outbound(&sub_batch, self_id, &no_keys);
+        for task in &sub_batch {
+            mgr.mark_fenced(task, 100);
+        }
+
+        let mut dwell = std::collections::HashMap::new();
+        let mut last_advances = 0u64;
+        let t0 = std::time::Instant::now();
+        assert!(
+            reap_pass(&mgr, &mut last_advances, &mut dwell, t0)
+                .due
+                .is_empty(),
+            "nothing has dwelt yet on the first pass",
+        );
+
+        // 40 s in, the pipeline is plainly alive: the next sub-batch fences its
+        // own shards and one of this sub-batch's handshakes lands.
+        let next = MigrationTask {
+            shard: 100,
+            from_node: self_id,
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        mgr.start_outbound(std::slice::from_ref(&next), self_id, &no_keys);
+        mgr.mark_fenced(&next, 200);
+        mgr.mark_complete(&sub_batch[0]);
+        assert!(
+            reap_pass(
+                &mgr,
+                &mut last_advances,
+                &mut dwell,
+                t0 + Duration::from_secs(40),
+            )
+            .due
+            .is_empty(),
+            "40 s of dwell is inside the deadline either way",
+        );
+
+        // 50 s of WALL CLOCK since the sub-batch was fenced — past the reap
+        // deadline — but only 10 s since the pipeline last advanced.
+        let pass = reap_pass(
+            &mgr,
+            &mut last_advances,
+            &mut dwell,
+            t0 + Duration::from_secs(50),
+        );
+        assert!(
+            pass.due.is_empty(),
+            "reaped {} task(s) out of a converging rebalance: {:?}",
+            pass.due.len(),
+            pass.due,
+        );
+
+        // Now the pipeline goes idle. 45 s after the LAST advance the reap
+        // fires on everything still stranded — the three unfinished shards of
+        // the sub-batch plus the one the next sub-batch fenced.
+        let idle = reap_pass(
+            &mgr,
+            &mut last_advances,
+            &mut dwell,
+            t0 + Duration::from_secs(40) + STRANDED_TASK_REAP_AFTER,
+        );
+        assert_eq!(
+            reaped_shards(&idle),
+            vec![1, 2, 3, 100],
+            "an idle pipeline must still be reaped 45 s after its last advance",
+        );
+    }
+
+    /// W17 P1-1 — the EMPTY-shard batch window must count as pipeline activity.
+    ///
+    /// The empty path never calls `mark_fenced`: it raises the write fence with
+    /// the bare `MigrationManager::fence_shard` and leaves its tasks in
+    /// `Preparing`. Nothing enters `Streaming`, so `queue_is_being_served` is
+    /// false and every one of those tasks is a reap candidate; the next manager
+    /// call that changes any task state is the `mark_complete` AFTER
+    /// `drain_in_flight_mutations`, a full `keys_by_shard_filtered` index pass
+    /// and a batched completion handshake. On an empty-dominated rebalance
+    /// every per-target worker is inside that window at once, so unless the
+    /// bare fence itself advances the pipeline the node emits nothing for the
+    /// whole batch and the reap fires anyway — the incident, reproduced through
+    /// a different door.
+    #[test]
+    fn stranded_reap_holds_off_across_the_empty_shard_fence_window() {
+        let self_id = NodeId(1);
+        let no_keys = std::collections::HashSet::new();
+        let mut mgr = MigrationManager::new();
+        let fence_empty_batch = |mgr: &mut MigrationManager, shards: std::ops::Range<u16>| {
+            let tasks: Vec<MigrationTask> = shards
+                .map(|shard| MigrationTask {
+                    shard,
+                    from_node: self_id,
+                    to_node: NodeId(2),
+                    is_master: true,
+                })
+                .collect();
+            mgr.start_outbound(&tasks, self_id, &no_keys);
+            for task in &tasks {
+                mgr.fence_shard(task.shard);
+            }
+        };
+
+        fence_empty_batch(&mut mgr, 0..3);
+        let mut dwell = std::collections::HashMap::new();
+        let mut last_advances = 0u64;
+        let t0 = std::time::Instant::now();
+        assert!(
+            reap_pass(&mgr, &mut last_advances, &mut dwell, t0)
+                .due
+                .is_empty(),
+        );
+        assert!(
+            mgr.active_migrations()
+                .iter()
+                .all(|p| p.state == crate::cluster::migration::MigrationState::Preparing),
+            "the empty path leaves its tasks in Preparing — the reap log's \
+             hardcoded \"Fenced\" is not evidence of the state",
+        );
+
+        // 40 s later another worker reaches ITS empty-fence loop. Task
+        // REGISTRATION deliberately does not count as progress, so the bare
+        // fence is the only thing that can save the batch.
+        fence_empty_batch(&mut mgr, 100..103);
+        let pass = reap_pass(
+            &mgr,
+            &mut last_advances,
+            &mut dwell,
+            t0 + Duration::from_secs(50),
+        );
+        assert!(
+            pass.due.is_empty(),
+            "reaped {} empty-shard task(s) mid-batch: {:?}",
+            pass.due.len(),
+            pass.due,
+        );
+    }
+
+    /// W17 safety, direction 1 — the shard-76 leftover this reaper exists for
+    /// must still be reaped.
+    ///
+    /// A rolling restart ended with exactly one zero-progress task in `Fenced`
+    /// (shard 76, EMPTY fenced-shard set) while masters (4096/4096), handoffs
+    /// (0) and inbound (0) had all converged. Nothing was streaming and nothing
+    /// was advancing, so the pipeline-idle gate is satisfied and the reap must
+    /// fire exactly as it did before — otherwise the task pins
+    /// `active_migrations` above zero forever.
+    #[test]
+    fn stranded_reap_fires_on_a_lone_quiesced_fenced_leftover() {
+        let self_id = NodeId(1);
+        let mut mgr = MigrationManager::new();
+        let leftover = MigrationTask {
+            shard: 76,
+            from_node: self_id,
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&leftover),
+            self_id,
+            &std::collections::HashSet::new(),
+        );
+        mgr.mark_fenced(&leftover, 5);
+
+        let mut dwell = std::collections::HashMap::new();
+        let mut last_advances = 0u64;
+        let t0 = std::time::Instant::now();
+        for elapsed in [
+            Duration::ZERO,
+            STRANDED_TASK_REAP_AFTER - Duration::from_secs(1),
+        ] {
+            assert!(
+                reap_pass(&mgr, &mut last_advances, &mut dwell, t0 + elapsed)
+                    .due
+                    .is_empty(),
+                "must not reap before the deadline (elapsed {elapsed:?})",
+            );
+        }
+        let pass = reap_pass(
+            &mgr,
+            &mut last_advances,
+            &mut dwell,
+            t0 + STRANDED_TASK_REAP_AFTER,
+        );
+        assert_eq!(
+            pass.due,
+            vec![(leftover, crate::cluster::migration::MigrationState::Fenced)],
+            "a quiesced pipeline must not shelter a stranded Fenced task, and \
+             the pass must report the state it found so the log can name it",
+        );
+    }
+
+    /// W17 safety, direction 2 — the scenario-05 case: eight zero-progress
+    /// tasks in `Preparing` (shards 11/323/324/344/878/887/895/3270), which
+    /// were the ENTIRE migration set, pinning `active_migrations` at 8 with
+    /// masters/handoffs/inbound all converged. Nothing streams, nothing
+    /// advances: the reap must still fire, and must report `Preparing`.
+    ///
+    /// The same fixture with one live `Streaming` task pins the other half of
+    /// the guard — scenario 09 had node3 mid-drain with 2904 active tasks
+    /// (1680 `Preparing`, 1224 `Streaming`), every one at `total_records == 0`,
+    /// and reaping on dwell alone would have aborted the whole drain.
+    #[test]
+    fn stranded_reap_fires_on_quiesced_preparing_but_spares_a_served_queue() {
+        let self_id = NodeId(1);
+        let stuck: Vec<MigrationTask> = [11u16, 323, 324, 344, 878, 887, 895, 3270]
+            .iter()
+            .map(|&shard| MigrationTask {
+                shard,
+                from_node: self_id,
+                to_node: NodeId(2),
+                is_master: true,
+            })
+            .collect();
+
+        let mut quiesced = MigrationManager::new();
+        quiesced.start_outbound(&stuck, self_id, &std::collections::HashSet::new());
+        let mut dwell = std::collections::HashMap::new();
+        let mut last_advances = 0u64;
+        let t0 = std::time::Instant::now();
+        assert!(
+            reap_pass(&quiesced, &mut last_advances, &mut dwell, t0)
+                .due
+                .is_empty(),
+        );
+        let pass = reap_pass(
+            &quiesced,
+            &mut last_advances,
+            &mut dwell,
+            t0 + STRANDED_TASK_REAP_AFTER,
+        );
+        assert_eq!(
+            reaped_shards(&pass),
+            vec![11, 323, 324, 344, 878, 887, 895, 3270],
+            "eight quiesced Preparing tasks are the whole migration set — reap them",
+        );
+        assert!(
+            pass.due
+                .iter()
+                .all(|(_, s)| *s == crate::cluster::migration::MigrationState::Preparing),
+            "the pass must report Preparing, not the log's hardcoded Fenced",
+        );
+
+        // Same dwell, but the pool is visibly working the queue.
+        let mut draining = MigrationManager::new();
+        draining.start_outbound(&stuck, self_id, &std::collections::HashSet::new());
+        let streaming = MigrationTask {
+            shard: 4000,
+            from_node: self_id,
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        draining.start_outbound(
+            std::slice::from_ref(&streaming),
+            self_id,
+            &std::collections::HashSet::new(),
+        );
+        draining.set_snapshot_sequence(&streaming, 7);
+        let mut drain_dwell = std::collections::HashMap::new();
+        let mut drain_advances = 0u64;
+        let d0 = std::time::Instant::now();
+        assert!(
+            reap_pass(&draining, &mut drain_advances, &mut drain_dwell, d0)
+                .due
+                .is_empty(),
+        );
+        assert!(
+            reap_pass(
+                &draining,
+                &mut drain_advances,
+                &mut drain_dwell,
+                d0 + STRANDED_TASK_REAP_AFTER * 2,
+            )
+            .due
+            .is_empty(),
+            "a queued Preparing task must be spared while the pool streams",
+        );
+    }
+
+    /// W17 P2 — the hold-off has no ceiling, so it must not be SILENT.
+    ///
+    /// A pipeline that keeps advancing keeps resetting the idle clock, which is
+    /// the whole point; the cost is that a genuinely workerless task can be
+    /// held off indefinitely while its shard stays write-fenced. There is no
+    /// derivable wall-clock ceiling to fall back on — the completion handshake
+    /// alone budgets `MAX_RETRIES(40) x IO_TIMEOUT(30 s)` — so instead the pass
+    /// reports how many candidates have passed the deadline on their ABSOLUTE
+    /// dwell and are only alive because something else is moving. A persistently
+    /// non-zero `teraslab_migration_stranded_held_off` is the operator-visible
+    /// signal, and the data needed to choose a ceiling later.
+    #[test]
+    fn stranded_reap_reports_candidates_held_off_past_the_deadline() {
+        let self_id = NodeId(1);
+        let no_keys = std::collections::HashSet::new();
+        let mut mgr = MigrationManager::new();
+        let workerless = MigrationTask {
+            shard: 76,
+            from_node: self_id,
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        mgr.start_outbound(std::slice::from_ref(&workerless), self_id, &no_keys);
+        mgr.mark_fenced(&workerless, 5);
+
+        let mut dwell = std::collections::HashMap::new();
+        let mut last_advances = 0u64;
+        let t0 = std::time::Instant::now();
+        let first = reap_pass(&mgr, &mut last_advances, &mut dwell, t0);
+        assert!(first.due.is_empty());
+        assert_eq!(first.held_off, 0, "nothing has passed the deadline yet");
+
+        // Something else keeps the pipeline busy across the whole window.
+        for tick in 1..=4u64 {
+            mgr.fence_shard(1000 + tick as u16);
+            let pass = reap_pass(
+                &mgr,
+                &mut last_advances,
+                &mut dwell,
+                t0 + Duration::from_secs(30 * tick),
+            );
+            assert!(
+                pass.due.is_empty(),
+                "an advancing pipeline must not be reaped (tick {tick})",
+            );
+        }
+        // 120 s of absolute dwell against a 45 s deadline: held off, not hidden.
+        let pass = reap_pass(
+            &mgr,
+            &mut last_advances,
+            &mut dwell,
+            t0 + Duration::from_secs(120),
+        );
+        assert!(pass.due.is_empty());
+        assert_eq!(
+            pass.held_off, 1,
+            "a candidate past its absolute deadline must be reported, not silently kept",
+        );
+    }
     /// A node holding too FEW masters must be detected as work outstanding.
     ///
     /// The settled-state reactivation metric compares the table against its own
