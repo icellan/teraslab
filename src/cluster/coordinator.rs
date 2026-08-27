@@ -14088,50 +14088,76 @@ fn run_migration_batch_with_origin(
         // one more round.
         drain_in_flight_mutations(&engine);
         let mut empty_recheck_incomplete = false;
-        {
+        // W17 — enumerate OUTSIDE the migration mutex.
+        //
+        // `keys_by_shard_filtered` is a full index pass plus a device read per
+        // key. Holding the migration mutex across it made this the longest
+        // holder in the file, and at 3x I/O cost it wedged the coordinator: CI
+        // run 32668957355 node1 lost ~46 s to three STALLED reports, all
+        // `shard_table=free migration=HELD`, at `sweep` (10974 ms),
+        // `inbound_prune` (10582 ms) and `transfer_drain` (11651 ms) — three
+        // occurrences, zero in every other archived log. It is also the holder
+        // `RedoMetrics::redo_delta_floor_read_timeouts_total` was added to
+        // catch, and the one named in
+        // `migration_delta_reader_redo_floor_bounded`'s hazard note; W16
+        // bounded the READER's wait on this mutex, not this hold.
+        //
+        // Nothing here needed the mutex. What makes the recheck sound is the
+        // WRITE FENCE, raised in its own (already released) critical section
+        // above and published through `fenced_shards` / `fenced_bm`, plus the
+        // `drain_in_flight_mutations` that follows it — the client write path
+        // consults the lock-free bitmap and dispatch never takes this lock at
+        // all. Decisively, the recheck -> commit gap ALREADY spanned a network
+        // round trip outside the lock in the old code, so the enumeration was
+        // never protected end-to-end anyway.
+        //
+        // What does change: a concurrent `unfence_shard` can now land DURING
+        // the enumeration rather than after it. That widens a pre-existing
+        // window rather than opening one — it is rooted in
+        // `has_other_fenced_task` matching on `state == Fenced`, which this
+        // empty path never sets — and the unfenced RESYNC path
+        // (`raise_write_fence == false`) is racy by design either way, as
+        // documented at the drain above.
+        let (fenced_keys_by_shard, fenced_skipped) = engine.keys_by_shard_filtered(&empty_shards);
+        if fenced_skipped > 0 {
+            // Issue #46 fail-safe: an unreadable footer during the empty
+            // recheck means we CANNOT prove these shards are empty — a
+            // record exists but its full txid could not be resolved.
+            // Completing them as "empty" would silently drop that UTXO from
+            // the handoff. Refuse: leave every rechecked task out of both
+            // the ready-empty and promoted sets and fail it below (rolled
+            // back to self, never relinquished — the shard is NOT proven
+            // empty) so the retry path re-verifies next pass.
+            empty_recheck_incomplete = true;
+            tracing::error!(
+                skipped = fenced_skipped,
+                ?empty_shards,
+                "cluster: empty-shard recheck enumeration skipped {fenced_skipped} \
+                 unreadable-footer record(s); refusing to finalize these shards as empty \
+                 this round — routing to retry (issue #46)",
+            );
+        } else {
             let mut mgr = migration.lock();
-            let (fenced_keys_by_shard, fenced_skipped) =
-                engine.keys_by_shard_filtered(&empty_shards);
-
-            if fenced_skipped > 0 {
-                // Issue #46 fail-safe: an unreadable footer during the empty
-                // recheck means we CANNOT prove these shards are empty — a
-                // record exists but its full txid could not be resolved.
-                // Completing them as "empty" would silently drop that UTXO from
-                // the handoff. Refuse: leave every rechecked task out of both
-                // the ready-empty and promoted sets and fail it below (rolled
-                // back to self, never relinquished — the shard is NOT proven
-                // empty) so the retry path re-verifies next pass.
-                empty_recheck_incomplete = true;
-                tracing::error!(
-                    skipped = fenced_skipped,
-                    ?empty_shards,
-                    "cluster: empty-shard recheck enumeration skipped {fenced_skipped} \
-                     unreadable-footer record(s); refusing to finalize these shards as empty \
-                     this round — routing to retry (issue #46)",
-                );
-            } else {
-                for task in &empty_tasks {
-                    if !fenced_keys_by_shard.contains_key(&task.shard) {
-                        ready_empty_tasks.push(task.clone());
-                    } else {
-                        if engine.shard_record_count(task.shard) == 0 {
-                            let key_count = fenced_keys_by_shard
-                                .get(&task.shard)
-                                .map(|v| v.len())
-                                .unwrap_or(0);
-                            tracing::warn!(
-                                shard = task.shard,
-                                keys = key_count,
-                                "cluster: shard empty recheck found keys despite zero shard count",
-                            );
-                        }
-                        // Records appeared between snapshot and fence.
-                        // Must go through full migration path.
-                        mgr.unfence_shard(task.shard);
-                        fenced_bm.clear(task.shard);
-                        promoted.push(task.clone());
+            for task in &empty_tasks {
+                if !fenced_keys_by_shard.contains_key(&task.shard) {
+                    ready_empty_tasks.push(task.clone());
+                } else {
+                    if engine.shard_record_count(task.shard) == 0 {
+                        let key_count = fenced_keys_by_shard
+                            .get(&task.shard)
+                            .map(|v| v.len())
+                            .unwrap_or(0);
+                        tracing::warn!(
+                            shard = task.shard,
+                            keys = key_count,
+                            "cluster: shard empty recheck found keys despite zero shard count",
+                        );
                     }
+                    // Records appeared between snapshot and fence.
+                    // Must go through full migration path.
+                    mgr.unfence_shard(task.shard);
+                    fenced_bm.clear(task.shard);
+                    promoted.push(task.clone());
                 }
             }
         }
