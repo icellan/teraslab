@@ -29645,6 +29645,225 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // W17 — the orphan-cleanup / inbound-fence CIRCULAR WAIT
+    //
+    // CI 32668963874 (armed scenario 09): twelve shards on node3, all
+    // `from_node: 1`, 21 records, permanently fenced and never reclaimed.
+    //
+    //   the inbound entry is dropped only at `local_record_count == 0`
+    //     (`inbound_entry_retention` → `Drop`)
+    //   → only orphan cleanup can get the records to zero
+    //   → orphan cleanup skips any shard with a pending inbound entry
+    //   → the entry stands
+    //
+    // Closed, at rest, permanent. The cut is at the scan gate, and ONLY for
+    // an entry whose own source has terminally refused it while this node is
+    // a non-holder — the one inbound class that provably cannot be protecting
+    // a transfer in flight. Nothing below the gate is relaxed: the #28
+    // committed-handoff evidence check and the proof-of-elsewhere unanimity
+    // bar both still have to be satisfied before a single record is deleted.
+    // -----------------------------------------------------------------
+
+    /// Register a pending inbound entry for `shard` from `source` on `mgr` and
+    /// drive the REAL refusal path over it, classifying with the REAL
+    /// [`inbound_entry_retention`] against `table` — so the test's entry is in
+    /// exactly the state a live `ERR_MIGRATION_NO_TASKS` round leaves behind.
+    ///
+    /// Returns the shards the refusal retained as orphans.
+    fn refuse_inbound_as_orphan(
+        mgr: &mut MigrationManager,
+        table: &ShardTable,
+        engine: &Arc<Engine>,
+        self_id: NodeId,
+        shard: u16,
+        source: NodeId,
+    ) -> Vec<u16> {
+        assert!(
+            mgr.register_inbound_source(shard, source),
+            "the test's inbound entry must be new",
+        );
+        let outcome = mgr.drop_refused_inbound(&[shard], source, REFUSED_HOLDER_TERMINAL_ROUNDS, |s| {
+            inbound_entry_retention(table, self_id, s, engine.shard_record_count(s))
+        });
+        assert_eq!(outcome.dropped, 0, "records are present, so nothing drops");
+        outcome.kept_orphan
+    }
+
+    /// W17 (RED→GREEN) — a shard whose ONLY pending inbound entry is one its
+    /// own source terminally refused must still be JUDGED by the pass, and
+    /// reclaimed when the #28 evidence is there.
+    ///
+    /// Fail-before: `has_pending_inbound` skips it in the scan phase, before
+    /// the evidence check ever runs, so the records stay — and because the
+    /// records stay, `inbound_entry_retention` keeps answering `KeepOrphan`
+    /// and the entry stays too. That is the whole circular wait.
+    #[test]
+    fn run_orphan_cleanup_reclaims_a_shard_whose_only_inbound_is_a_refused_orphan_fence() {
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let shard = shard_node1_lost(&old_table, &new_table);
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(shard, 71));
+        assert_eq!(engine.shard_record_count(shard), 1);
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        {
+            let mut mgr = migration.lock();
+            mgr.record_committed_handoff(
+                shard,
+                new_table.target_assignment(shard).master,
+                new_table.version,
+            );
+            assert_eq!(
+                refuse_inbound_as_orphan(
+                    &mut mgr,
+                    &new_table,
+                    &engine,
+                    NodeId(1),
+                    shard,
+                    NodeId(2),
+                ),
+                vec![shard],
+                "a non-holder with records must be retained as KeepOrphan",
+            );
+            assert!(mgr.has_pending_inbound(shard), "the fence is up");
+        }
+
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+            None,
+        );
+
+        assert_eq!(
+            engine.shard_record_count(shard),
+            0,
+            "a terminally-refused orphan fence must not hide its own shard \
+             from the evidence gate that could release it",
+        );
+        // The records are what held the entry up; with them gone the ordinary
+        // not-held prune retires it and the fence comes down. Without this the
+        // reclaim would be half a fix — the shard would stay fenced forever
+        // over an empty local copy.
+        let mut mgr = migration.lock();
+        assert_eq!(
+            mgr.prune_inbound_not_held(|s| inbound_entry_must_be_kept(
+                &new_table,
+                NodeId(1),
+                s,
+                engine.shard_record_count(s),
+            )),
+            1,
+            "with the records reclaimed the entry is a zero-record non-holder \
+             — the stranded-forever case the prune exists to retire",
+        );
+        assert!(
+            !mgr.has_pending_inbound(shard),
+            "and the fence comes down with it",
+        );
+    }
+
+    /// The safety mirror, and the reason the exemption is scoped to the
+    /// REFUSAL rather than to "has an inbound entry": an entry no source has
+    /// refused is a live transfer, and the pass must not judge its shard.
+    #[test]
+    fn run_orphan_cleanup_still_skips_a_shard_whose_pending_inbound_was_never_refused() {
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let shard = shard_node1_lost(&old_table, &new_table);
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(shard, 72));
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        {
+            let mut mgr = migration.lock();
+            // Evidence IS present, so the ONLY thing standing between this
+            // shard and the delete loop is the un-refused inbound entry.
+            mgr.record_committed_handoff(
+                shard,
+                new_table.target_assignment(shard).master,
+                new_table.version,
+            );
+            assert!(mgr.register_inbound_source(shard, NodeId(2)));
+        }
+
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+            None,
+        );
+
+        assert_eq!(
+            engine.shard_record_count(shard),
+            1,
+            "an inbound entry no source has refused is a transfer that can \
+             still legitimately arrive — its shard is not judged",
+        );
+    }
+
+    /// The #74 mirror: a fail-closed heal fence raised OVER a previously
+    /// refused entry must keep its shard out of the pass.
+    ///
+    /// Green by two independent mechanisms after W17, and deliberately so.
+    /// `mark_heal_fence_active` now clears the stale refusal on promotion (the
+    /// invariant `register_heal_source`'s comment already claimed for the whole
+    /// module), AND the exemption requires `!heal_pending` locally rather than
+    /// resting on that non-local invariant. This is the exact case that makes
+    /// "exempt anything marked `refused_by_source`" — the obvious reading of
+    /// the fix — unsafe: it would hand a #74 park to the reclaim.
+    #[test]
+    fn run_orphan_cleanup_still_skips_a_heal_fence_raised_over_a_refused_entry() {
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let shard = shard_node1_lost(&old_table, &new_table);
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(shard, 73));
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        {
+            let mut mgr = migration.lock();
+            mgr.record_committed_handoff(
+                shard,
+                new_table.target_assignment(shard).master,
+                new_table.version,
+            );
+            refuse_inbound_as_orphan(&mut mgr, &new_table, &engine, NodeId(1), shard, NodeId(2));
+            // #74 F6 — the no-serve-before-heal fence is raised over the same
+            // entry. Nothing about a peer's opinion of its own outbound tasks
+            // resolves THIS fence.
+            mgr.mark_heal_fence_active(shard);
+        }
+
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+            None,
+        );
+
+        assert_eq!(
+            engine.shard_record_count(shard),
+            1,
+            "a reverse-heal fence is never an orphan candidate, refusal mark \
+             or not — it is waiting on the heal, not on its source's task list",
+        );
+    }
+
+    // -----------------------------------------------------------------
     // W12 — proof-of-elsewhere for the #28 fail-closed retain
     // -----------------------------------------------------------------
 
@@ -30695,6 +30914,161 @@ mod tests {
             0,
             "…while the unfenced sibling is still proven and reclaimed — the \
              gate is per-shard, not a global bail",
+        );
+    }
+
+    /// W17 (RED→GREEN) — the armed-09 shape, and the reason the exemption is
+    /// the substantive unlock rather than a census correction.
+    ///
+    /// The twelve stranded shards were a TARGET-side orphan: node3 received a
+    /// partial epoch-3 baseline from node1, node1 aborted the workers when
+    /// node3 activated epoch 4, and node3 was left holding records for shards
+    /// it never handed off to anyone. `handoff_outcomes` is written only on the
+    /// SOURCE side of a handoff (`record_committed_handoff` /
+    /// `record_aborted_handoff`), so node3's #28 evidence for those shards is
+    /// not merely missing, it is UNEARNABLE — `has_committed_handoff` returns
+    /// on its first line for want of a map entry.
+    ///
+    /// That is precisely the case the proof-of-elsewhere phase was built for
+    /// (W12: *"a shard whose #28 evidence is unearnable (SIGKILL, or never
+    /// handed off from here) can still be proven safe and reclaimed"*) — and
+    /// the scan gate skipped these shards before they could ever become probe
+    /// candidates, so the intended exit was unreachable.
+    ///
+    /// Fail-before: the holders are never asked. Pass-after: they are asked,
+    /// and unanimity — not the refusal — is what authorises the delete.
+    #[test]
+    fn run_orphan_cleanup_offers_a_refused_orphan_fence_to_its_holders() {
+        // Serialised against the other tests that read/bump the
+        // PROCESS-GLOBAL proof counters.
+        let _guard = migration_metrics_test_guard();
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let shard = shard_node1_lost(&old_table, &new_table);
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(shard, 74));
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        {
+            let mut mgr = migration.lock();
+            // NO committed-handoff evidence, and none is earnable: this node
+            // was the TARGET, never the source.
+            assert!(
+                !mgr.has_committed_handoff(shard, new_table.version),
+                "the armed-09 shape has no #28 evidence at all",
+            );
+            refuse_inbound_as_orphan(&mut mgr, &new_table, &engine, NodeId(1), shard, NodeId(1));
+            mgr.set_orphan_cleanup_proof_reclaim_enabled(true);
+        }
+        let proof = ScriptedProof::new(&[NodeId(1), NodeId(2), NodeId(3)]);
+
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+            Some(&proof),
+        );
+
+        assert!(
+            !proof.asked_for_shard(shard).is_empty(),
+            "a terminally-refused orphan fence must reach the proof phase — \
+             it is the only exit its shard has",
+        );
+        assert_eq!(
+            engine.shard_record_count(shard),
+            0,
+            "…and unanimous confirmation from the committed holders reclaims it",
+        );
+    }
+
+    /// The safety mirror for the above: the exemption reaches the proof phase,
+    /// it does not bypass it. A holder that will not confirm still keeps the
+    /// records, exactly as `proof = None` would.
+    #[test]
+    fn a_refused_orphan_fence_is_not_itself_permission_to_delete() {
+        let _guard = migration_metrics_test_guard();
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let shard = shard_node1_lost(&old_table, &new_table);
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(shard, 75));
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        {
+            let mut mgr = migration.lock();
+            refuse_inbound_as_orphan(&mut mgr, &new_table, &engine, NodeId(1), shard, NodeId(1));
+            mgr.set_orphan_cleanup_proof_reclaim_enabled(true);
+        }
+        // Only node2 confirms; node3 — the other committed holder — does not.
+        let proof = ScriptedProof::new(&[NodeId(2)]);
+
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+            Some(&proof),
+        );
+
+        assert!(
+            !proof.asked_for_shard(shard).is_empty(),
+            "the shard must have been offered — a retain nobody was asked \
+             about proves nothing",
+        );
+        assert_eq!(
+            engine.shard_record_count(shard),
+            1,
+            "'my source says nothing is coming' is not evidence about where \
+             the data IS — only unanimity is",
+        );
+    }
+
+    /// The DISARMED mirror, which is the shipped configuration: with the
+    /// proof-of-elsewhere reclaim off, the exemption changes nothing about
+    /// what is destroyed. The shard is retained by the #28 evidence gate
+    /// instead of by the inbound gate — a different census line, the same
+    /// records on disk.
+    #[test]
+    fn a_refused_orphan_fence_reclaims_nothing_on_shipped_defaults() {
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let shard = shard_node1_lost(&old_table, &new_table);
+        let engine = Arc::new(test_engine());
+        create_test_record(&engine, tx_key_for_shard(shard, 76));
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        {
+            let mut mgr = migration.lock();
+            refuse_inbound_as_orphan(&mut mgr, &new_table, &engine, NodeId(1), shard, NodeId(1));
+            assert!(
+                !mgr.orphan_cleanup_proof_reclaim_enabled(),
+                "the proof reclaim must still be disarmed by default",
+            );
+        }
+
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+            None,
+        );
+
+        assert_eq!(
+            engine.shard_record_count(shard),
+            1,
+            "with no evidence and no armed proof the pass is exactly the \
+             pre-W17 fail-closed retain",
         );
     }
 

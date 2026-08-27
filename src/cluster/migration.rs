@@ -6901,6 +6901,63 @@ mod tests {
         );
     }
 
+    /// W17 (RED→GREEN) — the #74 F6 PROMOTION of an existing entry to a heal
+    /// fence must forget a prior terminal refusal.
+    ///
+    /// [`MigrationManager::register_heal_source`] already clears it (W12 review
+    /// P2-4) and its comment asserts the invariant for the whole module: *"A
+    /// `heal_pending` entry can never acquire the mark afterwards:
+    /// `drop_refused_inbound` skips heal entries outright."* That is true of
+    /// ACQUIRING the mark and false of KEEPING it —
+    /// [`MigrationManager::mark_heal_fence_active`] promotes every existing
+    /// entry for the shard IN PLACE, so a `KeepOrphan` entry marked on its
+    /// first refusal carries `refused_by_source` INTO the fence.
+    ///
+    /// The mark then says "this node's own source has told it nothing is
+    /// coming" about an entry that is a fail-closed, no-source #74 PARK — the
+    /// one inbound class whose whole purpose is to stay up until an operator or
+    /// the Phase-3b re-heal resolves it. Anything keying off the mark (the
+    /// status JSON, the gauge, the convergence gate, and W17's orphan-cleanup
+    /// exemption) reads a park as a settled fixpoint.
+    ///
+    /// Fail-before: the promoted entry is still reported by
+    /// `refused_retained_inbound_entries`.
+    #[test]
+    fn mark_heal_fence_active_clears_a_prior_terminal_refusal() {
+        let refuser = NodeId(3);
+        let mut mgr = MigrationManager::new();
+        assert!(mgr.register_inbound_source(40, refuser));
+        assert_eq!(
+            mgr.drop_refused_inbound(&[40], refuser, TEST_TERMINAL_ROUNDS, |_| {
+                InboundRetention::KeepOrphan
+            })
+            .kept_orphan,
+            vec![40],
+        );
+        assert_eq!(mgr.refused_retained_inbound_entries(), vec![(40, refuser)]);
+
+        // #74 F6 — the no-source fail-closed fence is raised over the SAME
+        // entry (the promotion is deliberate).
+        assert!(!mgr.mark_heal_fence_active(40));
+
+        assert!(
+            mgr.refused_retained_inbound_entries().is_empty(),
+            "a heal-fence promotion is a NEW fail-closed expectation with its \
+             own resolution path — the prior source refusal no longer \
+             describes the entry",
+        );
+        assert!(
+            mgr.has_pending_inbound(40),
+            "clearing the mark must not drop the fence",
+        );
+        assert_eq!(
+            mgr.parked_no_source_heal_shards(),
+            Vec::<u16>::new(),
+            "the entry keeps its concrete source, so it is a heal PULL, not a \
+             no-source park",
+        );
+    }
+
     /// W16 (RED→GREEN) — a HOLDER's inbound entry its source refuses ROUND
     /// AFTER ROUND must become terminal, while staying retained and fenced.
     ///
