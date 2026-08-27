@@ -144,7 +144,7 @@ fn swim_timing_for_scenario(scenario_id: u16) -> (u32, u32) {
 /// only because the nodes' HTTP ports are reachable solely on the private
 /// per-scenario docker network and the loopback host port mapping. The
 /// constant is shared between the generated node configs
-/// ([`render_node_config`]) and the test HTTP client
+/// (`render_node_config` — private, so not a doc link) and the test HTTP client
 /// (`tests/common/mod.rs`), which attaches it as
 /// `Authorization: Bearer <token>` on every poll. It must be at least 16
 /// bytes — `ServerConfig::MIN_REMOTE_ADMIN_TOKEN_LEN` applies because the
