@@ -1616,24 +1616,46 @@ pub struct MigrationMetrics {
     /// documented at the exclusion site), so the count is the operator's
     /// visibility into how much residue is being deferred to repair.
     pub migration_prune_weak_declared_retained: PaddedCounter,
-    /// W10 review nit-2 — #29 prunes SKIPPED because the completion's
-    /// enumeration cutoff did not match this node's own stream watermark
-    /// (`prune_safe_at_enumeration_cutoff` refused). On a write-active
-    /// source→target pair the cutoff is frozen at fold time while the
-    /// per-source watermark keeps advancing, so the prune is effectively
-    /// dormant there and its anti-stale role rests on the escalation's
-    /// fresh-fold path. Rising steadily = that dormancy, not a defect.
-    pub migration_prune_skipped_cutoff_gate: PaddedCounter,
-    /// W15 — records the #29 completion prune actually DESTROYED.
+    /// Completions whose enumeration cutoff did not match this node's own
+    /// stream watermark (`prune_safe_at_enumeration_cutoff` refused).
     ///
-    /// Its two siblings above count what the prune DECLINED to do; until now
-    /// nothing counted what it did, so the one question triage actually asks —
-    /// "did a deleting path run at all?" — could not be answered from a metrics
-    /// scrape. Reconstructing that from `dead_bytes` arithmetic is exactly how
-    /// the scenario-05 acked-loss chain (CI run 32637576348) had to be traced.
-    /// Read together with the per-shard INFO audit line the prune now emits:
-    /// this counter says whether to go looking for it.
-    pub migration_prune_records_deleted: PaddedCounter,
+    /// W10 added this to meter the #29 prune's dormancy. W17 removed the prune's
+    /// deletion, so it no longer gates anything and the counter is now a pure
+    /// REPLICATION HEALTH signal: the source's `last_acked` view of our stream
+    /// position disagrees with our own durable watermark. On a write-active
+    /// source→target pair a frozen fold-time cutoff trailing an advancing
+    /// watermark is the steady state, so a steadily rising value is expected;
+    /// what matters is the SHAPE across nodes. In CI run 32668963874 node1
+    /// refused 118 times and node3 zero for the same source, which was the
+    /// visible signature of node3 having no stream history with a node that had
+    /// just been handed mastership — read a large asymmetry between peers as a
+    /// stream-relationship anomaly, not as noise.
+    pub migration_prune_skipped_cutoff_gate: PaddedCounter,
+    /// W17 — local keys the #29 completion RETAINED because the authoritative
+    /// source's manifest merely OMITTED them.
+    ///
+    /// It replaces W15's `migration_prune_records_deleted`, which counted what
+    /// that path DESTROYED. There is no longer any delete on the completion
+    /// handler, so the counter had no writer; a permanently-zero series reads
+    /// as "the prune ran and removed nothing" rather than "the prune cannot
+    /// remove anything", which is worse than its absence. This series is the
+    /// honest successor and covers the same triage question — how much did the
+    /// completion path move, and on whose manifest.
+    ///
+    /// These are the records the pre-W17 prune destroyed. Omission is not
+    /// deletion evidence: nothing establishes that a source's manifest is a
+    /// SUPERSET of the shard's committed content, so an omitted key may be a
+    /// live, RF-acked record the source never had (a stale rejoining master,
+    /// a manifest folded before the records arrived, or content that reached
+    /// this node through a different source's stream entirely).
+    ///
+    /// Operationally this is a RESIDUE gauge, not an error: it counts how much
+    /// possibly-stale local content the completion declined to clean up. The
+    /// reconciliation duty sits with the tombstone/RULE-DS veto and the
+    /// committed-handoff-gated orphan cleanup (#28). A steadily rising value
+    /// with no matching orphan-cleanup activity means residue is accumulating
+    /// and should be investigated — it never means data was lost.
+    pub migration_prune_retained_omitted: PaddedCounter,
     /// W11 FIX 4(a) — `OP_MIGRATION_TRANSFER_REQUEST` frames this source
     /// refused shards for: either a WHOLE-frame refusal (the requester is
     /// neither a target holder nor the intended master for ANY requested
@@ -1849,7 +1871,7 @@ impl MigrationMetrics {
             migration_weak_veto_arbitration_refused: PaddedCounter::new(),
             migration_prune_weak_declared_retained: PaddedCounter::new(),
             migration_prune_skipped_cutoff_gate: PaddedCounter::new(),
-            migration_prune_records_deleted: PaddedCounter::new(),
+            migration_prune_retained_omitted: PaddedCounter::new(),
             migration_transfer_request_refused: PaddedCounter::new(),
             migration_dangling_inbound_dropped: PaddedCounter::new(),
             migration_inbound_refused_retained: AtomicU32::new(0),

@@ -1600,8 +1600,8 @@ pub(crate) fn render_metrics_text(
         );
         prom_counter(
             &mut out,
-            "teraslab_migration_prune_records_deleted_total",
-            mm.migration_prune_records_deleted.get(),
+            "teraslab_migration_prune_retained_omitted_total",
+            mm.migration_prune_retained_omitted.get(),
         );
         prom_counter(
             &mut out,
@@ -5705,7 +5705,7 @@ mod tests {
             "teraslab_migration_weak_veto_arbitration_refused_total",
             "teraslab_migration_prune_weak_declared_retained_total",
             "teraslab_migration_prune_skipped_cutoff_gate_total",
-            "teraslab_migration_prune_records_deleted_total",
+            "teraslab_migration_prune_retained_omitted_total",
             "teraslab_migration_transfer_request_refused_total",
             "teraslab_migration_dangling_inbound_dropped_total",
             "teraslab_migration_inbound_refused_retained",

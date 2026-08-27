@@ -1780,10 +1780,103 @@ pub(crate) fn handle_request(
                 );
             }
 
+            // ===================================================================
+            // W17 — THE #29 PRUNE NO LONGER DELETES. It RETAINS AND REPORTS.
+            // ===================================================================
+            //
+            // Everything below this banner (the epoch/authority test, the
+            // enumeration-cutoff gate, the weak-tombstone declaration) is kept
+            // and still evaluated, but its terminal action is now a counted,
+            // logged RETENTION. Read the historical rationale below as the
+            // record of what was tried; read this banner for why it was not
+            // enough.
+            //
+            // THE DEFECT. "Absent from the source's manifest" was treated as
+            // deletion evidence, but NOTHING establishes that a manifest is a
+            // SUPERSET of the shard's committed content. Two independent ways
+            // it under-reports, both observed in CI run 32668963874 (armed
+            // scenario 05), where eight created-and-acked records ended at
+            // `holders=[n1:N, n2:N, n3:N]` — present on no node:
+            //
+            //   1. `source_is_authoritative_complete` is a pure TABLE-ROLE
+            //      test. Node2 rejoined with a stale on-disk store, its
+            //      catch-up FAILED (`recv_ack: replica timeout`, replica lag
+            //      10948 at the time), the new table handed it mastership, and
+            //      its manifests then pruned n1 and n3 down to its stale
+            //      content — 109 records at epoch 4. Node2's own reverse-heal
+            //      Tier-2 pass had already logged 368 shards where a replica
+            //      held a superset of what it had, and it pruned anyway.
+            //   2. The manifest is folded from `fenced_keys`, a PRE-migration
+            //      key snapshot rescanned only when a redo-churn detector puts
+            //      the shard in `changed_shards` (coordinator.rs), and a short
+            //      manifest is explicitly accepted there. So the fold point can
+            //      be strictly OLDER than the cutoff the gate compares against
+            //      — the gate's stated premise is not what the producer does.
+            //      That removed the other copy of the same eight records at
+            //      epoch 3.
+            //
+            // Each holder was pruned once, at a different epoch, by a different
+            // "authoritative" source; the intersection of the two prune sets is
+            // exactly the eight lost txids.
+            //
+            // WHY A TIGHTER GATE WAS NOT THE FIX. Every previous fix in this
+            // family (the epoch/authority test, then the enumeration-cutoff
+            // gate) is an attempt to PROVE the manifest is a superset of the
+            // shard's committed content. That proof requires knowing the
+            // shard's committed content — which is precisely what is unknown
+            // when a member is under-replicated or partially converged. A
+            // completeness requirement on the source (option A) is a heuristic,
+            // not a proof, and it is self-attested by a node that already
+            // believed itself authoritative. Aligning the fold point with the
+            // cutoff (option B) is a real soundness correction, but it only
+            // covers records that traversed THAT source's stream — the eight
+            // lost records were written while node2 was DEAD, so they never
+            // did, and the cutoff gate was provably vacuous for them
+            // (`teraslab_migration_prune_skipped_cutoff_gate_total` was 0 on
+            // node3 while node3 pruned 65 records). Three acked-data-loss
+            // incidents in this campaign all came from a cleanup path deleting
+            // on insufficient evidence, each through a different door. Omission
+            // carries zero bits; the class closes only by not deleting on it.
+            //
+            // ERROR DIRECTION — this errs toward RETAINING possibly-stale data
+            // and away from DESTROYING possibly-live data, and that is the safe
+            // direction for a UTXO store:
+            //
+            //   * Retention is not resurrection. Nothing comes back — the local
+            //     copy never left. A retained stale copy cannot propagate onto
+            //     a node that knows about the deletion: RULE-DS vetoes a heal
+            //     from an at-or-behind image. The exposure is a local stale
+            //     read, and only on a node that already held the record.
+            //   * Loss is terminal. All holders received the same short
+            //     manifest, so there was no copy left to heal from, and the
+            //     `PruneReplace` tombstone the prune planted then vetoed every
+            //     later heal of a created-once (generation-0-forever) record.
+            //     The prune's errors SEAL themselves; retention's errors are
+            //     corrected by the next authoritative delete.
+            //   * The store's safety already does not depend on this prune
+            //     running: it fails open in the retain direction routinely
+            //     (1812 cutoff-gate refusals in ts17, every weak-declared key,
+            //     every non-authoritative source). Making that unconditional
+            //     removes a rare catastrophic branch; it does not change the
+            //     posture the cluster actually runs in.
+            //   * Anti-resurrection duty stays where it is EVIDENCE-BASED: an
+            //     authoritative delete/spend replicates a real tombstone, and
+            //     the committed-handoff-gated orphan cleanup (#28) reclaims
+            //     residue against committed evidence.
+            //
+            // ACCEPTED RESIDUAL. A migration target can now carry stale records
+            // the authority no longer has, until a replicated delete or #28
+            // reclaims them. `teraslab_migration_prune_retained_omitted_total`
+            // is that volume. The right guard against a
+            // stale replica being promoted and then SERVING that residue is
+            // convergence-gating the promotion — not deleting data on a
+            // completion frame.
+            //
+            // ------------------------- historical -------------------------
             // DATA-LOSS GATE (task #29). The exact-entry manifest reconciliation
-            // below deletes every local key for this shard that the source's
-            // manifest omits. That is only correct when the manifest is the
-            // COMPLETE, AUTHORITATIVE set for the shard. The residual data-loss bug
+            // below used to delete every local key for this shard that the
+            // source's manifest omits. That is only correct when the manifest is
+            // the COMPLETE, AUTHORITATIVE set for the shard. The residual data-loss bug
             // (the `holders=[N,N,N]` stranding in scenario_05 / scenario_07) came
             // from a SHORT manifest whose source was NOT the authoritative holder
             // of the shard's complete contents: a still-catching-up rejoining node,
@@ -1944,7 +2037,19 @@ pub(crate) fn handle_request(
             // the retry cannot converge under load — it would only add rounds
             // before the same abort. See the revert commit for the full
             // argument.
-            let prune_safe_at_cutoff = match (completion_from_node, enumeration_cutoff) {
+            //
+            // W17 — the gate no longer authorizes anything: it is a REPLICATION
+            // HEALTH signal. It answers "does the source's view of our stream
+            // position agree with our own?", which is a real and independently
+            // useful question (it caught the receiver-watermark regression
+            // shape), and it is the only place that cross-checks the two. It
+            // deliberately does NOT gate the residue report below: a source
+            // whose view of us disagrees is precisely the source whose short
+            // manifest an operator most needs to see accounted for, so gating
+            // the report on it would blind the riskiest case — which is exactly
+            // what happened in CI run 32668963874, where node3's gate passed
+            // vacuously and node1's refused 118 times.
+            let source_cutoff_view_agrees = match (completion_from_node, enumeration_cutoff) {
                 (Some(src), Some(cutoff)) => {
                     let stream_key = format!("node:{}", src.0);
                     prune_safe_at_enumeration_cutoff(
@@ -1955,14 +2060,8 @@ pub(crate) fn handle_request(
                 }
                 _ => false,
             };
-            // W10 review nit-2 — a refused cutoff gate makes the prune
-            // DORMANT for this completion (the source re-verifies with a
-            // fresh fold). On a write-active source→target pair the frozen
-            // cutoff trails the advancing per-source watermark, so this is
-            // the steady state rather than an anomaly; metered so an
-            // operator can see the prune's dormancy instead of inferring it.
             if source_is_authoritative_complete
-                && !prune_safe_at_cutoff
+                && !source_cutoff_view_agrees
                 && let Some(m) = crate::metrics::migration_metrics()
             {
                 m.migration_prune_skipped_cutoff_gate.inc();
@@ -1972,20 +2071,35 @@ pub(crate) fn handle_request(
             // `completion_from_node.is_some_and(..)`, so it is `Some` on every
             // path that reaches here. It exists to name the source in the audit
             // line below without an `unwrap`.
+            //
+            // W17 — the `shard_record_count` leg is an O(1) PRECONDITION on the
+            // scan, not a safety gate. `keys_for_shard` is a full index pass
+            // plus a device footer read per hit, and this block no longer
+            // deletes, so running it when there is provably nothing to report
+            // is pure cost. The atomic per-shard counter answers "could this
+            // node hold anything the manifest does not name?" for free. It
+            // strictly improves on the pre-W17 cost, which paid for the scan
+            // whenever the cutoff gate passed even with the counts equal.
+            //
+            // It can under-count the report in one corner: a shard holding
+            // FEWER records than the manifest names can still hold an omitted
+            // key. Reaching a committed completion in that shape requires a
+            // reverse-heal whose missing entries are tombstone-vetoed (the
+            // forward path rejects a missing key outright), and nothing is
+            // deleted there either — only the residue line is missed.
             if source_is_authoritative_complete
-                && prune_safe_at_cutoff
                 && let Some(source_node) = completion_from_node
                 && let Some(entries) = source_entries.as_ref()
                 && !entries.is_empty()
                 && entries.len() as u64 == expected_records
+                && engine.shard_record_count(shard) > expected_records
             {
                 let expected_keys: std::collections::HashSet<TxKey> =
                     entries.iter().map(|(key, _)| *key).collect();
-                // W15 — the audit trail this path owed and never kept. The
-                // guard announces ONCE (never per record) on EVERY exit from
-                // this block, including the error arm's early `return` below
-                // (review P2-4).
-                let mut audit = PruneAudit::new(shard, source_node.0, migration_epoch);
+                // W15 — the audit trail this path owed and never kept. W17 —
+                // it now reports a RETENTION rather than a destruction; it
+                // still announces ONCE per shard, never per record.
+                let mut audit = PruneOmissionAudit::new(shard, source_node.0, migration_epoch);
                 for key in engine.keys_for_shard(shard) {
                     if expected_keys.contains(&key) {
                         continue;
@@ -2020,39 +2134,15 @@ pub(crate) fn handle_request(
                         }
                         continue;
                     }
-                    // W9 P1-1 — `delete_prune_replace`, NOT `delete`: this is
-                    // a local reconcile against the authoritative manifest,
-                    // not a client delete. `delete` recorded a ClientDelete
-                    // tombstone whose unconditional RULE-DS veto permanently
-                    // blocked every later heal of a live copy through a node
-                    // that never client-deleted (the same loss chain the
-                    // orphan cleanup fixed with `reclaim_held_copy` — see
-                    // coordinator's cleanup_orphan_shards). PruneReplace keeps
-                    // the anti-resurrection window (at-or-behind images stay
-                    // vetoed) while a strictly-newer live copy heals in.
-                    match engine.delete_prune_replace(&crate::ops::remaining::DeleteRequest {
-                        tx_key: key,
-                        due_guard: None,
-                    }) {
-                        Ok(()) => audit.record(&key.txid),
-                        // Already gone — nothing was destroyed, so it does not
-                        // belong in the audit line.
-                        Err(crate::ops::error::SpendError::TxNotFound) => {}
-                        Err(e) => {
-                            // `audit` drops HERE and emits — the records this
-                            // loop already destroyed are named even though the
-                            // prune is aborting (review P2-4).
-                            return error_response(
-                                request.request_id,
-                                ERR_MIGRATION_IN_PROGRESS,
-                                &format!(
-                                    "shard {shard} failed to prune stale key {:?}: {e:?}",
-                                    key,
-                                ),
-                            );
-                        }
-                    }
+                    // W17 — RETAIN AND REPORT. This is where the deletion used
+                    // to happen (`engine.delete_prune_replace`); the rationale
+                    // for removing it is in the block comment above. Nothing is
+                    // destroyed here and no tombstone is recorded, so a record
+                    // the source merely failed to enumerate stays alive AND
+                    // stays healable.
+                    audit.record(&key.txid);
                 }
+                audit.emit();
             }
 
             // Exact-entry verification runs BEFORE the count decision so it can
@@ -2371,7 +2461,7 @@ pub(crate) fn handle_request(
                     &format!(
                         "shard {shard} record count mismatch: expected {expected_records}, got \
                          {actual} (authoritative={source_is_authoritative_complete}, \
-                         prune_safe_at_cutoff={prune_safe_at_cutoff})"
+                         cutoff_view_agrees={source_cutoff_view_agrees})"
                     ),
                 );
             }
@@ -6273,90 +6363,90 @@ fn repl_slot_for(addr: SocketAddr) -> std::sync::Arc<Mutex<PerAddrSlot>> {
         .clone()
 }
 
-/// W15 — how many pruned txids the #29 audit line renders before it starts
-/// reporting a `txids_omitted` COUNT instead.
+/// W15 — how many txids the #29 audit line renders before it starts reporting
+/// a `txids_omitted` COUNT instead.
 ///
 /// Deliberately the same bound as `cluster::coordinator`'s
 /// `ORPHAN_RECLAIM_LOGGED_TXIDS`, for the same reason: a shard can hold
-/// thousands of records, and one flooding line per pruned shard would be as
-/// unusable as the silence it replaced. Ids beyond the cap are never dropped
-/// without saying so.
+/// thousands of records, and one flooding line per shard would be as unusable
+/// as the silence it replaced. Ids beyond the cap are never dropped without
+/// saying so.
 const MIGRATION_PRUNE_LOGGED_TXIDS: usize = 16;
 
-/// The #29 completion prune's audit trail: what it destroyed, emitted on EVERY
-/// exit from the prune block.
+/// The #29 completion path's residue audit: the local keys an
+/// authoritative-complete manifest OMITTED, which this node RETAINED.
 ///
-/// W15 review P2-4 — the emission was originally a plain `tracing::info!` after
-/// the delete loop, and the loop's error arm `return`s an
-/// `ERR_MIGRATION_IN_PROGRESS` response from inside the loop. A prune that
-/// destroyed k records and then hit a storage error therefore named NONE of
-/// them — the half-completed prune being exactly the case an operator most
-/// needs the txids for. Carrying the emission in `Drop` makes it
-/// unconditional: normal fall-through, the early return, and an unwinding
-/// panic all run it, and no future edit can add a third exit that skips it.
+/// W15 introduced this as `PruneAudit`, the trail a deleting path owed. W17
+/// removed the deletion (see the block comment at the call site), so the same
+/// accounting now answers the opposite question — "how much possibly-stale
+/// residue did the completion decline to clean up?" — and its `Drop`-based
+/// emission went with the early `return` that motivated it: the loop is now
+/// infallible and has exactly one exit, so [`Self::emit`] is called directly.
 ///
-/// The counter rides along for the same reason (review P2-5): a partial prune
-/// must still be countable from a `/metrics` scrape.
-struct PruneAudit {
+/// The counter and the capped txid list are unchanged in shape (review P2-5): a
+/// `/metrics` scrape must answer the volume question without grepping logs, and
+/// a shard can hold thousands of records, so the id list is bounded and says
+/// how many it omitted.
+struct PruneOmissionAudit {
     shard: u16,
     source_node: u64,
     migration_epoch: u64,
-    /// Records actually destroyed — `TxNotFound` is not counted, nothing died.
-    pruned: u64,
+    /// Local records the manifest omitted and this node kept.
+    retained: u64,
     /// Rendered txids, capped at [`MIGRATION_PRUNE_LOGGED_TXIDS`]; the excess
-    /// is reported as a count by [`Self::drop`], never dropped in silence.
+    /// is reported as a count by [`Self::emit`], never dropped in silence.
     txids: Vec<String>,
 }
 
-impl PruneAudit {
+impl PruneOmissionAudit {
     fn new(shard: u16, source_node: u64, migration_epoch: u64) -> Self {
         Self {
             shard,
             source_node,
             migration_epoch,
-            pruned: 0,
+            retained: 0,
             txids: Vec::new(),
         }
     }
 
-    /// Note one destroyed record.
+    /// Note one retained record.
     fn record(&mut self, txid: &[u8; 32]) {
-        self.pruned += 1;
+        self.retained += 1;
         if self.txids.len() < MIGRATION_PRUNE_LOGGED_TXIDS {
             self.txids.push(crate::cluster::coordinator::hex_txid(txid));
         }
     }
-}
 
-impl Drop for PruneAudit {
-    fn drop(&mut self) {
-        if self.pruned == 0 {
+    /// Emit the shard's line and bump the counter. No-op when the manifest
+    /// covered everything this node holds, which is the normal case.
+    fn emit(&self) {
+        if self.retained == 0 {
             return;
         }
         if let Some(m) = crate::metrics::migration_metrics() {
-            m.migration_prune_records_deleted.add(self.pruned);
+            m.migration_prune_retained_omitted.add(self.retained);
         }
-        // W15 — a path that DELETES must never be silent. This prune destroyed
-        // live, RF-acked copies in CI run 32637576348 scenario 05 (five records
-        // ending at `holders=[N,N,N]`) and emitted nothing at all, so the loss
-        // chain had to be reconstructed from `dead_bytes` arithmetic. Same
-        // policy and shape as the orphan reclaim's audit line
-        // (`cluster::coordinator`'s `run_orphan_cleanup`): ONE INFO line per
-        // pruned shard, never per record, naming the source whose manifest
-        // authorised the deletion — a stale source is precisely the failure
-        // mode.
+        // W15's rule was "a path that DELETES must never be silent", after this
+        // prune destroyed live RF-acked copies in CI run 32637576348 and
+        // emitted nothing. W17 keeps the line for the inverse reason: the
+        // retention is a deliberate, load-bearing refusal to clean up, and an
+        // operator must be able to see how much residue it is carrying and
+        // which source's manifest was short. ONE INFO line per shard, never per
+        // record — same shape as the orphan reclaim's line in
+        // `cluster::coordinator`'s `run_orphan_cleanup`.
         tracing::info!(
             shard = self.shard,
-            records_pruned = self.pruned,
+            records_retained = self.retained,
             source_node = self.source_node,
             migration_epoch = self.migration_epoch,
             txids = ?self.txids,
-            txids_omitted = self.pruned.saturating_sub(self.txids.len() as u64),
-            "cluster: migration completion PRUNED local keys the \
-             authoritative source's manifest omitted — these records \
-             are GONE from this node (PruneReplace tombstone: an \
-             at-or-behind copy stays vetoed, a strictly-newer one \
-             can still heal in)",
+            txids_omitted = self.retained.saturating_sub(self.txids.len() as u64),
+            "cluster: migration completion RETAINED local keys the \
+             authoritative source's manifest omitted — omission is not \
+             deletion evidence, so these records are KEPT (no tombstone, \
+             still healable); genuinely-stale residue is reconciled by \
+             replicated deletes and the committed-handoff-gated orphan \
+             cleanup",
         );
     }
 }
@@ -6417,7 +6507,20 @@ fn prune_safe_at_enumeration_cutoff(
         // Leg 2 (watermark past the cutoff → an apply the fold may have
         // missed) and leg 3 (watermark BELOW the cutoff → the source's view of
         // us regressed / is stale) collapse to a single equality requirement.
-        Some(watermark) => watermark == cutoff,
+        //
+        // W17 — plus leg 4: a ZERO cutoff is never evidence. It means the
+        // source has not completed a single full-batch ACK to this target, so
+        // it has no view of our stream position at all; matching it against our
+        // own zero watermark made "we have no relationship whatsoever" read as
+        // "we are provably in sync". That vacuous `0 == 0` is what authorized
+        // node3's 65 deletions in CI run 32668963874 while node1 — which DID
+        // have prior history with the same source's stream, hence a non-zero
+        // watermark — refused the identical completions 118 times. It is also
+        // the exact shape the per-source keying premise on
+        // `ops::engine::ReplicaShardSeqTracker` cannot cover: a node that has
+        // just been handed mastership of a shard whose content reached us
+        // through a DIFFERENT node's stream.
+        Some(watermark) => cutoff != 0 && watermark == cutoff,
         None => true,
     }
 }
@@ -29048,27 +29151,70 @@ mod tests {
         );
     }
 
-    /// Task #29 (no-resurrection / preserve-the-prune): an AUTHORITATIVE-complete
-    /// completion — stamped with the CURRENT committed epoch and sent by the
-    /// shard's committed MASTER — that omits a key the target still holds DOES
-    /// prune that genuinely-stale extra record. This proves the data-loss gate
-    /// did not break the prune's legitimate purpose (removing a stale copy of a
-    /// record the authoritative master correctly deleted/spent).
+    /// W17 (option C, the structural fix) — an AUTHORITATIVE-complete,
+    /// epoch-current, cutoff-safe completion whose manifest OMITS a key this
+    /// node still holds must RETAIN that record and destroy NOTHING.
+    ///
+    /// This is the exact frame shape that produced the third acked-data-loss
+    /// incident (CI run 32668963874, armed scenario 05: eight created-and-acked
+    /// records ended at `holders=[n1:N, n2:N, n3:N]`, present on no node). The
+    /// authorization test the pre-W17 prune applied — "the source is the
+    /// committed/effective master at the current epoch" — is a pure TABLE-ROLE
+    /// test. It says nothing about whether the source's manifest is a SUPERSET
+    /// of the shard's committed content, and in that run it demonstrably was
+    /// not: node2 rejoined with a stale on-disk store, its catch-up FAILED, it
+    /// was handed mastership, and its short manifests then pruned n1 and n3 down
+    /// to its own stale content.
+    ///
+    /// The assertions pin the whole demotion:
+    ///   * the omitted records SURVIVE (the loss the incident was);
+    ///   * NO tombstone is recorded for them. The pre-W17 path wrote a
+    ///     `PruneReplace` tombstone, which then vetoed every later heal of a
+    ///     created-once (generation-0-forever) record — that is what made the
+    ///     deletion permanent instead of self-repairing;
+    ///   * the completion STILL COMMITS (`STATUS_OK`, inbound cleared) — the
+    ///     retained extras land on the superset arm exactly as a cutoff-gate
+    ///     refusal already did, so this is not a new liveness risk;
+    ///   * `migration_prune_retained_omitted` counts the residue, so the volume
+    ///     is answerable from a `/metrics` scrape.
+    ///
+    /// It replaces `migration_complete_exact_entries_prune_extra_local_records`
+    /// and `migration_complete_prune_counts_the_records_it_destroyed`, whose
+    /// contract ("the prune DOES delete the extra record", "the counter records
+    /// what it destroyed") this change deliberately reverses; every property
+    /// they asserted beyond the deletion is asserted here.
     #[test]
-    fn migration_complete_exact_entries_prune_extra_local_records() {
+    fn migration_complete_retains_local_keys_the_manifest_omits() {
+        let _metrics_guard = crate::test_metrics::migration_metrics_test_guard();
+        let metrics = crate::test_metrics::install_test_migration_metrics();
         let h = DispatchTestHarness::new();
-        let shard = 37u16;
+        let retained_before = metrics.migration_prune_retained_omitted.get();
+
+        let shard = 151u16;
         let txid_a = txid_for_shard(shard, 7);
         let txid_b = txid_for_shard(shard, 8);
+        let txid_c = txid_for_shard(shard, 9);
         assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
         assert_eq!(h.create_tx(txid_b, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_c, 1).status, STATUS_OK);
+
+        // Tombstones armed (the RF>1 shape) so a deleting path would be
+        // OBSERVABLE as a `PruneReplace` cause, not merely as a missing record.
+        let tomb_log = crate::ops::tombstone::TombstoneLog::new(
+            std::path::PathBuf::from("/nonexistent/w17-retain-omitted.tombstones"),
+            h.engine.index_seed(),
+            h.engine.index_shard_count(),
+            10_000,
+        );
+        h.engine.set_tombstone_log(tomb_log);
 
         let key_a = TxKey { txid: txid_a };
+        let key_b = TxKey { txid: txid_b };
+        let key_c = TxKey { txid: txid_c };
         let meta_a = h.engine.read_metadata(&key_a).unwrap();
+        // The source's manifest names ONLY A: B and C are simply absent from it.
         let entries = vec![(key_a, meta_a.generation)];
 
-        // Single-node table at epoch 49: NodeId(1) is the committed master of
-        // every shard, and the activated table version is 49.
         let epoch = 49u64;
         let members = vec![crate::cluster::shards::NodeId(1)];
         let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
@@ -29077,7 +29223,7 @@ mod tests {
             table,
             &[(
                 crate::cluster::shards::NodeId(1),
-                "127.0.0.1:4708".parse().unwrap(),
+                "127.0.0.1:4788".parse().unwrap(),
             )],
             &members,
             &[shard],
@@ -29086,8 +29232,8 @@ mod tests {
             1,
         );
 
-        // Authoritative-complete: from the committed master (NodeId(1)) at the
-        // current committed epoch (49).
+        // Maximally authorized under the OLD rule: committed master, current
+        // epoch, cutoff-safe.
         let payload = build_migration_complete_payload(
             1,
             0,
@@ -29117,28 +29263,47 @@ mod tests {
         assert_eq!(
             cluster.inbound_pending_count(),
             0,
-            "successful exact-entry reconciliation should clear pending inbound"
+            "retaining the extras must still COMMIT the handoff — the superset \
+             arm is the same one a cutoff-gate refusal already lands on",
         );
-        assert_eq!(h.engine.shard_record_count(shard), 1);
-        assert!(h.engine.read_metadata(&key_a).is_ok());
-        assert!(h.engine.read_metadata(&TxKey { txid: txid_b }).is_err());
+        assert_eq!(
+            h.engine.shard_record_count(shard),
+            3,
+            "every record must survive: omission from a manifest is not \
+             deletion evidence",
+        );
+        for (name, key) in [("A", &key_a), ("B", &key_b), ("C", &key_c)] {
+            assert!(
+                h.engine.read_metadata(key).is_ok(),
+                "record {name} must still be readable after the completion",
+            );
+            assert_eq!(
+                h.engine.tombstone_cause(key),
+                None,
+                "record {name} must carry NO tombstone — a PruneReplace marker \
+                 here is what made the armed-05 loss permanent by vetoing every \
+                 later heal of a generation-0-forever record",
+            );
+        }
+        assert_eq!(
+            metrics.migration_prune_retained_omitted.get() - retained_before,
+            2,
+            "both omitted keys must be counted as retained residue",
+        );
     }
 
-    /// W15 — the #29 prune DESTROYS records and logged NOTHING but counter
-    /// bumps.
+    /// W15 gave the #29 path its audit line under the rule *"a path that
+    /// deletes data must never be silent."* W17 removed the deletion, and the
+    /// line survives for the inverse reason: the retention is a deliberate,
+    /// load-bearing refusal to clean up, so an operator must be able to see how
+    /// much residue this node is carrying and WHICH source's manifest was
+    /// short — a short manifest from a not-yet-converged source being the whole
+    /// failure mode.
     ///
-    /// This repo already learned the rule once: after a wave-13 proof reclaim
-    /// deleted four acked records invisibly, `run_orphan_cleanup` grew its
-    /// per-shard INFO audit line and the rule became *"a path that deletes data
-    /// must never be silent."* The prune is the same kind of path and had no
-    /// line at all, which is why the scenario-05 acked-loss chain (CI run
-    /// 32637576348, five records ending at `holders=[N,N,N]`) had to be
-    /// reconstructed from `dead_bytes` arithmetic.
-    ///
-    /// One line per pruned SHARD (never per record), naming the shard, the
-    /// count, the source whose manifest authorised it, and the txids.
+    /// One line per SHARD (never per record), naming the shard, the count, the
+    /// source, and the txids.
     #[test]
-    fn migration_complete_prune_logs_the_destroyed_keys_at_info() {
+    fn migration_complete_logs_the_retained_keys_at_info() {
         let h = DispatchTestHarness::new();
         let shard = 137u16;
         let txid_a = txid_for_shard(shard, 7);
@@ -29196,204 +29361,58 @@ mod tests {
         });
 
         assert!(
-            h.engine.read_metadata(&TxKey { txid: txid_b }).is_err(),
-            "the fixture must actually prune, or the log assertion is vacuous",
+            h.engine.read_metadata(&TxKey { txid: txid_b }).is_ok(),
+            "the omitted key must be RETAINED, or the log assertion is vacuous",
         );
 
-        let prune_lines: Vec<&String> = captured
+        let retain_lines: Vec<&String> = captured
             .iter()
-            .filter(|l| l.contains("migration completion PRUNED"))
+            .filter(|l| l.contains("migration completion RETAINED"))
             .collect();
         assert_eq!(
-            prune_lines.len(),
+            retain_lines.len(),
             1,
-            "exactly ONE INFO line per pruned shard (never per record); \
+            "exactly ONE INFO line per shard (never per record); \
              captured INFO events: {captured:?}",
         );
-        let line = prune_lines[0];
+        let line = retain_lines[0];
         assert!(
             line.contains(&format!("shard={shard}")),
-            "the prune line must name the shard: {line}",
+            "the retention line must name the shard: {line}",
         );
         assert!(
-            line.contains("records_pruned=1"),
-            "the prune line must state how many records went: {line}",
+            line.contains("records_retained=1"),
+            "the retention line must state how much residue it kept: {line}",
         );
         assert!(
             line.contains("source_node=1"),
-            "the prune line must name the source whose manifest authorised the \
-             deletion — that source being stale is the whole failure mode: {line}",
+            "the retention line must name the source whose manifest was short — \
+             a not-yet-converged source is the whole failure mode: {line}",
         );
         let txid = crate::cluster::coordinator::hex_txid(&txid_b);
         assert!(
             line.contains(&txid),
-            "the prune line must name the txids it destroyed ({txid}): {line}",
+            "the retention line must name the txids it kept ({txid}): {line}",
         );
         assert!(
             !line.contains(&crate::cluster::coordinator::hex_txid(&txid_a)),
-            "the RETAINED key must not appear in the destroyed list: {line}",
+            "a key the manifest DID name is not residue and must not appear: {line}",
         );
         assert!(
             line.contains("txids_omitted=0"),
-            "a fully-listed prune must say so explicitly: {line}",
+            "a fully-listed retention must say so explicitly: {line}",
         );
+        // Nothing may be destroyed on this path — the record the manifest DID
+        // name is untouched too.
+        assert_eq!(h.engine.shard_record_count(shard), 2);
     }
 
-    /// W15 review P2-5 — the prune must be answerable from a `/metrics` scrape,
-    /// not only by grepping archived container logs.
-    ///
-    /// Its two existing counters (`migration_prune_weak_declared_retained`,
-    /// `migration_prune_skipped_cutoff_gate`) count what the prune DECLINED to
-    /// do; nothing counted what it did. This diff adds `/metrics` collection to
-    /// the in-test failure diagnostics precisely to answer "did a deleting path
-    /// run at all?", and without this counter the prune still could not answer
-    /// it. Runs the REAL completion path, not a mimic.
+    /// W15 — the audit line's txid list must be BOUNDED, matching
+    /// `ORPHAN_RECLAIM_LOGGED_TXIDS`: a shard-sized residue must not flood the
+    /// log with thousands of ids, and the operator must be able to tell a
+    /// truncated list from a complete one.
     #[test]
-    fn migration_complete_prune_counts_the_records_it_destroyed() {
-        let _metrics_guard = crate::test_metrics::migration_metrics_test_guard();
-        let metrics = crate::test_metrics::install_test_migration_metrics();
-        // The harness holds `metrics_test_lock`, which is what serializes the
-        // OTHER prune tests — snapshot the counter only once we own it, or
-        // their bumps land inside our delta window.
-        let h = DispatchTestHarness::new();
-        let before = metrics.migration_prune_records_deleted.get();
-        let shard = 139u16;
-        let txid_a = txid_for_shard(shard, 7);
-        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
-        for salt in 0..3u8 {
-            assert_eq!(
-                h.create_tx(txid_for_shard(shard, 20 + salt), 1).status,
-                STATUS_OK
-            );
-        }
-
-        let key_a = TxKey { txid: txid_a };
-        let meta_a = h.engine.read_metadata(&key_a).unwrap();
-        let entries = vec![(key_a, meta_a.generation)];
-
-        let epoch = 49u64;
-        let members = vec![crate::cluster::shards::NodeId(1)];
-        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
-        let cluster = crate::cluster::coordinator::new_test_running_cluster(
-            crate::cluster::shards::NodeId(1),
-            table,
-            &[(
-                crate::cluster::shards::NodeId(1),
-                "127.0.0.1:4720".parse().unwrap(),
-            )],
-            &members,
-            &[shard],
-            &[],
-            &[],
-            1,
-        );
-        let payload = build_migration_complete_payload(
-            1,
-            0,
-            epoch,
-            None,
-            Some(&entries),
-            Some(crate::cluster::shards::NodeId(1)),
-        );
-        let req = RequestFrame {
-            request_id: shard as u64,
-            op_code: OP_MIGRATION_COMPLETE,
-            flags: 0,
-            payload: payload.into(),
-        };
-        let mut conn_state = crate::server::ConnectionState::new();
-        let resp = handle_request(
-            &req,
-            &h.engine,
-            8192,
-            Some(&cluster),
-            None,
-            &mut conn_state,
-            None,
-        );
-        assert_eq!(resp.status, STATUS_OK);
-        assert_eq!(
-            h.engine.shard_record_count(shard),
-            1,
-            "the fixture must actually prune three records",
-        );
-        assert_eq!(
-            metrics.migration_prune_records_deleted.get() - before,
-            3,
-            "the counter must record exactly the records destroyed",
-        );
-    }
-
-    /// W15 review P2-4 — the audit line must survive the delete loop's EARLY
-    /// RETURN.
-    ///
-    /// The loop's error arm returns an `ERR_MIGRATION_IN_PROGRESS` response
-    /// from inside the loop, so a prune that destroyed k records and then hit a
-    /// storage error used to name none of them — the half-completed prune being
-    /// exactly the case an operator most needs the txids for. `PruneAudit`
-    /// carries the emission in `Drop`, so it is unconditional.
-    ///
-    /// This drives the guard through the same control flow the production error
-    /// arm uses: a `return` out of a scope that owns it. The NORMAL path through
-    /// the real `handle_request` is covered by the two integration tests above,
-    /// which fail if the guard stops being what the prune uses.
-    #[test]
-    fn prune_audit_names_destroyed_records_when_the_loop_returns_early() {
-        let _metrics_guard = crate::test_metrics::migration_metrics_test_guard();
-        // No harness here, so take `metrics_test_lock` directly: it is what
-        // keeps the sibling prune tests from bumping the counter under us.
-        let _dispatch_lock = metrics_test_lock();
-        let metrics = crate::test_metrics::install_test_migration_metrics();
-        let before = metrics.migration_prune_records_deleted.get();
-        let shard = 141u16;
-        let killed = [txid_for_shard(shard, 1), txid_for_shard(shard, 2)];
-
-        /// Mirrors the prune block's shape: destroy some records, then bail out
-        /// of the scope via `return` exactly as the `Err(e)` arm does.
-        fn destroy_then_bail(shard: u16, killed: &[[u8; 32]]) -> &'static str {
-            let mut audit = PruneAudit::new(shard, 7, 49);
-            for txid in killed {
-                audit.record(txid);
-            }
-            // The production early return. `audit` is dropped here.
-            "aborted"
-        }
-
-        let captured = crate::test_log_capture::capture_tracing_lines(tracing::Level::INFO, || {
-            assert_eq!(destroy_then_bail(shard, &killed), "aborted");
-        });
-
-        let line = captured
-            .iter()
-            .find(|l| l.contains("migration completion PRUNED"))
-            .expect(
-                "a prune that destroyed records and then aborted must STILL name \
-                 them — that is the case the txids are most needed for",
-            );
-        assert!(
-            line.contains(&format!("shard={shard}")) && line.contains("records_pruned=2"),
-            "the aborted prune's line must carry the real count: {line}",
-        );
-        for txid in &killed {
-            let hex = crate::cluster::coordinator::hex_txid(txid);
-            assert!(
-                line.contains(&hex),
-                "the aborted prune must name every already-destroyed txid ({hex}): {line}",
-            );
-        }
-        assert_eq!(
-            metrics.migration_prune_records_deleted.get() - before,
-            2,
-            "and the counter must include the partial prune's records too",
-        );
-    }
-
-    /// W15 — the prune's txid list must be BOUNDED, matching
-    /// `ORPHAN_RECLAIM_LOGGED_TXIDS`: a shard-sized prune must not flood the log
-    /// with thousands of ids, and the operator must be able to tell a truncated
-    /// list from a complete one.
-    #[test]
-    fn migration_complete_prune_caps_the_logged_txid_list() {
+    fn migration_complete_retention_caps_the_logged_txid_list() {
         let h = DispatchTestHarness::new();
         let shard = 138u16;
         let txid_a = txid_for_shard(shard, 7);
@@ -29458,16 +29477,16 @@ mod tests {
         });
         assert_eq!(
             h.engine.shard_record_count(shard),
-            1,
-            "every undeclared key must be pruned, or the cap assertion is vacuous",
+            doomed as u64 + 1,
+            "every omitted key must be RETAINED, or the cap assertion is vacuous",
         );
 
         let line = captured
             .iter()
-            .find(|l| l.contains("migration completion PRUNED"))
-            .expect("the prune must be announced at INFO");
+            .find(|l| l.contains("migration completion RETAINED"))
+            .expect("the retention must be announced at INFO");
         assert!(
-            line.contains(&format!("records_pruned={doomed}")),
+            line.contains(&format!("records_retained={doomed}")),
             "the count must be the FULL count, not the capped list length: {line}",
         );
         let rendered = (0..doomed)
@@ -29491,17 +29510,23 @@ mod tests {
         );
     }
 
-    /// W9 P1-1 (third producer) — the #29 prune deletes a local key the
-    /// authoritative source's manifest omitted via a plain `engine.delete`,
-    /// which recorded a ClientDelete tombstone on a node that never
-    /// client-deleted anything — re-opening the exact CI loss chain the
-    /// compensation family was fixed for (unconditional permanent veto on
-    /// every later heal of a live copy). The prune must record PruneReplace,
-    /// whose RULE-DS leg is generation-gated: an at-or-behind image (the
-    /// stale-resurrection window the prune exists to close) stays vetoed, a
-    /// strictly-newer live copy heals back in.
+    /// W9 P1-1 asked which tombstone CAUSE the #29 prune should record: a plain
+    /// `engine.delete` wrote `ClientDelete`, whose unconditional RULE-DS veto
+    /// permanently blocked every later heal, so it was changed to
+    /// `PruneReplace` — generation-gated, so a strictly-newer copy could heal
+    /// back in. That mitigation was never enough in practice: a created-once
+    /// record is generation-0 FOREVER, so "strictly newer" is structurally
+    /// vacuous for exactly the records the armed-05 chain lost, and the marker
+    /// sealed the deletion.
+    ///
+    /// W17 answers the question by removing it. The completion path records NO
+    /// tombstone of any cause, so no heal of the retained record is ever
+    /// vetoed by it — including the gen-0 case the `PruneReplace` window could
+    /// not save. This test now pins that: the record survives, carries no
+    /// tombstone, and a heal at its OWN generation (the vacuous case) is
+    /// admitted rather than vetoed.
     #[test]
-    fn migration_complete_prune_records_prune_replace_and_admits_newer_heal() {
+    fn migration_complete_retention_records_no_tombstone_and_never_vetoes_a_heal() {
         let h = DispatchTestHarness::new();
         let shard = 38u16;
         let txid_a = txid_for_shard(shard, 7);
@@ -29509,8 +29534,8 @@ mod tests {
         assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
         assert_eq!(h.create_tx(txid_b, 1).status, STATUS_OK);
 
-        // Tombstones armed (RF>1 shape) BEFORE the completion so the prune's
-        // delete records one.
+        // Tombstones armed (RF>1 shape) BEFORE the completion, so that if a
+        // deleting path DID run its marker would be recorded and visible.
         let tomb_log = crate::ops::tombstone::TombstoneLog::new(
             std::path::PathBuf::from("/nonexistent/w9-prune-cause.tombstones"),
             h.engine.index_seed(),
@@ -29523,7 +29548,7 @@ mod tests {
         let key_b = TxKey { txid: txid_b };
         let meta_a = h.engine.read_metadata(&key_a).unwrap();
         let gen_b = { h.engine.read_metadata(&key_b).unwrap().generation };
-        // Manifest omits B → the authoritative completion prunes it.
+        // Manifest omits B → pre-W17 the authoritative completion pruned it.
         let entries = vec![(key_a, meta_a.generation)];
 
         let epoch = 49u64;
@@ -29567,22 +29592,26 @@ mod tests {
             None,
         );
         assert_eq!(resp.status, STATUS_OK);
-        assert!(h.engine.read_metadata(&key_b).is_err(), "B is pruned");
+        assert!(h.engine.read_metadata(&key_b).is_ok(), "B is retained");
 
-        // The prune's tombstone: PruneReplace, at B's frozen generation.
+        // No marker of ANY cause — not `PruneReplace`, not `ClientDelete`.
         assert_eq!(
             h.engine.tombstone_cause(&key_b),
-            Some(crate::ops::tombstone::TombstoneCause::PruneReplace),
-            "the #29 prune is a local reconcile, not a client delete",
+            None,
+            "the completion path must record no deletion marker at all",
         );
-        // At-or-behind: still vetoed (the prune's legitimate purpose).
-        assert!(h.engine.tombstone_blocks_heal_apply(&key_b, gen_b));
-        // Strictly newer: the live copy heals back in (pre-fix: vetoed
-        // forever by the mislabeled ClientDelete tombstone).
+        // The case `PruneReplace`'s generation gate could never save: a
+        // created-once record is gen-0 forever, so an at-or-behind image is
+        // the ONLY image it will ever present. It must be admitted.
+        assert!(
+            !h.engine.tombstone_blocks_heal_apply(&key_b, gen_b),
+            "a heal at the record's own generation — the only one a \
+             created-once record can ever present — must not be vetoed",
+        );
         assert!(
             !h.engine
                 .tombstone_blocks_heal_apply(&key_b, gen_b.wrapping_add(1)),
-            "a strictly-newer live copy must defeat the local prune marker",
+            "and a strictly-newer copy must be admitted too",
         );
     }
 
@@ -29611,7 +29640,11 @@ mod tests {
     /// cannot be made convergent.
     #[test]
     fn migration_complete_prune_skips_key_applied_after_enumeration_cutoff() {
+        let _metrics_guard = crate::test_metrics::migration_metrics_test_guard();
+        let metrics = crate::test_metrics::install_test_migration_metrics();
         let h = DispatchTestHarness::new();
+        let refusals_before = metrics.migration_prune_skipped_cutoff_gate.get();
+        let retained_before = metrics.migration_prune_retained_omitted.get();
         let shard = 41u16;
         let txid_a = txid_for_shard(shard, 7);
         let txid_b = txid_for_shard(shard, 8);
@@ -29698,7 +29731,19 @@ mod tests {
             payload: payload.into(),
         };
         let mut cs = crate::server::ConnectionState::new();
-        let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
+        let mut resp = None;
+        let captured = crate::test_log_capture::capture_tracing_lines(tracing::Level::INFO, || {
+            resp = Some(handle_request(
+                &req,
+                &h.engine,
+                8192,
+                Some(&cluster),
+                None,
+                &mut cs,
+                None,
+            ));
+        });
+        let resp = resp.expect("the handler must have produced a response");
 
         // The post-fold apply is RETAINED: no delete, no PruneReplace
         // tombstone (the armed-05 property — unchanged by W11 FIX 2).
@@ -29722,6 +29767,32 @@ mod tests {
         // cannot be made convergent because the cutoff gate's decisive leg is
         // a STREAM-WIDE watermark. See the gate's doc.
         assert_eq!(resp.status, STATUS_OK, "verified superset still completes");
+
+        // W17 — the cutoff gate REFUSED here (leg 1: B applied past the
+        // cutoff), and the residue report must fire ANYWAY. Gating the report
+        // on the gate would blind exactly the completions whose source has a
+        // disagreeing view of us — the shape that lost data in CI run
+        // 32668963874. Asserting both together is what makes this non-vacuous:
+        // under the pre-decoupling wiring the refusal below would be 1 and the
+        // line would be absent.
+        assert_eq!(
+            metrics.migration_prune_skipped_cutoff_gate.get() - refusals_before,
+            1,
+            "the gate must have refused, or the decoupling is untested here",
+        );
+        assert_eq!(
+            metrics.migration_prune_retained_omitted.get() - retained_before,
+            1,
+            "the retained post-cutoff record must still be counted as residue",
+        );
+        let line = captured
+            .iter()
+            .find(|l| l.contains("migration completion RETAINED"))
+            .expect("a refused cutoff gate must not suppress the residue report");
+        assert!(
+            line.contains(&crate::cluster::coordinator::hex_txid(&txid_b)),
+            "the report must name the retained record: {line}",
+        );
     }
 
     /// W10 FIX 3 — a source holding WEAK tombstones for keys of a shard must
@@ -29814,11 +29885,26 @@ mod tests {
         assert!(h.engine.read_metadata(&key_a).is_ok());
     }
 
-    /// W10 FIX 3 companion — keys NOT in the weak-tombstone section keep the
-    /// historical prune (the declaration is per-key, not a blanket skip).
+    /// W10 FIX 3 companion, re-pinned for W17 — the weak-tombstone declaration
+    /// is still per-key and still meaningful, but it no longer decides SURVIVAL.
+    ///
+    /// Pre-W17 a declared key was retained and an undeclared one was deleted, so
+    /// the declaration was the difference between a record living and dying.
+    /// Now both live; what the declaration still buys is ACCOUNTING — a declared
+    /// omission is the source telling us why it is short (its own weak
+    /// reconcile marker) and lands on
+    /// `migration_prune_weak_declared_retained`, while an undeclared omission
+    /// is unexplained residue and lands on `migration_prune_retained_omitted`.
+    /// Keeping them apart is what lets an operator tell "the source knows it is
+    /// short" from "the source has no idea it is short" — the second being the
+    /// stale-master shape.
     #[test]
-    fn migration_complete_prune_still_runs_for_undeclared_keys() {
+    fn migration_complete_retains_declared_and_undeclared_omissions_separately() {
+        let _metrics_guard = crate::test_metrics::migration_metrics_test_guard();
+        let metrics = crate::test_metrics::install_test_migration_metrics();
         let h = DispatchTestHarness::new();
+        let declared_before = metrics.migration_prune_weak_declared_retained.get();
+        let omitted_before = metrics.migration_prune_retained_omitted.get();
         let shard = 44u16;
         let txid_a = txid_for_shard(shard, 7);
         let txid_b = txid_for_shard(shard, 8);
@@ -29851,7 +29937,7 @@ mod tests {
             1,
         );
 
-        // B declared weak — retained; C undeclared — pruned as stale residue.
+        // B declared weak, C undeclared — both retained, counted apart.
         let payload = crate::cluster::coordinator::encode_migration_complete_payload_with_weak_keys(
             entries.len() as u64,
             0,
@@ -29874,8 +29960,20 @@ mod tests {
         assert_eq!(resp.status, STATUS_OK);
         assert!(h.engine.read_metadata(&key_b).is_ok(), "declared key kept");
         assert!(
-            h.engine.read_metadata(&key_c).is_err(),
-            "an undeclared extra key keeps the historical prune",
+            h.engine.read_metadata(&key_c).is_ok(),
+            "an undeclared omission is unexplained residue, not deletion \
+             evidence — it is kept too",
+        );
+        assert_eq!(h.engine.shard_record_count(shard), 3);
+        assert_eq!(
+            metrics.migration_prune_weak_declared_retained.get() - declared_before,
+            1,
+            "the DECLARED omission is attributed to the source's own marker",
+        );
+        assert_eq!(
+            metrics.migration_prune_retained_omitted.get() - omitted_before,
+            1,
+            "the UNDECLARED omission is counted as unexplained residue",
         );
     }
 
@@ -31741,12 +31839,64 @@ mod tests {
         assert!(prune_safe_at_enumeration_cutoff(false, None, 0));
     }
 
-    /// W10 FIX 1 companion (liveness) — a completion whose cutoff COVERS every
-    /// tracked apply to the shard keeps the historical prune: the extra local
-    /// key provably predates the manifest fold, so its omission IS deletion
-    /// evidence and the stale residue is reconciled away exactly as before.
+    /// W17 (secondary) — the refusal ASYMMETRY observed in CI run 32668963874:
+    /// node1 refused this gate 118 times and node3 refused ZERO, while node3
+    /// went on to prune 65 records.
+    ///
+    /// The cause is the `Some(0)` vs `cutoff == 0` case falling through the
+    /// equality leg as `0 == 0`. Both zeros mean the OPPOSITE of what the leg
+    /// reads them as:
+    ///
+    ///   * `cutoff == 0` — the source has never completed a full-batch ACK to
+    ///     this target, so it has NO view of our stream position at all;
+    ///   * `watermark == 0` — we have never durably applied anything from that
+    ///     source's stream.
+    ///
+    /// Together that is the absence of any relationship, which is no evidence
+    /// whatsoever — and it is precisely the highest-risk shape, a source that
+    /// has just become master of a shard whose content reached us through some
+    /// OTHER node's stream (the per-source keying premise documented on
+    /// `ReplicaShardSeqTracker` breaks under a master CHANGE). node1 had prior
+    /// history with node2's stream so its non-zero watermark tripped the
+    /// inequality and refused; node3 had none, so the vacuous `0 == 0` PASSED
+    /// and authorized the deletions.
+    ///
+    /// A zero cutoff must therefore refuse. The `None` (no durable tracker
+    /// configured) fallback above is deliberately untouched: it is a different
+    /// question — an unconfigured deployment, not a source with no view of us.
     #[test]
-    fn migration_complete_prune_still_runs_when_cutoff_covers_applies() {
+    fn prune_gate_refuses_a_zero_cutoff_from_a_source_that_never_acked_us() {
+        assert!(
+            !prune_safe_at_enumeration_cutoff(false, Some(0), 0),
+            "a source that has never acked us has no view of our stream \
+             position — `0 == 0` is the absence of evidence, not proof that \
+             nothing postdates its fold",
+        );
+        // The non-vacuous equality case is unchanged: a real, matching position
+        // on both sides still permits.
+        assert!(prune_safe_at_enumeration_cutoff(false, Some(7), 7));
+        // And a zero cutoff against a non-zero watermark already refused via
+        // leg 3 — that is node1's 118 refusals, and it must stay refusing.
+        assert!(!prune_safe_at_enumeration_cutoff(false, Some(7), 0));
+    }
+
+    /// W17 — the MAXIMALLY AUTHORIZED case still retains.
+    ///
+    /// W10 built this fixture to pin the converse: a completion whose cutoff
+    /// COVERS every tracked apply to the shard was treated as proof that the
+    /// extra local key predates the manifest fold, so its omission counted as
+    /// deletion evidence and the prune ran. That inference is the defect. The
+    /// cutoff bounds only what arrived through THIS source's stream; it says
+    /// nothing about content that reached this node any other way, nor about
+    /// whether the source's fold covered its own shard (the fold reads a
+    /// pre-migration `fenced_keys` snapshot that the producer explicitly
+    /// tolerates being short).
+    ///
+    /// So this is now the strongest available statement of the demotion: every
+    /// gate passes — epoch-current, committed master, cutoff provably covering
+    /// the apply, real producer bytes — and the omitted key is STILL retained.
+    #[test]
+    fn migration_complete_retains_even_when_cutoff_covers_applies() {
         let h = DispatchTestHarness::new();
         let shard = 42u16;
         let txid_a = txid_for_shard(shard, 7);
@@ -31773,9 +31923,9 @@ mod tests {
             1,
         );
 
-        // B applied from node 1's stream at seq 1 — but this time the source
-        // folded AFTER acking it (cutoff 1 >= 1), so the manifest's omission
-        // of B is authoritative: B is stale residue the source deleted.
+        // B applied from node 1's stream at seq 1, and the source folded AFTER
+        // acking it (cutoff 1 >= 1) — the case the cutoff gate was built to
+        // wave through.
         let batch = ReplicaBatch {
             first_sequence: 1,
             ops: vec![ReplicaOp::Create {
@@ -31822,11 +31972,12 @@ mod tests {
 
         assert_eq!(resp.status, STATUS_OK);
         assert!(
-            h.engine.read_metadata(&key_b).is_err(),
-            "an apply covered by the cutoff is provably pre-fold — the prune keeps \
-             its anti-resurrection job",
+            h.engine.read_metadata(&key_b).is_ok(),
+            "a covered cutoff bounds only THIS source's stream — it is not proof \
+             the manifest is a superset of the shard, so B must be retained",
         );
         assert!(h.engine.read_metadata(&key_a).is_ok());
+        assert_eq!(h.engine.shard_record_count(shard), 2);
     }
 
     /// Task #29 (no-loss): a SHORT manifest stamped with a SUPERSEDED epoch
@@ -32125,12 +32276,20 @@ mod tests {
         );
     }
 
-    /// Task #29 (preserve-the-prune): an EPOCH-CURRENT completion from the shard's
-    /// committed master DOES prune the genuinely-stale extra record. Proves the
-    /// authoritative-holder gate did not break the prune's legitimate
-    /// anti-resurrection purpose for the common (no-handoff) case.
+    /// W17 — the multi-node counterpart of
+    /// `migration_complete_retains_local_keys_the_manifest_omits`: a REAL
+    /// three-member table, a shard whose committed master is another node, and
+    /// a registered inbound from that master.
+    ///
+    /// This fixture used to prove that "the authoritative-holder gate did not
+    /// break the prune". It now pins the opposite, on the shape that actually
+    /// lost data: being the committed master at the current epoch is a TABLE
+    /// ROLE, not evidence about content — precisely what the stale rejoining
+    /// node2 was in CI run 32668963874 when its short manifests pruned its two
+    /// peers. The completion is still accepted and still commits; the extra
+    /// record survives.
     #[test]
-    fn migration_complete_epoch_current_master_source_prunes_extra_record() {
+    fn migration_complete_epoch_current_master_source_retains_extra_record() {
         let h = DispatchTestHarness::new();
         let shard = 42u16;
         let txid_a = txid_for_shard(shard, 17);
@@ -32186,9 +32345,17 @@ mod tests {
 
         assert_eq!(resp.status, STATUS_OK);
         assert!(h.engine.read_metadata(&key_a).is_ok());
-        assert!(h.engine.read_metadata(&TxKey { txid: txid_b }).is_err());
-        assert_eq!(h.engine.shard_record_count(shard), 1);
-        assert_eq!(cluster.inbound_pending_count(), 0);
+        assert!(
+            h.engine.read_metadata(&TxKey { txid: txid_b }).is_ok(),
+            "a committed master's short manifest is a table role, not proof of \
+             content — the extra record must survive",
+        );
+        assert_eq!(h.engine.shard_record_count(shard), 2);
+        assert_eq!(
+            cluster.inbound_pending_count(),
+            0,
+            "retaining the extra must still commit the handoff",
+        );
     }
 
     #[test]
