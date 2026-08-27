@@ -1635,6 +1635,14 @@ pub(crate) fn render_metrics_text(
             mm.orphan_cleanup_skipped_pending_inbound
                 .load(Ordering::Relaxed) as u64,
         );
+        // W17 — read TOGETHER with the gauge above: shards leaving that one
+        // for this one were not resolved, their fence was set aside.
+        prom_gauge(
+            &mut out,
+            "teraslab_orphan_cleanup_refused_orphan_exempt",
+            mm.orphan_cleanup_refused_orphan_exempt
+                .load(Ordering::Relaxed) as u64,
+        );
         prom_counter(
             &mut out,
             "teraslab_orphan_cleanup_shard_skipped_total",
@@ -2608,11 +2616,17 @@ async fn handle_admin_migration_status(State(state): State<Arc<HttpState>>) -> i
             // W12 review NIT — ONE snapshot under a single migration lock, so
             // the four numbers below cannot straddle a concurrent refusal and
             // render an impossible state (refused > pending).
+            //
+            // W17 — the whole body is rendered by the snapshot
+            // (`InboundStatusSnapshot::to_status_json`): the inbound object is
+            // the BASE and the outbound fields are merged into it, so the body
+            // cannot be produced without the inbound fields. Every convergence
+            // gate parses an absent `inbound_pending` /
+            // `inbound_refused_retained` as ZERO — the converged reading — so a
+            // render path that can drop them silently turns a wedged cluster
+            // into a green run (review P2-5). The per-entry retention CLASS is
+            // attributed and unit-tested there too.
             let inbound_snapshot = cluster.inbound_status_snapshot();
-            let inbound = inbound_snapshot.pending_count;
-            let inbound_entries = &inbound_snapshot.entries;
-            let refused_retained = &inbound_snapshot.refused_retained;
-            let fenced = inbound_snapshot.fenced_count;
             let active_count = migrations
                 .iter()
                 .filter(|m| {
@@ -2624,31 +2638,24 @@ async fn handle_admin_migration_status(State(state): State<Arc<HttpState>>) -> i
                 .iter()
                 .filter(|m| m.state == crate::cluster::migration::MigrationState::Failed)
                 .count();
-            let body = serde_json::json!({
-                "active_count": active_count,
-                "failed_count": failed_count,
-                "inbound_pending": inbound,
-                "inbound_entries": inbound_entries.iter().map(|(shard, from_node)| {
-                    serde_json::json!({
-                        "shard": shard,
-                        "from_node": from_node.0,
-                        "refused_by_source": refused_retained.contains(&(*shard, *from_node)),
+            let body = inbound_snapshot.to_status_json(
+                active_count,
+                failed_count,
+                migrations
+                    .iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "shard": m.shard,
+                            "from_node": m.from_node.0,
+                            "to_node": m.to_node.0,
+                            "state": format!("{:?}", m.state),
+                            "migrated_records": m.migrated_records,
+                            "total_records": m.total_records,
+                            "bytes_sent": m.bytes_sent,
+                        })
                     })
-                }).collect::<Vec<_>>(),
-                "inbound_refused_retained": refused_retained.len(),
-                "fenced_shards": fenced,
-                "migrations": migrations.iter().map(|m| {
-                    serde_json::json!({
-                        "shard": m.shard,
-                        "from_node": m.from_node.0,
-                        "to_node": m.to_node.0,
-                        "state": format!("{:?}", m.state),
-                        "migrated_records": m.migrated_records,
-                        "total_records": m.total_records,
-                        "bytes_sent": m.bytes_sent,
-                    })
-                }).collect::<Vec<_>>(),
-            });
+                    .collect::<Vec<_>>(),
+            );
             (StatusCode::OK, body.to_string())
         }
         None => (
@@ -5720,6 +5727,7 @@ mod tests {
             "teraslab_migration_dangling_inbound_dropped_total",
             "teraslab_migration_inbound_refused_retained",
             "teraslab_orphan_cleanup_skipped_pending_inbound",
+            "teraslab_orphan_cleanup_refused_orphan_exempt",
             "teraslab_orphan_cleanup_shard_skipped_total",
             "teraslab_topology_proposal_revalidation_emptied_total",
             "teraslab_topology_catch_up_reproposal_skipped_total",
