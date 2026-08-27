@@ -1673,6 +1673,23 @@ pub struct MigrationMetrics {
     /// copies reported `orphan_cleanup_retained_no_evidence = 0` and looked
     /// healthy while nothing was being reclaimed at all.
     pub orphan_cleanup_skipped_pending_inbound: AtomicU32,
+    /// W17 — gauge: shards the LAST orphan-cleanup pass went on to JUDGE even
+    /// though they carry a pending inbound entry, because every one of that
+    /// shard's entries is a terminally-refused ORPHAN fence
+    /// (`MigrationManager::inbound_is_refused_orphan_fence`).
+    ///
+    /// The exemption is a gate, and this function's governing rule (W11 FIX
+    /// 4(b)) is that a census gap must be visible at the gate that caused it.
+    /// Without this gauge the exemption is invisible twice over: the shards
+    /// simply LEAVE `orphan_cleanup_skipped_pending_inbound`, which on a
+    /// dashboard reads as "the fences resolved" rather than "the fences were
+    /// set aside". The two must be read together — this is the count of shards
+    /// whose fence was set aside, and it is the count of shards for which a
+    /// downstream delete is now reachable.
+    ///
+    /// Published every pass INCLUDING ZERO, like its sibling above, so a
+    /// cleared condition leaves the gauge.
+    pub orphan_cleanup_refused_orphan_exempt: AtomicU32,
     /// W11 FIX 4(b) — the per-shard (`cleanup_orphaned_shard_if_settled`)
     /// sibling of the gauge above: reclaim attempts that returned before the
     /// #28 evidence check because the shard still had an unresolved task or a
@@ -1854,6 +1871,7 @@ impl MigrationMetrics {
             migration_dangling_inbound_dropped: PaddedCounter::new(),
             migration_inbound_refused_retained: AtomicU32::new(0),
             orphan_cleanup_skipped_pending_inbound: AtomicU32::new(0),
+            orphan_cleanup_refused_orphan_exempt: AtomicU32::new(0),
             orphan_cleanup_shard_skipped: PaddedCounter::new(),
             topology_proposal_revalidation_emptied: PaddedCounter::new(),
             topology_catch_up_reproposal_skipped: PaddedCounter::new(),

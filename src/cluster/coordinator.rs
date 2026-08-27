@@ -1988,10 +1988,39 @@ impl InboundStatusSnapshot {
             }).collect::<Vec<_>>(),
             "inbound_refused_retained": self.refused_retained.len(),
             "inbound_refused_retained_holder_terminal": holder_terminal,
+            // W17 review P2-7 — DERIVED from the union, never counted
+            // independently, so the three numbers always describe a possible
+            // state. `MigrationManager::refused_retained_orphan_entries`
+            // derives the same way for the same reason.
             "inbound_refused_retained_orphan":
                 self.refused_retained.len().saturating_sub(holder_terminal),
             "fenced_shards": self.fenced_count,
         })
+    }
+
+    /// The full `/admin/migration_status` body: the inbound object above,
+    /// EXTENDED with the outbound fields.
+    ///
+    /// W17 review P2-5 — the inbound object is the BASE and the rest is merged
+    /// into it, so the body cannot be rendered without the inbound fields. That
+    /// is a correctness requirement, not tidiness: every convergence gate reads
+    /// `inbound_pending` / `inbound_refused_retained` from this body and parses
+    /// an absent field as ZERO, which is the CONVERGED reading. A render path
+    /// that can drop the inbound object turns a wedged cluster into a green
+    /// run. Merging the other way round — inbound spliced into an outbound base
+    /// through a fallible downcast — made that failure mode representable and
+    /// silent.
+    pub fn to_status_json(
+        &self,
+        active_count: usize,
+        failed_count: usize,
+        migrations: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut body = self.to_json();
+        body["active_count"] = serde_json::Value::from(active_count);
+        body["failed_count"] = serde_json::Value::from(failed_count);
+        body["migrations"] = serde_json::Value::Array(migrations);
+        body
     }
 }
 
@@ -16138,17 +16167,24 @@ fn run_orphan_cleanup(
                 debug_shard_log(shard, "orphan_cleanup SKIP (pending inbound / heal fence)");
                 continue;
             }
+            let assignment = table.effective_assignment(shard);
+            let owned = assignment.master == self_id || assignment.replicas.contains(&self_id);
+            if owned || engine.shard_record_count(shard) == 0 {
+                continue;
+            }
+            // W17 review P2-4 — counted BELOW the ownership / record-count
+            // test, not above it. The gauge's claim is "this many shards had
+            // their fence set aside so the pass could judge them", and a shard
+            // skipped for being OWNED (the holder-terminal class, which the
+            // pass never judges) or EMPTY was never judged. Counting those
+            // inflated the one number an operator would use to audit how much
+            // the exemption is doing.
             if mgr.has_pending_inbound(shard) {
                 refused_orphan_exempt = refused_orphan_exempt.saturating_add(1);
                 debug_shard_log(
                     shard,
                     "orphan_cleanup JUDGE (pending inbound is a terminally-refused orphan fence)",
                 );
-            }
-            let assignment = table.effective_assignment(shard);
-            let owned = assignment.master == self_id || assignment.replicas.contains(&self_id);
-            if owned || engine.shard_record_count(shard) == 0 {
-                continue;
             }
             // Data-loss guard (task #28): NEVER delete a non-owned shard's
             // last local copy on the strength of the current table alone — the
@@ -16521,6 +16557,13 @@ fn run_orphan_cleanup(
         // pass, including zero, so a cleared skip leaves the gauge).
         m.orphan_cleanup_skipped_pending_inbound
             .store(skipped_pending_inbound, Ordering::Relaxed);
+        // W17 review P2-3 — same contract (published every pass including
+        // zero). Without it the exemption is a gate with no gauge: the shards
+        // it admits simply LEAVE the sibling above, and a dashboard reads that
+        // fall as "the fences resolved" instead of "the fences were set aside"
+        // — the exact ambiguity W11 FIX 4(b) exists to forbid.
+        m.orphan_cleanup_refused_orphan_exempt
+            .store(refused_orphan_exempt, Ordering::Relaxed);
         // W12 — counters, not gauges: these accumulate the proof phase's
         // verdicts so a drained census is distinguishable from a pass that
         // never asked.
@@ -31395,9 +31438,13 @@ mod tests {
     #[test]
     fn the_exemption_gauges_only_the_shards_it_actually_let_through() {
         let _guard = migration_metrics_test_guard();
+        // node4 JOINS rather than node1 leaving, so the post-change table has
+        // both shards node1 lost and shards node1 still holds — the test needs
+        // one of each.
         let old_table =
             ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
-        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
+        let new_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)], 2, 11, 1);
         let mut lost = (0..NUM_SHARDS as u16).filter(|&s| {
             let old = old_table.target_assignment(s);
             let new = new_table.target_assignment(s);
@@ -31414,7 +31461,7 @@ mod tests {
                 let a = new_table.target_assignment(s);
                 a.master == NodeId(1) || a.replicas.contains(&NodeId(1))
             })
-            .expect("node1 still holds shards after the removal");
+            .expect("node1 still holds shards after node4 joins");
 
         let engine = Arc::new(test_engine());
         create_test_record(&engine, tx_key_for_shard(judged, 83));
@@ -31430,10 +31477,9 @@ mod tests {
             }
             // Refuse all three as orphans, so the ONLY thing separating them
             // is the ownership / record-count test below the exemption.
-            let outcome =
-                mgr.drop_refused_inbound(&[judged, empty, owned], NodeId(2), 1, |_| {
-                    crate::cluster::migration::InboundRetention::KeepOrphan
-                });
+            let outcome = mgr.drop_refused_inbound(&[judged, empty, owned], NodeId(2), 1, |_| {
+                crate::cluster::migration::InboundRetention::KeepOrphan
+            });
             assert_eq!(outcome.kept_orphan.len(), 3);
         }
 

@@ -599,32 +599,38 @@ pub fn refused_retained_inbound(json: &serde_json::Value) -> u64 {
 /// "is a migration still running?"; this is the answer to "is anything stuck,
 /// and stuck how?".
 ///
-/// A server that reports the total but not the split (any build before W17) has
-/// its whole residue attributed to the ORPHAN class. That is the fail-closed
-/// direction for TIMING: the orphan grace is the longer of the two, so an
-/// unclassifiable residue is never failed on the shorter clock — which is
-/// exactly the wave-16 defect this split exists to remove. The residue itself
-/// is never dropped, so the VERDICT stays fail-closed too.
+/// `inbound_refused_retained` is the AUTHORITY for how much residue exists;
+/// only the ATTRIBUTION is read from the split. The orphan half is derived as
+/// `total - holder_terminal`, never trusted from the wire, so:
+///
+/// * a server that reports the total but not the split (any build before W17)
+///   has its whole residue attributed to the ORPHAN class;
+/// * a split that does not add up — a partial rollout, a rename, a bug —
+///   cannot shrink the residue. The remainder lands in the orphan class.
+///
+/// W17 review P2-5. Reading the two halves independently was FAIL-OPEN,
+/// contrary to what this doc claimed: a server reporting `total=5` with both
+/// halves zero produced a residue whose `total()` is ZERO, which satisfies the
+/// gates' convergence condition and turns a wedged cluster into a GREEN
+/// verdict. Deriving from the authority makes that unrepresentable. The
+/// remainder taking the ORPHAN class is also the fail-safe direction for
+/// TIMING — that is the longer of the two graces, so an unclassifiable residue
+/// is never judged on the shorter clock, which is the wave-16 defect this split
+/// exists to remove.
 pub fn refused_residue_counts(json: &serde_json::Value) -> RefusedResidue {
     let total = refused_retained_inbound(json);
     if total == 0 {
         return RefusedResidue::default();
     }
-    match (
-        json["inbound_refused_retained_holder_terminal"].as_u64(),
-        json["inbound_refused_retained_orphan"].as_u64(),
-    ) {
-        (Some(holder_terminal), Some(orphan)) => RefusedResidue {
-            holder_terminal,
-            orphan,
-        },
-        // Only one half named, or neither: the answer cannot be trusted to
-        // attribute anything to the SHORT clock, so all of it takes the long
-        // one.
-        _ => RefusedResidue {
-            holder_terminal: 0,
-            orphan: total,
-        },
+    // Clamped to the total: the holder class is the one with the SHORT grace,
+    // so an overstated half must never enlarge it.
+    let holder_terminal = json["inbound_refused_retained_holder_terminal"]
+        .as_u64()
+        .unwrap_or(0)
+        .min(total);
+    RefusedResidue {
+        holder_terminal,
+        orphan: total - holder_terminal,
     }
 }
 
@@ -769,6 +775,19 @@ struct RefusedResidueWindows {
 /// matching the request in a later round, or — for the orphan class — orphan
 /// cleanup reclaiming the records), so a residue that comes back later starts a
 /// NEW window rather than resuming a half-spent one.
+///
+/// # Known diagnostic gap (W17 review P2-6): a residue that FLAPS class
+///
+/// An entry can be re-classified between refusal rounds — the shard's records
+/// or this node's holder-ness can change, and `drop_refused_inbound` assigns
+/// the class every round. A residue that alternates holder-terminal and orphan
+/// therefore zeroes one window each time it moves, so neither matures and the
+/// run degrades to a plain budget timeout instead of the named residue verdict.
+/// The verdict is not WRONG — a flapping entry is genuinely being re-judged,
+/// and the timeout dump still reports the residue and its split — but it is
+/// less legible than it should be. Deliberately not "fixed" by carrying a
+/// window across a class change: that would judge an entry on a clock it earned
+/// in a different state, which is the wave-16 defect in a new costume.
 fn note_refused_residue(
     windows: RefusedResidueWindows,
     seen: RefusedResidue,

@@ -436,6 +436,20 @@ struct InboundMigration {
     /// `refusal_rounds`). The holder arm is deliberately slow to reclassify:
     /// one refusal there is weak evidence (a diverged source table), a
     /// sustained streak is not.
+    ///
+    /// # INVARIANT — nothing may set this outside [`MigrationManager::drop_refused_inbound`]
+    ///
+    /// W17 review. Everything the mark now licenses — the convergence gate's
+    /// terminal verdict and the orphan-cleanup exemption
+    /// (`inbound_is_refused_orphan_fence`) — rests on it meaning exactly "this
+    /// entry's own `from_node` answered `ERR_MIGRATION_NO_TASKS`, judged
+    /// against a live retention classification". One writer keeps that true.
+    ///
+    /// The converse directions are already safe and need no rule: a future path
+    /// that registers an entry WITHOUT clearing the mark cannot widen anything
+    /// (an un-refused entry blocks the pass, and every existing registration
+    /// path calls [`InboundMigration::clear_refusal`] anyway), and a fence
+    /// raised through the bitmap alone carries no entry to mark.
     refused_by_source: bool,
     /// W16 — how many CONSECUTIVE [`MigrationManager::drop_refused_inbound`]
     /// rounds have answered `ERR_MIGRATION_NO_TASKS` for this entry.
@@ -622,6 +636,27 @@ impl InboundMigration {
     /// fixed at the promotion site as well — this is the local half of the same
     /// argument, and the one an orphan-cleanup reader can verify without
     /// leaving the predicate.
+    ///
+    /// # What it deliberately does NOT exclude: a C8 `lost` entry
+    ///
+    /// W17 review P2-1. `lost` is not tested here, and adding it would be the
+    /// wrong reflex. The settled-inbound GC marks an entry `lost` when its
+    /// source is SWIM-DEAD — a state the stranded residue reaches easily, and
+    /// precisely the case with the least chance of ever being re-driven — so
+    /// excluding it would re-close the deadlock for the shards that need the
+    /// exit most.
+    ///
+    /// It is sound because `lost` and this predicate answer different
+    /// questions. `lost` says "the shard's inbound was never proved complete",
+    /// and it enforces that by keeping the entry pending with its
+    /// `inbound_bitmap` bit SET — which this predicate does not touch, so the
+    /// shard stays FENCED and client-invisible exactly as before. This
+    /// predicate only says "no transfer is coming", which a dead source makes
+    /// MORE true, not less. Everything that could destroy data is still
+    /// downstream: the #28 committed-handoff guard, or a unanimous superset
+    /// confirmation over this node's exact image. A `lost` entry whose records
+    /// are reclaimed becomes a zero-record non-holder, which the ordinary prune
+    /// retires — the correct end state for it.
     fn is_refused_orphan_fence(&self) -> bool {
         !self.completed && self.refused_by_source && !self.refused_as_holder && !self.heal_pending
     }
@@ -3076,10 +3111,26 @@ impl MigrationManager {
     /// the records turns the entry into a zero-record non-holder, which the
     /// ordinary prune retires. The two classes are reported apart because they
     /// carry different promises about how long they may legitimately persist.
+    ///
+    /// # W17 review P2-7 — DERIVED, not counted independently
+    ///
+    /// This is the union MINUS the holder-terminal subset, so the three
+    /// reported numbers (total, holder, orphan) always describe a possible
+    /// state. Counting it with its own predicate let the two definitions agree
+    /// only while a module invariant held — and a consumer handed three numbers
+    /// that do not add up has no safe reading of them.
+    ///
+    /// It is therefore DELIBERATELY weaker than
+    /// [`Self::inbound_is_refused_orphan_fence`], which additionally demands
+    /// `!heal_pending`. The two answer different questions and fail in
+    /// opposite, correct directions: this one REPORTS, so an entry that should
+    /// be impossible lands in the class carrying the longer convergence grace;
+    /// the predicate AUTHORISES a judgement, so it refuses locally rather than
+    /// resting on the invariant.
     pub fn refused_retained_orphan_entries(&self) -> Vec<(u16, NodeId)> {
         self.inbound_migrations
             .iter()
-            .filter(|m| m.is_refused_orphan_fence())
+            .filter(|m| !m.completed && m.refused_by_source && !m.refused_as_holder)
             .map(|m| (m.shard, m.from_node))
             .collect()
     }
